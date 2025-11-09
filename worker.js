@@ -1,15 +1,20 @@
-﻿// cloudflare-worker.js - 完整班级评分系统
+﻿// 替换原来的 initDatabase 函数和 fetch 处理函数
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
 
     try {
+      // 检查数据库连接是否正常
+      if (!env.DB) {
+        return new Response('数据库连接未配置', { status: 500 });
+      }
+
       // 初始化数据库
       const isInitialized = await initDatabase(env.DB);
       
       // 检查是否需要初始化设置
-      if (!isInitialized && path !== '/setup' && path !== '/api/setup') {
+      if (!isInitialized && path !== '/setup' && path !== '/api/setup' && !path.startsWith('/api/')) {
         return Response.redirect(new URL('/setup', request.url));
       }
 
@@ -28,16 +33,21 @@ export default {
       });
     }
   }
-};
+}
 
-// 初始化数据库
+// 替换原来的 initDatabase 函数
 async function initDatabase(db) {
+  if (!db) {
+    throw new Error('数据库连接不可用');
+  }
+
   try {
-    // 检查设置表是否存在，如果不存在则创建所有表
+    // 检查设置表是否存在
     try {
       await db.prepare('SELECT 1 FROM settings LIMIT 1').run();
     } catch (e) {
       // 表不存在，需要初始化
+      console.log('创建数据库表...');
       await createAllTables(db);
       return false; // 需要设置
     }
@@ -47,155 +57,187 @@ async function initDatabase(db) {
     return settings.count > 0;
   } catch (error) {
     console.error('Database initialization error:', error);
-    return false;
+    // 如果表不存在，创建它们
+    try {
+      await createAllTables(db);
+      return false;
+    } catch (createError) {
+      console.error('Failed to create tables:', createError);
+      throw createError;
+    }
   }
 }
 
-// 创建所有表
+// 确保 createAllTables 函数存在且正确
 async function createAllTables(db) {
-  // 创建学生表
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS students (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT UNIQUE,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  // 创建评分项表
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS score_categories (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT,
-      type TEXT,
-      weight INTEGER DEFAULT 1,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  // 创建评分记录表
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS score_records (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      student_id INTEGER,
-      category_id INTEGER,
-      score INTEGER,
-      operator TEXT,
-      note TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (student_id) REFERENCES students (id),
-      FOREIGN KEY (category_id) REFERENCES score_categories (id)
-    )
-  `);
-
-  // 创建任务表
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS tasks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      title TEXT,
-      content TEXT,
-      deadline DATETIME,
-      created_by TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  // 创建系统设置表
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS settings (
-      key TEXT PRIMARY KEY,
-      value TEXT,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  // 创建月度快照表
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS monthly_snapshots (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      month TEXT,
-      student_name TEXT,
-      add_score INTEGER,
-      minus_score INTEGER,
-      total_score INTEGER,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  // 创建操作日志表
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS operation_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      student_id INTEGER,
-      action_type TEXT,
-      score_change INTEGER,
-      operator TEXT,
-      category_name TEXT,
-      note TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  // 初始化学生数据
-  const students = [
-    '曾钰景', '陈金语', '陈金卓', '陈明英', '陈兴旺', '陈钰琳', '代紫涵', '丁玉文',
-    '高建航', '高奇', '高思凡', '高兴扬', '关戎', '胡菡', '胡人溪', '胡延鑫',
-    '胡意佳', '胡语欣', '李国华', '李昊蓉', '李浩', '李灵芯', '李荣蝶', '李鑫蓉',
-    '廖聪斌', '刘沁熙', '刘屹', '孟舒玲', '孟卫佳', '庞清清', '任雲川', '邵金平',
-    '宋毓佳', '唐旺', '唐正高', '王恒', '王文琪', '吴良涛', '吴永贵', '夏碧涛',
-    '徐程', '徐海俊', '徐小龙', '颜荣蕊', '晏灏', '杨青望', '余芳', '张灿',
-    '张航', '张杰', '张毅', '赵丽瑞', '赵美婷', '赵威', '周安融', '周思棋', '朱蕊'
-  ];
-
-  for (const name of students) {
-    await db.prepare(
-      'INSERT OR IGNORE INTO students (name) VALUES (?)'
-    ).bind(name).run();
+  if (!db) {
+    throw new Error('数据库连接不可用');
   }
 
-  // 初始化评分类别
-  const scoreCategories = [
-    // 加分项
-    ['作业完成质量优秀', 'add', 1],
-    ['天天练达标', 'add', 1],
-    ['准时上课', 'add', 1],
-    ['卫生完成优秀', 'add', 1],
-    ['行为习惯良好', 'add', 1],
-    ['早操出勤', 'add', 1],
-    ['上课专注', 'add', 1],
-    ['任务完成优秀', 'add', 1],
-    ['课堂表现积极', 'add', 1],
-    ['帮助同学', 'add', 1],
-    
-    // 减分项
-    ['上课违纪', 'minus', 1],
-    ['作业完成质量差', 'minus', 1],
-    ['天天练未达标', 'minus', 1],
-    ['迟到', 'minus', 1],
-    ['卫生未完成', 'minus', 1],
-    ['行为习惯差', 'minus', 1],
-    ['早操缺勤', 'minus', 1],
-    ['上课不专注', 'minus', 1],
-    ['未交/拖延作业', 'minus', 1],
-    ['破坏课堂纪律', 'minus', 1]
-  ];
+  try {
+    // 创建学生表
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS students (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
-  for (const [name, type, weight] of scoreCategories) {
-    await db.prepare(
-      'INSERT OR IGNORE INTO score_categories (name, type, weight) VALUES (?, ?, ?)'
-    ).bind(name, type, weight).run();
+    // 创建评分项表
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS score_categories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        type TEXT,
+        weight INTEGER DEFAULT 1,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // 创建评分记录表
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS score_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        student_id INTEGER,
+        category_id INTEGER,
+        score INTEGER,
+        operator TEXT,
+        note TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (student_id) REFERENCES students (id),
+        FOREIGN KEY (category_id) REFERENCES score_categories (id)
+      )
+    `);
+
+    // 创建任务表
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        content TEXT,
+        deadline DATETIME,
+        created_by TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // 创建系统设置表
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // 创建月度快照表
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS monthly_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        month TEXT,
+        student_name TEXT,
+        add_score INTEGER,
+        minus_score INTEGER,
+        total_score INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // 创建操作日志表
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS operation_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        student_id INTEGER,
+        action_type TEXT,
+        score_change INTEGER,
+        operator TEXT,
+        category_name TEXT,
+        note TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // 初始化学生数据
+    const students = [
+      '曾钰景', '陈金语', '陈金卓', '陈明英', '陈兴旺', '陈钰琳', '代紫涵', '丁玉文',
+      '高建航', '高奇', '高思凡', '高兴扬', '关戎', '胡菡', '胡人溪', '胡延鑫',
+      '胡意佳', '胡语欣', '李国华', '李昊蓉', '李浩', '李灵芯', '李荣蝶', '李鑫蓉',
+      '廖聪斌', '刘沁熙', '刘屹', '孟舒玲', '孟卫佳', '庞清清', '任雲川', '邵金平',
+      '宋毓佳', '唐旺', '唐正高', '王恒', '王文琪', '吴良涛', '吴永贵', '夏碧涛',
+      '徐程', '徐海俊', '徐小龙', '颜荣蕊', '晏灏', '杨青望', '余芳', '张灿',
+      '张航', '张杰', '张毅', '赵丽瑞', '赵美婷', '赵威', '周安融', '周思棋', '朱蕊'
+    ];
+
+    for (const name of students) {
+      try {
+        await db.prepare(
+          'INSERT OR IGNORE INTO students (name) VALUES (?)'
+        ).bind(name).run();
+      } catch (error) {
+        console.error(`Error inserting student ${name}:`, error);
+      }
+    }
+
+    // 初始化评分类别
+    const scoreCategories = [
+      // 加分项
+      ['作业完成质量优秀', 'add', 1],
+      ['天天练达标', 'add', 1],
+      ['准时上课', 'add', 1],
+      ['卫生完成优秀', 'add', 1],
+      ['行为习惯良好', 'add', 1],
+      ['早操出勤', 'add', 1],
+      ['上课专注', 'add', 1],
+      ['任务完成优秀', 'add', 1],
+      ['课堂表现积极', 'add', 1],
+      ['帮助同学', 'add', 1],
+      
+      // 减分项
+      ['上课违纪', 'minus', 1],
+      ['作业完成质量差', 'minus', 1],
+      ['天天练未达标', 'minus', 1],
+      ['迟到', 'minus', 1],
+      ['卫生未完成', 'minus', 1],
+      ['行为习惯差', 'minus', 1],
+      ['早操缺勤', 'minus', 1],
+      ['上课不专注', 'minus', 1],
+      ['未交/拖延作业', 'minus', 1],
+      ['破坏课堂纪律', 'minus', 1]
+    ];
+
+    for (const [name, type, weight] of scoreCategories) {
+      try {
+        await db.prepare(
+          'INSERT OR IGNORE INTO score_categories (name, type, weight) VALUES (?, ?, ?)'
+        ).bind(name, type, weight).run();
+      } catch (error) {
+        console.error(`Error inserting category ${name}:`, error);
+      }
+    }
+
+    console.log('所有数据库表创建完成');
+    return false; // 需要设置
+  } catch (error) {
+    console.error('Error creating tables:', error);
+    throw error;
   }
-
-  return false; // 需要设置
 }
 
-// API处理
 async function handleAPI(request, env, url) {
   const path = url.pathname;
 
+  // 检查数据库连接
+  if (!env.DB) {
+    return new Response(JSON.stringify({ error: '数据库连接失败' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
   try {
     if (path === '/api/login') {
-      return await handleLogin(request, env);
+      return await handleLogin(request, env.DB);
     } else if (path === '/api/logout') {
       return handleLogout();
     } else if (path === '/api/students') {
@@ -555,10 +597,15 @@ async function handleGetMonthlyData(request, db) {
   });
 }
 
-// 页面处理
+// 在 handlePages 函数开始处添加数据库检查
 async function handlePages(request, env, url) {
   const path = url.pathname;
   
+  // 检查数据库连接
+  if (!env.DB) {
+    return new Response('数据库连接失败', { status: 500 });
+  }
+
   try {
     if (path === '/login') {
       return renderLoginPage();
