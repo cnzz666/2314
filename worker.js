@@ -1,4 +1,4 @@
-﻿// cloudflare-worker.js - 完整可用的班级评分系统
+﻿// cloudflare-worker.js - 完整班级评分系统
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -17,7 +17,10 @@ export default {
       return await handlePages(request, env, url);
     } catch (error) {
       console.error('Error:', error);
-      return new Response(JSON.stringify({ error: '服务器错误: ' + error.message }), {
+      return new Response(JSON.stringify({ 
+        error: '服务器错误',
+        details: error.message 
+      }), {
         status: 500,
         headers: { 'Content-Type': 'application/json' }
       });
@@ -25,45 +28,37 @@ export default {
   }
 };
 
-// 初始化数据库
+// 数据库初始化
 async function initDatabase(db) {
   try {
-    // 创建学生表
+    // 学生表
     await db.exec(`
       CREATE TABLE IF NOT EXISTS students (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE,
+        student_id TEXT,
+        position TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
-    // 创建评分项表
-    await db.exec(`
-      CREATE TABLE IF NOT EXISTS score_categories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        type TEXT,
-        weight INTEGER DEFAULT 1,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    // 创建评分记录表
+    // 评分记录表
     await db.exec(`
       CREATE TABLE IF NOT EXISTS score_records (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         student_id INTEGER,
-        category_id INTEGER,
-        score INTEGER,
+        score_type TEXT,
+        score_value INTEGER,
+        category TEXT,
+        subject TEXT,
         operator TEXT,
         note TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (student_id) REFERENCES students (id),
-        FOREIGN KEY (category_id) REFERENCES score_categories (id)
+        FOREIGN KEY (student_id) REFERENCES students (id)
       )
     `);
 
-    // 创建任务表
+    // 任务表
     await db.exec(`
       CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,7 +70,7 @@ async function initDatabase(db) {
       )
     `);
 
-    // 创建系统设置表
+    // 系统设置表
     await db.exec(`
       CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -84,29 +79,27 @@ async function initDatabase(db) {
       )
     `);
 
-    // 创建月度快照表
+    // 月度快照表
     await db.exec(`
       CREATE TABLE IF NOT EXISTS monthly_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         month TEXT,
-        student_name TEXT,
-        add_score INTEGER,
-        minus_score INTEGER,
-        total_score INTEGER,
+        title TEXT,
+        student_data TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
-    // 创建操作日志表
+    // 操作日志表
     await db.exec(`
       CREATE TABLE IF NOT EXISTS operation_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         student_id INTEGER,
         student_name TEXT,
-        action_type TEXT,
+        action TEXT,
         score_change INTEGER,
         operator TEXT,
-        category_name TEXT,
+        category TEXT,
         note TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
@@ -120,8 +113,8 @@ async function initDatabase(db) {
       ['admin_password', '2314admin2314admin'],
       ['site_title', '2314班综合评分系统'],
       ['class_name', '2314班'],
-      ['current_month', new Date().toISOString().slice(0, 7)],
-      ['announcement', '欢迎使用班级综合评分系统！请各位同学遵守纪律，积极表现！']
+      ['announcement', '欢迎使用班级评分系统！请遵守纪律，积极表现！'],
+      ['current_month', new Date().toISOString().slice(0, 7)]
     ];
 
     for (const [key, value] of defaultSettings) {
@@ -147,91 +140,67 @@ async function initDatabase(db) {
       ).bind(name).run();
     }
 
-    // 初始化评分类别
-    const scoreCategories = [
-      // 加分项
-      ['作业完成质量优秀', 'add', 1],
-      ['天天练达标', 'add', 1],
-      ['准时上课', 'add', 1],
-      ['卫生完成优秀', 'add', 1],
-      ['行为习惯良好', 'add', 1],
-      ['早操出勤', 'add', 1],
-      ['上课专注', 'add', 1],
-      ['任务完成优秀', 'add', 1],
-      ['课堂表现积极', 'add', 1],
-      ['帮助同学', 'add', 1],
-      
-      // 减分项
-      ['上课违纪', 'minus', 1],
-      ['作业完成质量差', 'minus', 2],
-      ['天天练未达标', 'minus', 1],
-      ['迟到', 'minus', 1],
-      ['卫生未完成', 'minus', 1],
-      ['行为习惯差', 'minus', 1],
-      ['早操缺勤', 'minus', 1],
-      ['上课不专注', 'minus', 1],
-      ['未交/拖延作业', 'minus', 1],
-      ['破坏课堂纪律', 'minus', 1]
-    ];
-
-    for (const [name, type, weight] of scoreCategories) {
-      await db.prepare(
-        'INSERT OR IGNORE INTO score_categories (name, type, weight) VALUES (?, ?, ?)'
-      ).bind(name, type, weight).run();
-    }
-
     console.log('Database initialized successfully');
   } catch (error) {
-    console.error('Database initialization error:', error);
-    throw error;
+    console.error('Database init error:', error);
   }
 }
 
 // API处理
 async function handleAPI(request, env, url) {
   const path = url.pathname;
+  const method = request.method;
 
   try {
+    // 登录相关
     if (path === '/api/login') {
-      return await handleLogin(request, env);
+      return await handleLogin(request, env.DB);
     } else if (path === '/api/logout') {
       return handleLogout();
-    } else if (path === '/api/students') {
+    }
+    
+    // 学生数据相关
+    else if (path === '/api/students') {
       return await handleGetStudents(env.DB);
-    } else if (path === '/api/score') {
+    } else if (path === '/api/students/scores') {
+      return await handleGetStudentScores(request, env.DB);
+    }
+    
+    // 评分相关
+    else if (path === '/api/score/add') {
       return await handleAddScore(request, env.DB);
-    } else if (path === '/api/revoke') {
+    } else if (path === '/api/score/revoke') {
       return await handleRevokeScore(request, env.DB);
-    } else if (path === '/api/tasks') {
-      if (request.method === 'GET') {
-        return await handleGetTasks(env.DB);
-      } else if (request.method === 'POST') {
-        return await handleAddTask(request, env.DB);
-      } else if (request.method === 'DELETE') {
-        return await handleDeleteTask(request, env.DB);
-      }
+    }
+    
+    // 任务相关
+    else if (path === '/api/tasks') {
+      if (method === 'GET') return await handleGetTasks(env.DB);
+      if (method === 'POST') return await handleAddTask(request, env.DB);
+    }
+    
+    // 系统相关
+    else if (path === '/api/settings') {
+      if (method === 'GET') return await handleGetSettings(env.DB);
+      if (method === 'POST') return await handleUpdateSettings(request, env.DB);
     } else if (path === '/api/snapshot') {
-      return await handleSnapshot(request, env.DB);
+      return await handleCreateSnapshot(request, env.DB);
     } else if (path === '/api/reset') {
-      return await handleReset(env.DB);
-    } else if (path === '/api/settings') {
-      if (request.method === 'GET') {
-        return await handleGetSettings(env.DB);
-      } else if (request.method === 'POST') {
-        return await handleUpdateSettings(request, env.DB);
-      }
-    } else if (path === '/api/logs') {
+      return await handleResetScores(env.DB);
+    } else if (path === '/api/clear') {
+      return await handleClearData(env.DB);
+    }
+    
+    // 日志相关
+    else if (path === '/api/logs') {
       return await handleGetLogs(request, env.DB);
     } else if (path === '/api/monthly') {
       return await handleGetMonthlyData(env.DB);
-    } else if (path === '/api/clear-all') {
-      return await handleClearAllData(env.DB);
     }
 
     return new Response('Not Found', { status: 404 });
   } catch (error) {
-    console.error('API Error:', error);
-    return new Response(JSON.stringify({ error: 'API错误: ' + error.message }), {
+    return new Response(JSON.stringify({ error: error.message }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' }
     });
@@ -239,51 +208,45 @@ async function handleAPI(request, env, url) {
 }
 
 // 登录处理
-async function handleLogin(request, env) {
-  try {
-    const { username, password } = await request.json();
+async function handleLogin(request, db) {
+  const { username, password } = await request.json();
+  
+  const settings = await db.prepare(
+    'SELECT key, value FROM settings WHERE key IN (?, ?, ?, ?)'
+  ).bind('class_username', 'class_password', 'admin_username', 'admin_password').all();
+
+  const settingMap = {};
+  settings.results.forEach(row => {
+    settingMap[row.key] = row.value;
+  });
+
+  let role = '';
+  if (username === settingMap.class_username && password === settingMap.class_password) {
+    role = 'class';
+  } else if (username === settingMap.admin_username && password === settingMap.admin_password) {
+    role = 'admin';
+  }
+
+  if (role) {
+    const sessionId = generateSessionId();
+    const expires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const cookie = `session=${sessionId}; Path=/; HttpOnly; Expires=${expires.toUTCString()}; SameSite=Lax`;
     
-    const settings = await env.DB.prepare(
-      'SELECT key, value FROM settings WHERE key IN (?, ?, ?, ?)'
-    ).bind('class_username', 'class_password', 'admin_username', 'admin_password').all();
-
-    const settingMap = {};
-    settings.results.forEach(row => {
-      settingMap[row.key] = row.value;
-    });
-
-    let role = '';
-    if (username === settingMap.class_username && password === settingMap.class_password) {
-      role = 'class';
-    } else if (username === settingMap.admin_username && password === settingMap.admin_password) {
-      role = 'admin';
-    }
-
-    if (role) {
-      const sessionId = generateSessionId();
-      const expires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-      const cookie = `session=${sessionId}; Path=/; HttpOnly; Expires=${expires.toUTCString()}; SameSite=Lax`;
-      
-      await env.DB.prepare(
-        'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)'
-      ).bind(`session_${sessionId}`, JSON.stringify({ username, role, expires: expires.getTime() })).run();
-      
-      return new Response(JSON.stringify({ success: true, role }), {
-        headers: {
-          'Content-Type': 'application/json',
-          'Set-Cookie': cookie
-        }
-      });
-    }
-
-    return new Response(JSON.stringify({ success: false, error: '用户名或密码错误' }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    return new Response(JSON.stringify({ success: false, error: '登录失败: ' + error.message }), {
-      headers: { 'Content-Type': 'application/json' }
+    await db.prepare(
+      'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)'
+    ).bind(`session_${sessionId}`, JSON.stringify({ username, role, expires: expires.getTime() })).run();
+    
+    return new Response(JSON.stringify({ success: true, role }), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Set-Cookie': cookie
+      }
     });
   }
+
+  return new Response(JSON.stringify({ success: false, error: '用户名或密码错误' }), {
+    headers: { 'Content-Type': 'application/json' }
+  });
 }
 
 // 登出处理
@@ -299,312 +262,240 @@ function handleLogout() {
 
 // 获取学生数据
 async function handleGetStudents(db) {
-  try {
-    const students = await db.prepare(`
-      SELECT s.id, s.name, 
-             COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE 0 END), 0) as add_score,
-             COALESCE(SUM(CASE WHEN sc.type = 'minus' THEN sr.score ELSE 0 END), 0) as minus_score,
-             COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE -sr.score END), 0) as total_score
-      FROM students s
-      LEFT JOIN score_records sr ON s.id = sr.student_id
-      LEFT JOIN score_categories sc ON sr.category_id = sc.id
-      GROUP BY s.id, s.name
-      ORDER BY total_score DESC
-    `).all();
+  const students = await db.prepare(`
+    SELECT s.id, s.name,
+           COALESCE(SUM(CASE WHEN sr.score_type = 'add' THEN sr.score_value ELSE 0 END), 0) as add_score,
+           COALESCE(SUM(CASE WHEN sr.score_type = 'minus' THEN sr.score_value ELSE 0 END), 0) as minus_score,
+           COALESCE(SUM(CASE WHEN sr.score_type = 'add' THEN sr.score_value ELSE -sr.score_value END), 0) as total_score
+    FROM students s
+    LEFT JOIN score_records sr ON s.id = sr.student_id
+    GROUP BY s.id, s.name
+    ORDER BY total_score DESC
+  `).all();
 
-    const addRankings = [...students.results]
-      .map(s => ({ ...s, score: s.add_score }))
-      .sort((a, b) => b.score - a.score);
-    
-    const minusRankings = [...students.results]
-      .map(s => ({ ...s, score: s.minus_score }))
-      .sort((a, b) => b.score - a.score);
+  const addRankings = [...students.results]
+    .sort((a, b) => b.add_score - a.add_score)
+    .slice(0, 10);
+  
+  const minusRankings = [...students.results]
+    .sort((a, b) => b.minus_score - a.minus_score)
+    .slice(0, 10);
 
-    return new Response(JSON.stringify({
-      students: students.results,
-      addRankings: addRankings.slice(0, 10),
-      minusRankings: minusRankings.slice(0, 10)
-    }), {
-      headers: { 
-        'Content-Type': 'application/json',
-        'Cache-Control': 'no-cache'
-      }
-    });
-  } catch (error) {
-    throw new Error('获取学生数据失败: ' + error.message);
-  }
+  return new Response(JSON.stringify({
+    students: students.results,
+    addRankings,
+    minusRankings
+  }), {
+    headers: { 'Content-Type': 'application/json' }
+  });
+}
+
+// 获取学生评分详情
+async function handleGetStudentScores(request, db) {
+  const { studentId } = Object.fromEntries(new URL(request.url).searchParams);
+  
+  const scores = await db.prepare(`
+    SELECT sr.*, s.name as student_name
+    FROM score_records sr
+    JOIN students s ON sr.student_id = s.id
+    WHERE sr.student_id = ?
+    ORDER BY sr.created_at DESC
+  `).bind(studentId).all();
+
+  return new Response(JSON.stringify(scores.results), {
+    headers: { 'Content-Type': 'application/json' }
+  });
 }
 
 // 添加分数
 async function handleAddScore(request, db) {
-  try {
-    const { studentId, categoryId, score, operator, note } = await request.json();
-    
-    // 获取类别信息
-    const category = await db.prepare(
-      'SELECT name, type FROM score_categories WHERE id = ?'
-    ).bind(categoryId).first();
-    
-    if (!category) {
-      return new Response(JSON.stringify({ success: false, error: '评分项目不存在' }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
+  const { studentId, scoreType, scoreValue, category, subject, operator, note } = await request.json();
+  
+  // 获取学生姓名
+  const student = await db.prepare(
+    'SELECT name FROM students WHERE id = ?'
+  ).bind(studentId).first();
 
-    // 获取学生姓名
-    const student = await db.prepare(
-      'SELECT name FROM students WHERE id = ?'
-    ).bind(studentId).first();
+  // 插入评分记录
+  await db.prepare(
+    'INSERT INTO score_records (student_id, score_type, score_value, category, subject, operator, note) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).bind(studentId, scoreType, scoreValue, category, subject, operator, note).run();
 
-    if (!student) {
-      return new Response(JSON.stringify({ success: false, error: '学生不存在' }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
+  // 记录操作日志
+  await db.prepare(
+    'INSERT INTO operation_logs (student_id, student_name, action, score_change, operator, category, note) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).bind(studentId, student.name, scoreType === 'add' ? '加分' : '扣分', 
+         scoreType === 'add' ? scoreValue : -scoreValue, operator, category, note).run();
 
-    // 插入评分记录
-    await db.prepare(
-      'INSERT INTO score_records (student_id, category_id, score, operator, note) VALUES (?, ?, ?, ?, ?)'
-    ).bind(studentId, categoryId, score, operator, note).run();
-
-    // 记录操作日志
-    await db.prepare(
-      'INSERT INTO operation_logs (student_id, student_name, action_type, score_change, operator, category_name, note) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).bind(studentId, student.name, category.type, category.type === 'add' ? score : -score, operator, category.name, note).run();
-
-    return new Response(JSON.stringify({ success: true }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    throw new Error('添加分数失败: ' + error.message);
-  }
+  return new Response(JSON.stringify({ success: true }), {
+    headers: { 'Content-Type': 'application/json' }
+  });
 }
 
 // 撤销操作
 async function handleRevokeScore(request, db) {
-  try {
-    const { studentId } = await request.json();
-    
-    // 获取最近一条记录
-    const lastRecord = await db.prepare(`
-      SELECT sr.id, sr.score, sc.type, sc.name as category_name, sr.operator, sr.note, s.name as student_name
-      FROM score_records sr
-      JOIN score_categories sc ON sr.category_id = sc.id
-      JOIN students s ON sr.student_id = s.id
-      WHERE sr.student_id = ?
-      ORDER BY sr.created_at DESC 
-      LIMIT 1
-    `).bind(studentId).first();
+  const { studentId } = await request.json();
+  
+  // 获取最近一条记录
+  const lastRecord = await db.prepare(`
+    SELECT sr.*, s.name as student_name
+    FROM score_records sr
+    JOIN students s ON sr.student_id = s.id
+    WHERE sr.student_id = ?
+    ORDER BY sr.created_at DESC
+    LIMIT 1
+  `).bind(studentId).first();
 
-    if (!lastRecord) {
-      return new Response(JSON.stringify({ success: false, error: '没有可撤销的记录' }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    // 删除记录
-    await db.prepare('DELETE FROM score_records WHERE id = ?').bind(lastRecord.id).run();
-
-    // 记录撤销日志
-    await db.prepare(
-      'INSERT INTO operation_logs (student_id, student_name, action_type, score_change, operator, category_name, note) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).bind(studentId, lastRecord.student_name, 'revoke', lastRecord.type === 'add' ? -lastRecord.score : lastRecord.score, 
-           lastRecord.operator, `撤销: ${lastRecord.category_name}`, '撤销操作').run();
-
-    return new Response(JSON.stringify({ success: true }), {
+  if (!lastRecord) {
+    return new Response(JSON.stringify({ success: false, error: '没有可撤销的记录' }), {
       headers: { 'Content-Type': 'application/json' }
     });
-  } catch (error) {
-    throw new Error('撤销操作失败: ' + error.message);
   }
+
+  // 删除记录
+  await db.prepare('DELETE FROM score_records WHERE id = ?').bind(lastRecord.id).run();
+
+  // 记录撤销日志
+  await db.prepare(
+    'INSERT INTO operation_logs (student_id, student_name, action, score_change, operator, category, note) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).bind(studentId, lastRecord.student_name, '撤销', 
+         lastRecord.score_type === 'add' ? -lastRecord.score_value : lastRecord.score_value, 
+         lastRecord.operator, `撤销: ${lastRecord.category}`, '撤销操作').run();
+
+  return new Response(JSON.stringify({ success: true }), {
+    headers: { 'Content-Type': 'application/json' }
+  });
 }
 
 // 获取任务
 async function handleGetTasks(db) {
-  try {
-    const tasks = await db.prepare(
-      'SELECT * FROM tasks ORDER BY created_at DESC'
-    ).all();
+  const tasks = await db.prepare(
+    'SELECT * FROM tasks ORDER BY created_at DESC LIMIT 10'
+  ).all();
 
-    return new Response(JSON.stringify(tasks.results), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    throw new Error('获取任务失败: ' + error.message);
-  }
+  return new Response(JSON.stringify(tasks.results), {
+    headers: { 'Content-Type': 'application/json' }
+  });
 }
 
 // 添加任务
 async function handleAddTask(request, db) {
-  try {
-    const { title, content, deadline, created_by } = await request.json();
-    
-    await db.prepare(
-      'INSERT INTO tasks (title, content, deadline, created_by) VALUES (?, ?, ?, ?)'
-    ).bind(title, content, deadline, created_by).run();
+  const { title, content, deadline, created_by } = await request.json();
+  
+  await db.prepare(
+    'INSERT INTO tasks (title, content, deadline, created_by) VALUES (?, ?, ?, ?)'
+  ).bind(title, content, deadline, created_by).run();
 
-    return new Response(JSON.stringify({ success: true }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    throw new Error('添加任务失败: ' + error.message);
-  }
-}
-
-// 删除任务
-async function handleDeleteTask(request, db) {
-  try {
-    const { id } = await request.json();
-    
-    await db.prepare('DELETE FROM tasks WHERE id = ?').bind(id).run();
-
-    return new Response(JSON.stringify({ success: true }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    throw new Error('删除任务失败: ' + error.message);
-  }
-}
-
-// 创建快照
-async function handleSnapshot(request, db) {
-  try {
-    const { month, title } = await request.json();
-    
-    // 获取当前所有学生分数
-    const students = await db.prepare(`
-      SELECT s.name, 
-             COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE 0 END), 0) as add_score,
-             COALESCE(SUM(CASE WHEN sc.type = 'minus' THEN sr.score ELSE 0 END), 0) as minus_score,
-             COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE -sr.score END), 0) as total_score
-      FROM students s
-      LEFT JOIN score_records sr ON s.id = sr.student_id
-      LEFT JOIN score_categories sc ON sr.category_id = sc.id
-      GROUP BY s.id, s.name
-    `).all();
-
-    // 保存快照
-    for (const student of students.results) {
-      await db.prepare(
-        'INSERT INTO monthly_snapshots (month, student_name, add_score, minus_score, total_score) VALUES (?, ?, ?, ?, ?)'
-      ).bind(`${month}-${title}`, student.name, student.add_score, student.minus_score, student.total_score).run();
-    }
-
-    return new Response(JSON.stringify({ success: true }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    throw new Error('创建快照失败: ' + error.message);
-  }
-}
-
-// 重置分数
-async function handleReset(db) {
-  try {
-    await db.prepare('DELETE FROM score_records').run();
-    await db.prepare('DELETE FROM operation_logs').run();
-
-    return new Response(JSON.stringify({ success: true }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    throw new Error('重置分数失败: ' + error.message);
-  }
+  return new Response(JSON.stringify({ success: true }), {
+    headers: { 'Content-Type': 'application/json' }
+  });
 }
 
 // 获取设置
 async function handleGetSettings(db) {
-  try {
-    const settings = await db.prepare('SELECT key, value FROM settings').all();
-    const settingMap = {};
-    settings.results.forEach(row => {
-      settingMap[row.key] = row.value;
-    });
-    
-    return new Response(JSON.stringify(settingMap), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    throw new Error('获取设置失败: ' + error.message);
-  }
+  const settings = await db.prepare('SELECT key, value FROM settings').all();
+  const settingMap = {};
+  settings.results.forEach(row => {
+    settingMap[row.key] = row.value;
+  });
+  
+  return new Response(JSON.stringify(settingMap), {
+    headers: { 'Content-Type': 'application/json' }
+  });
 }
 
 // 更新设置
 async function handleUpdateSettings(request, db) {
-  try {
-    const settings = await request.json();
-    
-    for (const [key, value] of Object.entries(settings)) {
-      await db.prepare(
-        'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)'
-      ).bind(key, value).run();
-    }
-
-    return new Response(JSON.stringify({ success: true }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    throw new Error('更新设置失败: ' + error.message);
+  const settings = await request.json();
+  
+  for (const [key, value] of Object.entries(settings)) {
+    await db.prepare(
+      'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)'
+    ).bind(key, value).run();
   }
+
+  return new Response(JSON.stringify({ success: true }), {
+    headers: { 'Content-Type': 'application/json' }
+  });
 }
 
-// 获取操作日志
+// 创建快照
+async function handleCreateSnapshot(request, db) {
+  const { month, title } = await request.json();
+  
+  // 获取学生数据
+  const students = await db.prepare(`
+    SELECT s.id, s.name,
+           COALESCE(SUM(CASE WHEN sr.score_type = 'add' THEN sr.score_value ELSE 0 END), 0) as add_score,
+           COALESCE(SUM(CASE WHEN sr.score_type = 'minus' THEN sr.score_value ELSE 0 END), 0) as minus_score,
+           COALESCE(SUM(CASE WHEN sr.score_type = 'add' THEN sr.score_value ELSE -sr.score_value END), 0) as total_score
+    FROM students s
+    LEFT JOIN score_records sr ON s.id = sr.student_id
+    GROUP BY s.id, s.name
+  `).all();
+
+  // 保存快照
+  await db.prepare(
+    'INSERT INTO monthly_snapshots (month, title, student_data) VALUES (?, ?, ?)'
+  ).bind(month, title, JSON.stringify(students.results)).run();
+
+  return new Response(JSON.stringify({ success: true }), {
+    headers: { 'Content-Type': 'application/json' }
+  });
+}
+
+// 重置分数
+async function handleResetScores(db) {
+  await db.prepare('DELETE FROM score_records').run();
+  await db.prepare('DELETE FROM operation_logs').run();
+
+  return new Response(JSON.stringify({ success: true }), {
+    headers: { 'Content-Type': 'application/json' }
+  });
+}
+
+// 清空数据
+async function handleClearData(db) {
+  await db.prepare('DELETE FROM score_records').run();
+  await db.prepare('DELETE FROM tasks').run();
+  await db.prepare('DELETE FROM operation_logs').run();
+  await db.prepare('DELETE FROM monthly_snapshots').run();
+
+  return new Response(JSON.stringify({ success: true }), {
+    headers: { 'Content-Type': 'application/json' }
+  });
+}
+
+// 获取日志
 async function handleGetLogs(request, db) {
-  try {
-    const { studentId } = Object.fromEntries(new URL(request.url).searchParams);
-    
-    let query = `
-      SELECT ol.*
-      FROM operation_logs ol
-    `;
-    let params = [];
-
-    if (studentId) {
-      query += ' WHERE ol.student_id = ?';
-      params.push(studentId);
-    }
-
-    query += ' ORDER BY ol.created_at DESC LIMIT 100';
-
-    const logs = await db.prepare(query).bind(...params).all();
-
-    return new Response(JSON.stringify(logs.results), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    throw new Error('获取日志失败: ' + error.message);
+  const { studentId } = Object.fromEntries(new URL(request.url).searchParams);
+  
+  let query = 'SELECT * FROM operation_logs';
+  let params = [];
+  
+  if (studentId) {
+    query += ' WHERE student_id = ?';
+    params.push(studentId);
   }
+  
+  query += ' ORDER BY created_at DESC LIMIT 100';
+
+  const logs = await db.prepare(query).bind(...params).all();
+
+  return new Response(JSON.stringify(logs.results), {
+    headers: { 'Content-Type': 'application/json' }
+  });
 }
 
 // 获取月度数据
 async function handleGetMonthlyData(db) {
-  try {
-    const months = await db.prepare(
-      'SELECT DISTINCT month FROM monthly_snapshots ORDER BY month DESC'
-    ).all();
+  const months = await db.prepare(
+    'SELECT DISTINCT month, title FROM monthly_snapshots ORDER BY month DESC'
+  ).all();
 
-    return new Response(JSON.stringify(months.results.map(m => m.month)), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    throw new Error('获取月度数据失败: ' + error.message);
-  }
-}
-
-// 清空所有数据
-async function handleClearAllData(db) {
-  try {
-    await db.prepare('DELETE FROM score_records').run();
-    await db.prepare('DELETE FROM operation_logs').run();
-    await db.prepare('DELETE FROM tasks').run();
-    await db.prepare('DELETE FROM monthly_snapshots').run();
-
-    return new Response(JSON.stringify({ success: true }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    throw new Error('清空数据失败: ' + error.message);
-  }
+  return new Response(JSON.stringify(months.results), {
+    headers: { 'Content-Type': 'application/json' }
+  });
 }
 
 // 页面处理
@@ -626,8 +517,7 @@ async function handlePages(request, env, url) {
 
     return renderLoginPage();
   } catch (error) {
-    console.error('Page render error:', error);
-    return new Response('页面渲染错误: ' + error.message, { status: 500 });
+    return renderErrorPage(error.message);
   }
 }
 
@@ -640,23 +530,23 @@ function generateSessionId() {
 
 // 验证会话
 async function validateSession(request, db) {
+  const cookieHeader = request.headers.get('Cookie');
+  if (!cookieHeader) return null;
+
+  const cookies = Object.fromEntries(
+    cookieHeader.split(';').map(c => c.trim().split('='))
+  );
+  
+  const sessionId = cookies.session;
+  if (!sessionId) return null;
+
+  const sessionData = await db.prepare(
+    'SELECT value FROM settings WHERE key = ?'
+  ).bind(`session_${sessionId}`).first();
+
+  if (!sessionData) return null;
+
   try {
-    const cookieHeader = request.headers.get('Cookie');
-    if (!cookieHeader) return null;
-
-    const cookies = Object.fromEntries(
-      cookieHeader.split(';').map(c => c.trim().split('='))
-    );
-    
-    const sessionId = cookies.session;
-    if (!sessionId) return null;
-
-    const sessionData = await db.prepare(
-      'SELECT value FROM settings WHERE key = ?'
-    ).bind(`session_${sessionId}`).first();
-
-    if (!sessionData) return null;
-
     const session = JSON.parse(sessionData.value);
     if (session.expires < Date.now()) {
       await db.prepare('DELETE FROM settings WHERE key = ?').bind(`session_${sessionId}`).run();
@@ -677,19 +567,21 @@ function renderLoginPage() {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>班级评分系统 - 登录</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; font-family: Arial, sans-serif; }
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', system-ui, sans-serif; }
         body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
-        .login-container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); width: 100%; max-width: 400px; }
-        h1 { text-align: center; margin-bottom: 30px; color: #333; }
-        .input-group { margin-bottom: 20px; }
-        input { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 16px; }
-        button { width: 100%; padding: 12px; background: #667eea; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; }
-        button:hover { background: #5a6fd8; }
-        .role-select { display: flex; gap: 10px; margin-bottom: 20px; }
-        .role-btn { flex: 1; padding: 10px; border: 1px solid #ddd; background: white; border-radius: 5px; cursor: pointer; text-align: center; }
-        .role-btn.active { background: #667eea; color: white; }
-        .login-info { margin-top: 20px; padding: 15px; background: #f5f5f5; border-radius: 5px; font-size: 14px; }
-        .info-item { display: flex; justify-content: space-between; margin-bottom: 5px; }
+        .login-container { background: white; padding: 3rem; border-radius: 20px; box-shadow: 0 20px 40px rgba(0,0,0,0.1); width: 100%; max-width: 400px; transition: transform 0.3s ease; }
+        .login-container:hover { transform: translateY(-5px); }
+        h1 { text-align: center; margin-bottom: 2rem; color: #333; font-weight: 300; }
+        .role-select { display: flex; gap: 1rem; margin-bottom: 1.5rem; }
+        .role-btn { flex: 1; padding: 0.8rem; border: 2px solid #e1e5e9; background: white; border-radius: 10px; cursor: pointer; transition: all 0.3s ease; text-align: center; }
+        .role-btn.active { border-color: #667eea; background: #667eea; color: white; }
+        .input-group { margin-bottom: 1.5rem; }
+        input { width: 100%; padding: 1rem; border: 2px solid #e1e5e9; border-radius: 10px; font-size: 1rem; transition: all 0.3s ease; }
+        input:focus { outline: none; border-color: #667eea; box-shadow: 0 0 0 3px rgba(102,126,234,0.1); }
+        button { width: 100%; padding: 1rem; background: linear-gradient(135deg, #667eea, #764ba2); color: white; border: none; border-radius: 10px; font-size: 1rem; cursor: pointer; transition: all 0.3s ease; }
+        button:hover { transform: translateY(-2px); box-shadow: 0 10px 20px rgba(102,126,234,0.3); }
+        .login-info { margin-top: 1.5rem; padding: 1rem; background: #f8f9fa; border-radius: 10px; font-size: 0.875rem; }
+        .info-item { display: flex; justify-content: space-between; margin-bottom: 0.5rem; }
     </style>
 </head>
 <body>
@@ -709,7 +601,7 @@ function renderLoginPage() {
             <div class="info-item"><span>班级账号:</span><span>2314 / hzwy2314</span></div>
             <div class="info-item"><span>班主任账号:</span><span>2314admin / 2314admin2314admin</span></div>
         </div>
-        <div id="message" style="margin-top: 15px; text-align: center; color: red;"></div>
+        <div id="message" style="margin-top: 1rem; text-align: center; color: #e74c3c;"></div>
     </div>
     <script>
         let currentRole = 'class';
@@ -747,97 +639,85 @@ function renderLoginPage() {
 
 // 渲染班级页面
 async function renderClassPage(db) {
-  try {
-    const session = await validateSession(new Request('http://localhost'), db);
-    if (!session || session.role !== 'class') {
-      return Response.redirect(new URL('/login', 'http://localhost'));
-    }
+  const session = await validateSession(new Request('http://localhost'), db);
+  if (!session || session.role !== 'class') {
+    return Response.redirect('/login');
+  }
 
-    // 获取所有必要数据
-    const [studentsResult, categoriesResult, tasksResult, settingsResult] = await Promise.all([
-      db.prepare(`
-        SELECT s.id, s.name, 
-               COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE 0 END), 0) as add_score,
-               COALESCE(SUM(CASE WHEN sc.type = 'minus' THEN sr.score ELSE 0 END), 0) as minus_score,
-               COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE -sr.score END), 0) as total_score
-        FROM students s
-        LEFT JOIN score_records sr ON s.id = sr.student_id
-        LEFT JOIN score_categories sc ON sr.category_id = sc.id
-        GROUP BY s.id, s.name
-        ORDER BY total_score DESC
-      `).all(),
-      db.prepare('SELECT * FROM score_categories ORDER BY type, id').all(),
-      db.prepare('SELECT * FROM tasks ORDER BY created_at DESC LIMIT 10').all(),
-      db.prepare('SELECT key, value FROM settings WHERE key IN (?, ?, ?)').bind('site_title', 'class_name', 'announcement').all()
-    ]);
+  const [studentsData, tasks, settings] = await Promise.all([
+    handleGetStudents(db).then(r => r.json()),
+    db.prepare('SELECT * FROM tasks ORDER BY created_at DESC LIMIT 10').all(),
+    db.prepare('SELECT key, value FROM settings WHERE key IN (?, ?, ?)').bind('site_title', 'class_name', 'announcement').all()
+  ]);
 
-    const students = studentsResult.results;
-    const scoreCategories = categoriesResult.results;
-    const tasks = tasksResult.results;
-    
-    const settingMap = {};
-    settingsResult.results.forEach(row => {
-      settingMap[row.key] = row.value;
-    });
+  const settingMap = {};
+  settings.results.forEach(row => {
+    settingMap[row.key] = row.value;
+  });
 
-    // 计算排行榜
-    const addRankings = [...students].sort((a, b) => b.add_score - a.add_score).slice(0, 10);
-    const minusRankings = [...students].sort((a, b) => b.minus_score - a.minus_score).slice(0, 10);
-
-    const html = `<!DOCTYPE html>
+  const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${settingMap.site_title || '2314班综合评分系统'}</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; font-family: Arial, sans-serif; }
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', system-ui, sans-serif; }
         body { background: #f5f7fa; color: #333; }
-        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; }
-        .header-content { display: flex; justify-content: space-between; align-items: center; max-width: 1200px; margin: 0 auto; }
-        .class-info h1 { margin-bottom: 5px; }
-        .date { font-size: 14px; opacity: 0.9; }
-        .btn { padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; margin-left: 10px; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 1.5rem 2rem; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }
+        .header-content { display: flex; justify-content: space-between; align-items: center; }
+        .class-info h1 { font-weight: 300; margin-bottom: 0.5rem; }
+        .date { font-size: 0.9rem; opacity: 0.9; }
+        .btn { padding: 0.75rem 1.5rem; border: none; border-radius: 10px; font-weight: 600; cursor: pointer; transition: all 0.3s ease; text-decoration: none; display: inline-flex; align-items: center; gap: 0.5rem; }
         .btn-primary { background: rgba(255,255,255,0.2); color: white; border: 1px solid rgba(255,255,255,0.3); }
+        .btn-primary:hover { background: rgba(255,255,255,0.3); transform: translateY(-2px); }
         .btn-danger { background: #e74c3c; color: white; }
-        .announcement { background: white; margin: 20px; padding: 15px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        .main-content { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; padding: 20px; max-width: 1200px; margin: 0 auto; }
-        .score-section { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        .section-title { font-size: 18px; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; }
+        .announcement { background: white; margin: 1.5rem 2rem; padding: 1.5rem; border-radius: 15px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); border-left: 4px solid #667eea; }
+        .main-content { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; padding: 0 2rem 2rem; max-width: 1400px; margin: 0 auto; }
+        .score-section { background: white; border-radius: 15px; padding: 1.5rem; box-shadow: 0 5px 20px rgba(0,0,0,0.08); transition: transform 0.3s ease; }
+        .score-section:hover { transform: translateY(-2px); }
+        .section-title { font-size: 1.3rem; margin-bottom: 1.5rem; padding-bottom: 0.5rem; border-bottom: 2px solid #f0f0f0; color: #444; display: flex; justify-content: space-between; }
         .student-table { width: 100%; border-collapse: collapse; }
-        .student-table th, .student-table td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; }
-        .student-table th { background: #f8f9fa; }
+        .student-table th, .student-table td { padding: 0.8rem; text-align: left; border-bottom: 1px solid #f0f0f0; transition: background-color 0.2s ease; }
+        .student-table th { background: #f8f9fa; font-weight: 600; color: #555; }
         .student-table tr:hover td { background: #f8f9fa; }
-        .score-cell { cursor: pointer; }
-        .add-score { color: #27ae60; font-weight: bold; }
-        .minus-score { color: #e74c3c; font-weight: bold; }
-        .total-score { color: #2980b9; font-weight: bold; }
-        .score-modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center; }
-        .modal-content { background: white; padding: 30px; border-radius: 10px; width: 90%; max-width: 500px; }
-        .input-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; font-weight: bold; }
-        select, input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; }
-        .score-buttons { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 15px 0; }
-        .score-btn { padding: 10px; border: 1px solid #ddd; background: white; border-radius: 5px; cursor: pointer; text-align: center; }
-        .score-btn.selected { background: #667eea; color: white; }
-        .action-buttons { display: flex; gap: 10px; margin-top: 20px; }
-        .action-btn { flex: 1; padding: 10px; border: none; border-radius: 5px; cursor: pointer; }
+        .score-cell { cursor: pointer; position: relative; }
+        .score-cell:hover { background: #e3f2fd !important; }
+        .add-score { color: #27ae60; font-weight: 600; }
+        .minus-score { color: #e74c3c; font-weight: 600; }
+        .total-score { color: #2980b9; font-weight: 700; }
+        .score-modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center; animation: fadeIn 0.3s ease; }
+        .modal-content { background: white; padding: 2rem; border-radius: 15px; width: 90%; max-width: 400px; animation: slideUp 0.3s ease; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes slideUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        .score-buttons { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.5rem; margin: 1rem 0; }
+        .score-btn { padding: 0.8rem; border: 2px solid #e1e5e9; background: white; border-radius: 8px; cursor: pointer; transition: all 0.2s ease; text-align: center; }
+        .score-btn:hover { border-color: #667eea; background: #f8f9ff; }
+        .score-btn.selected { border-color: #667eea; background: #667eea; color: white; }
+        .action-buttons { display: flex; gap: 1rem; margin-top: 1.5rem; }
+        .action-btn { flex: 1; padding: 0.8rem; border: none; border-radius: 8px; cursor: pointer; transition: all 0.2s ease; }
         .submit-btn { background: #27ae60; color: white; }
+        .submit-btn:hover { background: #219a52; }
+        .revoke-btn { background: #e74c3c; color: white; }
+        .revoke-btn:hover { background: #c0392b; }
         .cancel-btn { background: #95a5a6; color: white; }
-        .tasks-panel { position: fixed; top: 0; right: -400px; width: 400px; height: 100vh; background: white; box-shadow: -5px 0 15px rgba(0,0,0,0.1); transition: right 0.3s; padding: 20px; overflow-y: auto; }
+        .cancel-btn:hover { background: #7f8c8d; }
+        .tasks-panel { position: fixed; top: 0; right: -400px; width: 400px; height: 100vh; background: white; box-shadow: -5px 0 20px rgba(0,0,0,0.1); transition: right 0.3s ease; padding: 2rem; overflow-y: auto; z-index: 999; }
         .tasks-panel.active { right: 0; }
-        .panel-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 999; }
+        .panel-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 998; }
         .panel-overlay.active { display: block; }
-        .task-item { background: #f8f9fa; padding: 15px; border-radius: 5px; margin-bottom: 10px; }
-        .admin-panel { position: fixed; bottom: 20px; right: 20px; }
-        .admin-btn { background: #667eea; color: white; border: none; border-radius: 50%; width: 60px; height: 60px; font-size: 20px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.2); }
-        .admin-menu { position: absolute; bottom: 70px; right: 0; background: white; border-radius: 10px; box-shadow: 0 5px 15px rgba(0,0,0,0.2); padding: 10px; min-width: 200px; display: none; }
+        .task-item { background: #f8f9fa; padding: 1.5rem; border-radius: 8px; margin-bottom: 1rem; border-left: 4px solid #667eea; }
+        .admin-panel { position: fixed; bottom: 2rem; right: 2rem; }
+        .admin-btn { background: #667eea; color: white; border: none; border-radius: 50%; width: 60px; height: 60px; font-size: 1.5rem; cursor: pointer; box-shadow: 0 4px 15px rgba(0,0,0,0.2); transition: all 0.3s ease; }
+        .admin-btn:hover { transform: scale(1.1); }
+        .admin-menu { position: absolute; bottom: 70px; right: 0; background: white; border-radius: 10px; box-shadow: 0 5px 15px rgba(0,0,0,0.2); padding: 1rem; min-width: 200px; display: none; }
         .admin-menu.active { display: block; }
-        .menu-item { padding: 10px; border: none; background: none; width: 100%; text-align: left; cursor: pointer; border-radius: 5px; }
+        .menu-item { padding: 0.75rem 1rem; border: none; background: none; width: 100%; text-align: left; cursor: pointer; border-radius: 5px; transition: background 0.2s ease; }
         .menu-item:hover { background: #f5f5f5; }
         @media (max-width: 768px) {
-            .main-content { grid-template-columns: 1fr; }
-            .header-content { flex-direction: column; gap: 10px; text-align: center; }
+            .main-content { grid-template-columns: 1fr; padding: 0 1rem 1rem; }
+            .header { padding: 1rem; }
+            .header-content { flex-direction: column; gap: 1rem; text-align: center; }
             .tasks-panel { width: 100%; right: -100%; }
         }
     </style>
@@ -849,7 +729,7 @@ async function renderClassPage(db) {
                 <h1>${settingMap.site_title || '2314班综合评分系统'}</h1>
                 <div class="date" id="currentDate"></div>
             </div>
-            <div>
+            <div style="display: flex; gap: 1rem; align-items: center;">
                 <button class="btn btn-primary" onclick="openTasksPanel()">任务管理</button>
                 <button class="btn btn-primary" onclick="openLogsPage()">操作日志</button>
                 <button class="btn btn-danger" onclick="logout()">退出登录</button>
@@ -858,8 +738,8 @@ async function renderClassPage(db) {
     </div>
 
     <div class="announcement">
-        <strong>班级公告：</strong> <span id="announcementText">${settingMap.announcement || '欢迎使用班级综合评分系统！'}</span>
-        <button onclick="editAnnouncement()" style="margin-left: 10px; background: none; border: none; color: #667eea; cursor: pointer;">编辑</button>
+        <strong>班级公告：</strong> <span id="announcementText">${settingMap.announcement || '欢迎使用班级评分系统！'}</span>
+        <button onclick="editAnnouncement()" style="margin-left: 1rem; background: none; border: none; color: #667eea; cursor: pointer;">编辑</button>
     </div>
 
     <div class="main-content">
@@ -867,7 +747,7 @@ async function renderClassPage(db) {
             <div class="section-title"><span>加分排行榜</span><span>总分</span></div>
             <table class="student-table">
                 <thead><tr><th>排名</th><th>姓名</th><th>加分</th></tr></thead>
-                <tbody>${addRankings.map((s, i) => `<tr><td>${i+1}</td><td>${s.name}</td><td class="add-score">+${s.add_score}</td></tr>`).join('')}</tbody>
+                <tbody>${studentsData.addRankings.map((s, i) => `<tr><td>${i+1}</td><td>${s.name}</td><td class="add-score">+${s.add_score}</td></tr>`).join('')}</tbody>
             </table>
         </div>
 
@@ -875,21 +755,21 @@ async function renderClassPage(db) {
             <div class="section-title"><span>扣分排行榜</span><span>总分</span></div>
             <table class="student-table">
                 <thead><tr><th>排名</th><th>姓名</th><th>扣分</th></tr></thead>
-                <tbody>${minusRankings.map((s, i) => `<tr><td>${i+1}</td><td>${s.name}</td><td class="minus-score">-${s.minus_score}</td></tr>`).join('')}</tbody>
+                <tbody>${studentsData.minusRankings.map((s, i) => `<tr><td>${i+1}</td><td>${s.name}</td><td class="minus-score">-${s.minus_score}</td></tr>`).join('')}</tbody>
             </table>
         </div>
 
         <div class="score-section" style="grid-column: 1 / -1;">
-            <div class="section-title"><span>学生综合评分表</span><span style="font-size: 14px; color: #666;">点击分数单元格进行评分</span></div>
+            <div class="section-title"><span>学生综合评分表</span><span style="font-size: 0.9rem; color: #666;">点击分数单元格进行评分</span></div>
             <div style="overflow-x: auto;">
                 <table class="student-table">
                     <thead><tr><th>姓名</th><th>加分总分</th><th>扣分总分</th><th>最终得分</th><th>操作</th></tr></thead>
-                    <tbody>${students.map(s => `<tr>
+                    <tbody>${studentsData.students.map(s => `<tr>
                         <td>${s.name}</td>
                         <td class="score-cell add-score" onclick="openScoreModal(${s.id}, 'add', '${s.name}')">+${s.add_score}</td>
                         <td class="score-cell minus-score" onclick="openScoreModal(${s.id}, 'minus', '${s.name}')">-${s.minus_score}</td>
                         <td class="total-score">${s.total_score > 0 ? '+' : ''}${s.total_score}</td>
-                        <td><button class="btn btn-danger" style="padding: 5px 10px; font-size: 12px;" onclick="revokeLastAction(${s.id})">撤销</button></td>
+                        <td><button class="btn-danger" style="padding: 0.5rem 1rem; font-size: 0.875rem;" onclick="revokeLastAction(${s.id})">撤销</button></td>
                     </tr>`).join('')}</tbody>
                 </table>
             </div>
@@ -901,27 +781,46 @@ async function renderClassPage(db) {
             <h3 id="modalTitle">评分操作</h3>
             <div class="input-group">
                 <label>评分项目：</label>
-                <select id="categorySelect">${scoreCategories.filter(c => c.type === 'add').map(c => `<option value="${c.id}">${c.name}</option>`).join('')}</select>
+                <select id="categorySelect" style="width: 100%; padding: 0.8rem; border: 2px solid #e1e5e9; border-radius: 8px; margin-top: 0.5rem;">
+                    <option value="作业完成质量">作业完成质量</option>
+                    <option value="天天练是否达标">天天练是否达标</option>
+                    <option value="准时上课">准时上课</option>
+                    <option value="卫生完成情况">卫生完成情况</option>
+                    <option value="行为习惯">行为习惯</option>
+                    <option value="早操出勤">早操出勤</option>
+                    <option value="上课专注">上课专注</option>
+                    <option value="未交拖延作业">未交拖延作业</option>
+                    <option value="课堂表现">课堂表现</option>
+                    <option value="其他">其他</option>
+                </select>
             </div>
             <div class="input-group">
                 <label>操作教师：</label>
-                <select id="operatorSelect">
-                    <option value="语文老师">语文老师</option><option value="数学老师">数学老师</option><option value="英语老师">英语老师</option>
-                    <option value="政治老师">政治老师</option><option value="历史老师">历史老师</option><option value="物理老师">物理老师</option>
-                    <option value="化学老师">化学老师</option><option value="班主任">班主任</option>
+                <select id="operatorSelect" style="width: 100%; padding: 0.8rem; border: 2px solid #e1e5e9; border-radius: 8px; margin-top: 0.5rem;">
+                    <option value="语文">语文</option>
+                    <option value="数学">数学</option>
+                    <option value="英语">英语</option>
+                    <option value="政治">政治</option>
+                    <option value="历史">历史</option>
+                    <option value="物理">物理</option>
+                    <option value="化学">化学</option>
                 </select>
             </div>
             <div class="input-group">
                 <label>分值：</label>
                 <div class="score-buttons" id="scoreButtons">
-                    <div class="score-btn" data-score="1">+1</div><div class="score-btn" data-score="2">+2</div><div class="score-btn" data-score="3">+3</div>
-                    <div class="score-btn" data-score="4">+4</div><div class="score-btn" data-score="5">+5</div><div class="score-btn" data-score="custom">自定义</div>
+                    <div class="score-btn" data-score="1">+1</div>
+                    <div class="score-btn" data-score="2">+2</div>
+                    <div class="score-btn" data-score="3">+3</div>
+                    <div class="score-btn" data-score="4">+4</div>
+                    <div class="score-btn" data-score="5">+5</div>
+                    <div class="score-btn" data-score="custom">自定义</div>
                 </div>
-                <input type="number" id="customScore" style="display: none; margin-top: 10px;" placeholder="输入分值" min="1">
+                <input type="number" id="customScore" style="width: 100%; padding: 0.8rem; border: 2px solid #e1e5e9; border-radius: 8px; margin-top: 0.5rem; display: none;" placeholder="输入分值">
             </div>
             <div class="input-group">
                 <label>备注：</label>
-                <input type="text" id="scoreNote" placeholder="可选备注">
+                <input type="text" id="scoreNote" style="width: 100%; padding: 0.8rem; border: 2px solid #e1e5e9; border-radius: 8px; margin-top: 0.5rem;" placeholder="可选备注">
             </div>
             <div class="action-buttons">
                 <button class="cancel-btn" onclick="closeScoreModal()">取消</button>
@@ -933,16 +832,17 @@ async function renderClassPage(db) {
     <div class="panel-overlay" id="panelOverlay" onclick="closeTasksPanel()"></div>
     <div class="tasks-panel" id="tasksPanel">
         <h2>任务管理</h2>
-        <div style="margin: 20px 0;">
-            <input type="text" id="taskTitle" placeholder="任务标题" style="width: 100%; padding: 10px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 5px;">
-            <textarea id="taskContent" placeholder="任务内容" style="width: 100%; padding: 10px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 5px; height: 100px;"></textarea>
-            <input type="datetime-local" id="taskDeadline" style="width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 5px;">
-            <button class="submit-btn" style="width: 100%; padding: 10px;" onclick="addTask()">发布任务</button>
+        <div style="margin: 1.5rem 0;">
+            <input type="text" id="taskTitle" placeholder="任务标题" style="width: 100%; padding: 0.8rem; border: 2px solid #e1e5e9; border-radius: 8px; margin-bottom: 1rem;">
+            <textarea id="taskContent" placeholder="任务内容" style="width: 100%; padding: 0.8rem; border: 2px solid #e1e5e9; border-radius: 8px; margin-bottom: 1rem; height: 100px; resize: vertical;"></textarea>
+            <input type="datetime-local" id="taskDeadline" style="width: 100%; padding: 0.8rem; border: 2px solid #e1e5e9; border-radius: 8px; margin-bottom: 1.5rem;">
+            <button class="submit-btn" style="width: 100%;" onclick="addTask()">发布任务</button>
         </div>
         <h3>最近任务</h3>
-        <div id="tasksList">${tasks.map(t => `<div class="task-item">
-            <h4>${t.title}</h4><p>${t.content}</p>
-            <div style="font-size: 12px; color: #666;">截止: ${new Date(t.deadline).toLocaleString()} | 发布: ${t.created_by}</div>
+        <div id="tasksList">${tasks.results.map(t => `<div class="task-item">
+            <h4 style="margin-bottom: 0.5rem;">${t.title}</h4>
+            <p style="color: #666; margin-bottom: 0.5rem;">${t.content}</p>
+            <div style="font-size: 0.8rem; color: #999;">截止: ${new Date(t.deadline).toLocaleString()} | 发布: ${t.created_by}</div>
         </div>`).join('')}</div>
     </div>
 
@@ -958,15 +858,37 @@ async function renderClassPage(db) {
 
     <script>
         let currentStudentId = null, currentScoreType = 'add', currentStudentName = '', selectedScore = 1;
-        document.getElementById('currentDate').textContent = new Date().toLocaleDateString('zh-CN');
+        document.getElementById('currentDate').textContent = new Date().toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' });
+        
         function openScoreModal(studentId, type, studentName) {
-            currentStudentId = studentId; currentScoreType = type; currentStudentName = studentName;
+            currentStudentId = studentId;
+            currentScoreType = type;
+            currentStudentName = studentName;
             document.getElementById('modalTitle').textContent = '为 ' + studentName + (type === 'add' ? ' 加分' : ' 扣分');
-            const select = document.getElementById('categorySelect');
-            select.innerHTML = ${JSON.stringify(scoreCategories)}.filter(c => c.type === type).map(c => '<option value="' + c.id + '">' + c.name + '</option>').join('');
+            
+            // 调整按钮显示
+            const scoreButtons = document.querySelectorAll('.score-btn');
+            if (type === 'minus') {
+                scoreButtons.forEach(btn => {
+                    if (btn.dataset.score !== 'custom') btn.textContent = btn.textContent.replace('+', '-');
+                });
+            } else {
+                scoreButtons.forEach(btn => {
+                    if (btn.dataset.score !== 'custom') btn.textContent = btn.textContent.replace('-', '+');
+                });
+            }
+            
             document.getElementById('scoreModal').style.display = 'flex';
         }
-        function closeScoreModal() { document.getElementById('scoreModal').style.display = 'none'; }
+        
+        function closeScoreModal() {
+            document.getElementById('scoreModal').style.display = 'none';
+            document.getElementById('customScore').style.display = 'none';
+            document.getElementById('customScore').value = '';
+            selectedScore = 1;
+            updateScoreButtons();
+        }
+        
         document.querySelectorAll('.score-btn').forEach(btn => {
             btn.addEventListener('click', function() {
                 if (this.dataset.score === 'custom') {
@@ -975,143 +897,188 @@ async function renderClassPage(db) {
                     document.getElementById('customScore').style.display = 'none';
                     selectedScore = parseInt(this.dataset.score);
                 }
-                document.querySelectorAll('.score-btn').forEach(b => b.classList.remove('selected'));
-                this.classList.add('selected');
+                updateScoreButtons();
             });
         });
+        
+        document.getElementById('customScore').addEventListener('input', function() {
+            selectedScore = parseInt(this.value) || 0;
+        });
+        
+        function updateScoreButtons() {
+            document.querySelectorAll('.score-btn').forEach(btn => {
+                btn.classList.remove('selected');
+                if (btn.dataset.score === 'custom' && document.getElementById('customScore').style.display === 'block') {
+                    btn.classList.add('selected');
+                } else if (parseInt(btn.dataset.score) === selectedScore) {
+                    btn.classList.add('selected');
+                }
+            });
+        }
+        
         async function submitScore() {
-            const categoryId = document.getElementById('categorySelect').value;
+            const category = document.getElementById('categorySelect').value;
             const operator = document.getElementById('operatorSelect').value;
             const note = document.getElementById('scoreNote').value;
             let score = selectedScore;
+            
             if (document.getElementById('customScore').style.display === 'block') {
                 score = parseInt(document.getElementById('customScore').value) || 1;
             }
-            const response = await fetch('/api/score', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ studentId: currentStudentId, categoryId, score, operator, note })
+            
+            const response = await fetch('/api/score/add', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    studentId: currentStudentId,
+                    scoreType: currentScoreType,
+                    scoreValue: score,
+                    category: category,
+                    subject: operator,
+                    operator: operator + '老师',
+                    note: note
+                })
             });
-            const result = await response.json();
-            if (result.success) { closeScoreModal(); setTimeout(() => location.reload(), 500); }
-            else alert(result.error || '提交失败');
+            
+            if (response.ok) {
+                closeScoreModal();
+                setTimeout(() => location.reload(), 500);
+            } else {
+                alert('提交失败');
+            }
         }
+        
         async function revokeLastAction(studentId) {
             if (!confirm('确定撤销最后一次操作？')) return;
-            const response = await fetch('/api/revoke', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ studentId }) });
-            const result = await response.json();
-            if (result.success) setTimeout(() => location.reload(), 500);
+            const response = await fetch('/api/score/revoke', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ studentId })
+            });
+            if (response.ok) setTimeout(() => location.reload(), 500);
             else alert('撤销失败');
         }
+        
         function openTasksPanel() {
             document.getElementById('tasksPanel').classList.add('active');
             document.getElementById('panelOverlay').classList.add('active');
         }
+        
         function closeTasksPanel() {
             document.getElementById('tasksPanel').classList.remove('active');
             document.getElementById('panelOverlay').classList.remove('active');
         }
+        
         async function addTask() {
             const title = document.getElementById('taskTitle').value;
             const content = document.getElementById('taskContent').value;
             const deadline = document.getElementById('taskDeadline').value;
             if (!title || !content) { alert('请填写任务标题和内容'); return; }
             const response = await fetch('/api/tasks', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ title, content, deadline, created_by: '班级账号' })
             });
-            const result = await response.json();
-            if (result.success) { closeTasksPanel(); setTimeout(() => location.reload(), 500); }
-            else alert('发布失败');
+            if (response.ok) {
+                closeTasksPanel();
+                setTimeout(() => location.reload(), 500);
+            } else alert('发布失败');
         }
+        
         function toggleAdminMenu() {
             document.getElementById('adminMenu').classList.toggle('active');
         }
+        
         async function createSnapshot() {
             const month = new Date().toISOString().slice(0,7);
             const title = prompt('输入快照标题:');
             if (!title) return;
-            const response = await fetch('/api/snapshot', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ month, title }) });
-            const result = await response.json();
-            alert(result.success ? '保存成功' : '保存失败');
+            const response = await fetch('/api/snapshot', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ month, title })
+            });
+            alert((await response.json()).success ? '保存成功' : '保存失败');
         }
+        
         async function resetScores() {
             if (!confirm('确定重置所有分数？')) return;
             const response = await fetch('/api/reset', { method: 'POST' });
-            const result = await response.json();
-            if (result.success) setTimeout(() => location.reload(), 500);
+            if ((await response.json()).success) setTimeout(() => location.reload(), 500);
             else alert('重置失败');
         }
+        
         async function clearAllData() {
             if (!confirm('确定清空所有数据？')) return;
-            const response = await fetch('/api/clear-all', { method: 'POST' });
-            const result = await response.json();
-            if (result.success) setTimeout(() => location.reload(), 500);
+            const response = await fetch('/api/clear', { method: 'POST' });
+            if ((await response.json()).success) setTimeout(() => location.reload(), 500);
             else alert('清空失败');
         }
+        
         async function showMonthlyData() {
             const response = await fetch('/api/monthly');
             const months = await response.json();
-            alert(months.length ? '历史数据: ' + months.join(', ') : '暂无数据');
+            alert(months.length ? '历史数据: ' + months.map(m => m.month + '-' + m.title).join(', ') : '暂无数据');
         }
+        
         function editAnnouncement() {
             const current = document.getElementById('announcementText').textContent;
             const newText = prompt('编辑公告:', current);
             if (newText !== null) document.getElementById('announcementText').textContent = newText;
         }
-        function openLogsPage() { window.open('/logs', '_blank'); }
-        async function logout() { await fetch('/api/logout'); window.location.href = '/login'; }
-        document.getElementById('scoreModal').addEventListener('click', e => { if (e.target === e.currentTarget) closeScoreModal(); });
+        
+        function openLogsPage() {
+            window.open('/logs', '_blank');
+        }
+        
+        async function logout() {
+            await fetch('/api/logout');
+            window.location.href = '/login';
+        }
+        
+        document.getElementById('scoreModal').addEventListener('click', e => {
+            if (e.target === e.currentTarget) closeScoreModal();
+        });
+        
+        document.addEventListener('click', e => {
+            if (!e.target.closest('.admin-panel')) {
+                document.getElementById('adminMenu').classList.remove('active');
+            }
+        });
     </script>
 </body>
 </html>`;
-    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-  } catch (error) {
-    throw new Error('渲染班级页面失败: ' + error.message);
-  }
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
 // 渲染访客页面
 async function renderVisitorPage(db) {
-  try {
-    const studentsResult = await db.prepare(`
-      SELECT s.id, s.name, 
-             COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE 0 END), 0) as add_score,
-             COALESCE(SUM(CASE WHEN sc.type = 'minus' THEN sr.score ELSE 0 END), 0) as minus_score,
-             COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE -sr.score END), 0) as total_score
-      FROM students s
-      LEFT JOIN score_records sr ON s.id = sr.student_id
-      LEFT JOIN score_categories sc ON sr.category_id = sc.id
-      GROUP BY s.id, s.name
-      ORDER BY total_score DESC
-    `).all();
+  const studentsData = await handleGetStudents(db).then(r => r.json());
+  const settings = await db.prepare(
+    'SELECT key, value FROM settings WHERE key IN (?, ?)'
+  ).bind('site_title', 'class_name').all();
 
-    const settingsResult = await db.prepare(
-      'SELECT key, value FROM settings WHERE key IN (?, ?)'
-    ).bind('site_title', 'class_name').all();
+  const settingMap = {};
+  settings.results.forEach(row => {
+    settingMap[row.key] = row.value;
+  });
 
-    const students = studentsResult.results;
-    const settingMap = {};
-    settingsResult.results.forEach(row => {
-      settingMap[row.key] = row.value;
-    });
-
-    const html = `<!DOCTYPE html>
+  const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${settingMap.site_title || '班级评分系统'} - 访客视图</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; font-family: Arial, sans-serif; }
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', system-ui, sans-serif; }
         body { background: #f5f7fa; color: #333; }
-        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px 20px; text-align: center; }
-        .login-prompt { text-align: center; padding: 30px 20px; background: white; margin: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        .login-btn { background: #667eea; color: white; padding: 12px 30px; border: none; border-radius: 5px; text-decoration: none; display: inline-block; margin-top: 15px; }
-        .ranking-table { width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin: 20px 0; }
-        .ranking-table th, .ranking-table td { padding: 15px; text-align: center; border-bottom: 1px solid #eee; }
-        .ranking-table th { background: #f8f9fa; }
-        .container { padding: 20px; max-width: 600px; margin: 0 auto; }
-        .section-title { font-size: 24px; margin: 30px 0 20px; text-align: center; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 2rem 1rem; text-align: center; }
+        .login-prompt { text-align: center; padding: 2rem 1rem; background: white; margin: 1rem; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .login-btn { background: #667eea; color: white; padding: 1rem 2rem; border: none; border-radius: 10px; text-decoration: none; display: inline-block; margin-top: 1rem; font-weight: 600; }
+        .ranking-table { width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin: 1rem 0; }
+        .ranking-table th, .ranking-table td { padding: 1rem; text-align: center; border-bottom: 1px solid #eee; }
+        .ranking-table th { background: #f8f9fa; font-weight: 600; }
+        .container { padding: 1rem; max-width: 600px; margin: 0 auto; }
     </style>
 </head>
 <body>
@@ -1124,80 +1091,64 @@ async function renderVisitorPage(db) {
             <p>查看完整功能请登录系统</p>
             <a href="/login" class="login-btn">立即登录</a>
         </div>
-        <div class="section-title">学生评分总榜</div>
+        <h2 style="text-align: center; margin: 2rem 0 1rem;">学生评分排名</h2>
         <table class="ranking-table">
             <thead><tr><th>排名</th><th>姓名</th><th>总分</th></tr></thead>
-            <tbody>${students.map((s, i) => `<tr>
+            <tbody>${studentsData.students.map((s, i) => `<tr>
                 <td>${i+1}</td><td>${s.name}</td>
-                <td style="font-weight: bold; color: ${s.total_score >= 0 ? '#27ae60' : '#e74c3c'}">${s.total_score > 0 ? '+' : ''}${s.total_score}</td>
+                <td style="font-weight: 600; color: ${s.total_score >= 0 ? '#27ae60' : '#e74c3c'}">${s.total_score > 0 ? '+' : ''}${s.total_score}</td>
             </tr>`).join('')}</tbody>
         </table>
     </div>
 </body>
 </html>`;
-    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-  } catch (error) {
-    throw new Error('渲染访客页面失败: ' + error.message);
-  }
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
 // 渲染管理员页面
 async function renderAdminPage(db) {
-  try {
-    const session = await validateSession(new Request('http://localhost'), db);
-    if (!session || session.role !== 'admin') {
-      return Response.redirect(new URL('/login', 'http://localhost'));
-    }
+  const session = await validateSession(new Request('http://localhost'), db);
+  if (!session || session.role !== 'admin') {
+    return Response.redirect('/login');
+  }
 
-    const [studentsResult, logsResult, settingsResult] = await Promise.all([
-      db.prepare(`
-        SELECT s.id, s.name, 
-               COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE 0 END), 0) as add_score,
-               COALESCE(SUM(CASE WHEN sc.type = 'minus' THEN sr.score ELSE 0 END), 0) as minus_score,
-               COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE -sr.score END), 0) as total_score
-        FROM students s
-        LEFT JOIN score_records sr ON s.id = sr.student_id
-        LEFT JOIN score_categories sc ON sr.category_id = sc.id
-        GROUP BY s.id, s.name
-        ORDER BY total_score DESC
-      `).all(),
-      db.prepare('SELECT * FROM operation_logs ORDER BY created_at DESC LIMIT 50').all(),
-      db.prepare('SELECT key, value FROM settings').all()
-    ]);
+  const [studentsData, logs, settings] = await Promise.all([
+    handleGetStudents(db).then(r => r.json()),
+    db.prepare('SELECT * FROM operation_logs ORDER BY created_at DESC LIMIT 50').all(),
+    db.prepare('SELECT key, value FROM settings').all()
+  ]);
 
-    const students = studentsResult.results;
-    const logs = logsResult.results;
-    const settingMap = {};
-    settingsResult.results.forEach(row => {
-      settingMap[row.key] = row.value;
-    });
+  const settingMap = {};
+  settings.results.forEach(row => {
+    settingMap[row.key] = row.value;
+  });
 
-    const html = `<!DOCTYPE html>
+  const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${settingMap.site_title || '班级评分系统'} - 管理员</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; font-family: Arial, sans-serif; }
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', system-ui, sans-serif; }
         body { background: #f5f7fa; color: #333; }
-        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; }
-        .header-content { display: flex; justify-content: space-between; align-items: center; max-width: 1200px; margin: 0 auto; }
-        .btn { padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; margin-left: 10px; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 1.5rem 2rem; }
+        .header-content { display: flex; justify-content: space-between; align-items: center; max-width: 1400px; margin: 0 auto; }
+        .btn { padding: 0.75rem 1.5rem; border: none; border-radius: 10px; font-weight: 600; cursor: pointer; text-decoration: none; display: inline-block; margin-left: 10px; }
         .btn-primary { background: rgba(255,255,255,0.2); color: white; border: 1px solid rgba(255,255,255,0.3); }
-        .main-content { max-width: 1200px; margin: 0 auto; padding: 20px; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        .card { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .main-content { max-width: 1400px; margin: 0 auto; padding: 2rem; display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
+        .card { background: white; border-radius: 15px; padding: 2rem; box-shadow: 0 5px 20px rgba(0,0,0,0.08); }
         .card-full { grid-column: 1 / -1; }
-        .card-title { font-size: 18px; margin-bottom: 15px; }
-        .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 20px; }
-        .stat-card { background: #f8f9fa; padding: 15px; border-radius: 5px; text-align: center; }
-        .stat-number { font-size: 24px; font-weight: bold; color: #667eea; }
+        .card-title { font-size: 1.5rem; margin-bottom: 1.5rem; }
+        .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-bottom: 2rem; }
+        .stat-card { background: #f8f9fa; padding: 1.5rem; border-radius: 10px; text-align: center; }
+        .stat-number { font-size: 2rem; font-weight: bold; color: #667eea; }
         .data-table { width: 100%; border-collapse: collapse; }
-        .data-table th, .data-table td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; }
+        .data-table th, .data-table td { padding: 1rem; text-align: left; border-bottom: 1px solid #eee; }
         .data-table th { background: #f8f9fa; }
-        .settings-form { display: grid; gap: 15px; }
-        .form-group { display: flex; flex-direction: column; gap: 5px; }
-        .form-group input { padding: 10px; border: 1px solid #ddd; border-radius: 5px; }
+        .settings-form { display: grid; gap: 1.5rem; }
+        .form-group { display: flex; flex-direction: column; gap: 0.5rem; }
+        .form-group input { padding: 0.8rem; border: 2px solid #e1e5e9; border-radius: 8px; }
         .btn-success { background: #27ae60; color: white; }
         .btn-danger { background: #e74c3c; color: white; }
     </style>
@@ -1213,9 +1164,9 @@ async function renderAdminPage(db) {
         <div class="card card-full">
             <div class="card-title">系统概览</div>
             <div class="stats-grid">
-                <div class="stat-card"><div class="stat-number">${students.length}</div><div>学生总数</div></div>
-                <div class="stat-card"><div class="stat-number">${students.reduce((a, s) => a + s.add_score, 0)}</div><div>总加分</div></div>
-                <div class="stat-card"><div class="stat-number">${students.reduce((a, s) => a + s.minus_score, 0)}</div><div>总扣分</div></div>
+                <div class="stat-card"><div class="stat-number">${studentsData.students.length}</div><div>学生总数</div></div>
+                <div class="stat-card"><div class="stat-number">${studentsData.students.reduce((a, s) => a + s.add_score, 0)}</div><div>总加分</div></div>
+                <div class="stat-card"><div class="stat-number">${studentsData.students.reduce((a, s) => a + s.minus_score, 0)}</div><div>总扣分</div></div>
             </div>
         </div>
         <div class="card">
@@ -1232,7 +1183,7 @@ async function renderAdminPage(db) {
         </div>
         <div class="card">
             <div class="card-title">系统管理</div>
-            <div style="display: flex; flex-direction: column; gap: 10px;">
+            <div style="display: flex; flex-direction: column; gap: 1rem;">
                 <button class="btn btn-primary" onclick="createSnapshot()">保存月度数据</button>
                 <button class="btn btn-primary" onclick="showMonthlyData()">查看历史数据</button>
                 <button class="btn btn-danger" onclick="resetScores()">重置当前分数</button>
@@ -1244,10 +1195,10 @@ async function renderAdminPage(db) {
             <div style="overflow-x: auto;">
                 <table class="data-table">
                     <thead><tr><th>时间</th><th>学生</th><th>操作类型</th><th>分数变化</th><th>操作教师</th><th>备注</th></tr></thead>
-                    <tbody>${logs.map(l => `<tr>
+                    <tbody>${logs.results.map(l => `<tr>
                         <td>${new Date(l.created_at).toLocaleString('zh-CN')}</td>
                         <td>${l.student_name}</td>
-                        <td><span style="padding: 3px 8px; border-radius: 10px; font-size: 12px; background: ${l.action_type === 'add' ? '#27ae60' : l.action_type === 'minus' ? '#e74c3c' : '#f39c12'}; color: white;">${l.action_type === 'add' ? '加分' : l.action_type === 'minus' ? '扣分' : '撤销'}</span></td>
+                        <td><span style="padding: 0.25rem 0.5rem; border-radius: 12px; font-size: 0.75rem; background: ${l.action === '加分' ? '#27ae60' : l.action === '扣分' ? '#e74c3c' : '#f39c12'}; color: white;">${l.action}</span></td>
                         <td style="color: ${l.score_change > 0 ? '#27ae60' : '#e74c3c'}; font-weight: bold;">${l.score_change > 0 ? '+' : ''}${l.score_change}</td>
                         <td>${l.operator}</td>
                         <td>${l.note || '-'}</td>
@@ -1261,82 +1212,85 @@ async function renderAdminPage(db) {
             e.preventDefault();
             const formData = new FormData(e.target);
             const settings = Object.fromEntries(formData);
-            const response = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settings) });
-            const result = await response.json();
-            alert(result.success ? '保存成功' : '保存失败');
+            const response = await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(settings)
+            });
+            alert((await response.json()).success ? '保存成功' : '保存失败');
         });
         async function createSnapshot() {
             const month = new Date().toISOString().slice(0,7);
             const title = prompt('输入快照标题:');
             if (!title) return;
-            const response = await fetch('/api/snapshot', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ month, title }) });
-            const result = await response.json();
-            alert(result.success ? '保存成功' : '保存失败');
+            const response = await fetch('/api/snapshot', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ month, title })
+            });
+            alert((await response.json()).success ? '保存成功' : '保存失败');
         }
         async function showMonthlyData() {
             const response = await fetch('/api/monthly');
             const months = await response.json();
-            alert(months.length ? '历史数据: ' + months.join(', ') : '暂无数据');
+            alert(months.length ? '历史数据: ' + months.map(m => m.month + '-' + m.title).join(', ') : '暂无数据');
         }
         async function resetScores() {
             if (!confirm('确定重置所有分数？')) return;
             const response = await fetch('/api/reset', { method: 'POST' });
-            const result = await response.json();
-            if (result.success) setTimeout(() => location.reload(), 500);
+            if ((await response.json()).success) setTimeout(() => location.reload(), 500);
             else alert('重置失败');
         }
         async function clearAllData() {
             if (!confirm('确定清空所有数据？')) return;
-            const response = await fetch('/api/clear-all', { method: 'POST' });
-            const result = await response.json();
-            if (result.success) setTimeout(() => location.reload(), 500);
+            const response = await fetch('/api/clear', { method: 'POST' });
+            if ((await response.json()).success) setTimeout(() => location.reload(), 500);
             else alert('清空失败');
         }
-        async function logout() { await fetch('/api/logout'); window.location.href = '/login'; }
+        async function logout() {
+            await fetch('/api/logout');
+            window.location.href = '/login';
+        }
     </script>
 </body>
 </html>`;
-    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-  } catch (error) {
-    throw new Error('渲染管理员页面失败: ' + error.message);
-  }
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
 // 渲染日志页面
 async function renderLogsPage(db, url) {
-  try {
-    const studentId = url.searchParams.get('studentId');
-    
-    let logs;
-    if (studentId) {
-      logs = await db.prepare(`
-        SELECT * FROM operation_logs WHERE student_id = ? ORDER BY created_at DESC LIMIT 100
-      `).bind(studentId).all();
-    } else {
-      logs = await db.prepare(`
-        SELECT * FROM operation_logs ORDER BY created_at DESC LIMIT 100
-      `).all();
-    }
+  const studentId = url.searchParams.get('studentId');
+  
+  let logs;
+  if (studentId) {
+    logs = await db.prepare(`
+      SELECT * FROM operation_logs WHERE student_id = ? ORDER BY created_at DESC LIMIT 100
+    `).bind(studentId).all();
+  } else {
+    logs = await db.prepare(`
+      SELECT * FROM operation_logs ORDER BY created_at DESC LIMIT 100
+    `).all();
+  }
 
-    const students = await db.prepare('SELECT id, name FROM students ORDER BY name').all();
+  const students = await db.prepare('SELECT id, name FROM students ORDER BY name').all();
 
-    const html = `<!DOCTYPE html>
+  const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>操作日志 - 班级评分系统</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; font-family: Arial, sans-serif; }
-        body { background: #f5f7fa; color: #333; padding: 20px; }
-        .header { text-align: center; margin-bottom: 20px; }
-        .filters { background: white; padding: 15px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; display: flex; gap: 10px; }
-        select, button { padding: 8px 12px; border: 1px solid #ddd; border-radius: 5px; }
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', system-ui, sans-serif; }
+        body { background: #f5f7fa; color: #333; padding: 2rem; }
+        .header { text-align: center; margin-bottom: 2rem; }
+        .filters { background: white; padding: 1.5rem; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 2rem; display: flex; gap: 1rem; align-items: center; }
+        select, button { padding: 0.8rem 1rem; border: 2px solid #e1e5e9; border-radius: 8px; background: white; }
         button { background: #667eea; color: white; border: none; cursor: pointer; }
-        .log-table { width: 100%; background: white; border-radius: 5px; overflow: hidden; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        .log-table th, .log-table td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; }
+        .log-table { width: 100%; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .log-table th, .log-table td { padding: 1rem; text-align: left; border-bottom: 1px solid #eee; }
         .log-table th { background: #f8f9fa; }
-        .back-btn { display: inline-block; margin-bottom: 15px; color: #667eea; text-decoration: none; }
+        .back-btn { display: inline-block; margin-bottom: 1rem; color: #667eea; text-decoration: none; }
     </style>
 </head>
 <body>
@@ -1352,10 +1306,10 @@ async function renderLogsPage(db, url) {
         <tbody>${logs.results.map(l => `<tr>
             <td>${new Date(l.created_at).toLocaleString('zh-CN')}</td>
             <td>${l.student_name}</td>
-            <td><span style="padding: 3px 8px; border-radius: 10px; font-size: 12px; background: ${l.action_type === 'add' ? '#27ae60' : l.action_type === 'minus' ? '#e74c3c' : '#f39c12'}; color: white;">${l.action_type === 'add' ? '加分' : l.action_type === 'minus' ? '扣分' : '撤销'}</span></td>
+            <td><span style="padding: 0.25rem 0.5rem; border-radius: 12px; font-size: 0.75rem; background: ${l.action === '加分' ? '#27ae60' : l.action === '扣分' ? '#e74c3c' : '#f39c12'}; color: white;">${l.action}</span></td>
             <td style="color: ${l.score_change > 0 ? '#27ae60' : '#e74c3c'}; font-weight: bold;">${l.score_change > 0 ? '+' : ''}${l.score_change}</td>
             <td>${l.operator}</td>
-            <td>${l.category_name}</td>
+            <td>${l.category}</td>
             <td>${l.note || '-'}</td>
         </tr>`).join('')}</tbody>
     </table>
@@ -1368,8 +1322,30 @@ async function renderLogsPage(db, url) {
     </script>
 </body>
 </html>`;
-    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-  } catch (error) {
-    throw new Error('渲染日志页面失败: ' + error.message);
-  }
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
+// 错误页面
+function renderErrorPage(message) {
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+    <title>系统错误</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+        .error-container { text-align: center; padding: 2rem; background: white; border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }
+    </style>
+</head>
+<body>
+    <div class="error-container">
+        <h1>系统错误</h1>
+        <p>${message}</p>
+        <button onclick="window.location.href='/'" style="padding: 10px 20px; background: #667eea; color: white; border: none; border-radius: 5px; cursor: pointer;">返回首页</button>
+    </div>
+</body>
+</html>`;
+  return new Response(html, {
+    status: 500,
+    headers: { 'Content-Type': 'text/html; charset=utf-8' }
+  });
 }
