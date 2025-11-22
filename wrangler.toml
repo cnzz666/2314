@@ -1,4 +1,9 @@
 name = "2314"
 main = "worker.js"
-compatibility_date = "2025-09-07"
+compatibility_date = "2025-11-22"
 keep_vars = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "2314"
+database_id = "2314"
