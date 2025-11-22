@@ -1519,11 +1519,7 @@ function renderLoginPage() {
             <div class="info-item">
                 <span>版权所有 2025 By Liuqinxi </span>
                 <span>由Cloudflare(赛博菩萨)提供cdn(内容分发网络)和worker(无服务器搭建)</span>
-            </div>
-            <div class="info-item">
-                 <span>版权所有 2025 By Liuqinxi </span>
-                <span>由Cloudflare(赛博菩萨)提供cdn(内容分发网络)和worker(无服务器搭建)</span  
-            </div>
+                <span>IT改变世界 Dream of going to San Francisco.</span>                
         </div>
         
         <div id="message" style="margin-top: 1rem; text-align: center; color: var(--danger); font-weight: 500;"></div>
