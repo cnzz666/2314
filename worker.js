@@ -279,6 +279,14 @@ async function handleAPI(request, env, url) {
       return await handleSetup(request, env.DB);
     } else if (path === '/api/health') {
       return await handleHealthCheck(env.DB);
+    } else if (path === '/api/student') {
+      if (request.method === 'POST') {
+        return await handleAddStudent(request, env.DB);
+      } else if (request.method === 'DELETE') {
+        return await handleDeleteStudent(request, env.DB);
+      }
+    } else if (path === '/api/clear-all') {
+      return await handleClearAllData(request, env.DB);
     }
 
     return new Response(JSON.stringify({ error: 'API路径不存在' }), {
@@ -322,7 +330,7 @@ async function handleHealthCheck(db) {
 // 初始化设置处理
 async function handleSetup(request, db) {
   try {
-    const { admin_username, admin_password, class_username, class_password, site_title, class_name } = await request.json();
+    const { admin_username, admin_password, class_username, class_password, site_title, class_name, clear_data } = await request.json();
     
     // 验证必需字段
     if (!admin_username || !admin_password || !class_username || !class_password) {
@@ -332,6 +340,15 @@ async function handleSetup(request, db) {
       }), {
         headers: { 'Content-Type': 'application/json' }
       });
+    }
+
+    // 如果选择清空数据，则删除所有数据
+    if (clear_data) {
+      await db.prepare('DELETE FROM score_records').run();
+      await db.prepare('DELETE FROM operation_logs').run();
+      await db.prepare('DELETE FROM tasks').run();
+      await db.prepare('DELETE FROM monthly_snapshots').run();
+      console.log('所有数据已清空');
     }
 
     // 保存设置
@@ -486,6 +503,79 @@ async function handleGetStudents(db) {
     return new Response(JSON.stringify({ 
       success: false,
       error: '获取学生数据失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// 添加学生
+async function handleAddStudent(request, db) {
+  try {
+    const { name } = await request.json();
+    
+    if (!name) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '请输入学生姓名' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    await db.prepare(
+      'INSERT OR IGNORE INTO students (name) VALUES (?)'
+    ).bind(name).run();
+
+    return new Response(JSON.stringify({ 
+      success: true,
+      message: '学生添加成功'
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Add student error:', error);
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: '添加学生失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// 删除学生
+async function handleDeleteStudent(request, db) {
+  try {
+    const { id } = await request.json();
+    
+    if (!id) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '缺少学生ID' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // 删除学生的评分记录和操作日志
+    await db.prepare('DELETE FROM score_records WHERE student_id = ?').bind(id).run();
+    await db.prepare('DELETE FROM operation_logs WHERE student_id = ?').bind(id).run();
+    await db.prepare('DELETE FROM students WHERE id = ?').bind(id).run();
+
+    return new Response(JSON.stringify({ 
+      success: true,
+      message: '学生删除成功'
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Delete student error:', error);
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: '删除学生失败: ' + error.message 
     }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' }
@@ -780,6 +870,55 @@ async function handleReset(request, db) {
   }
 }
 
+// 清空所有数据
+async function handleClearAllData(request, db) {
+  try {
+    // 删除所有表数据（保留表结构）
+    await db.prepare('DELETE FROM score_records').run();
+    await db.prepare('DELETE FROM operation_logs').run();
+    await db.prepare('DELETE FROM tasks').run();
+    await db.prepare('DELETE FROM monthly_snapshots').run();
+    await db.prepare('DELETE FROM students').run();
+    
+    // 重新初始化学生数据
+    const students = [
+      '曾钰景', '陈金语', '陈金卓', '陈明英', '陈兴旺', '陈钰琳', '代紫涵', '丁玉文',
+      '高建航', '高奇', '高思凡', '高兴扬', '关戎', '胡菡', '胡人溪', '胡延鑫',
+      '胡意佳', '胡语欣', '李国华', '李昊蓉', '李浩', '李灵芯', '李荣蝶', '李鑫蓉',
+      '廖聪斌', '刘沁熙', '刘屹', '孟舒玲', '孟卫佳', '庞清清', '任雲川', '邵金平',
+      '宋毓佳', '唐旺', '唐正高', '王恒', '王文琪', '吴良涛', '吴永贵', '夏碧涛',
+      '徐程', '徐海俊', '徐小龙', '颜荣蕊', '晏灏', '杨青望', '余芳', '张灿',
+      '张航', '张杰', '张毅', '赵丽瑞', '赵美婷', '赵威', '周安融', '周思棋', '朱蕊'
+    ];
+
+    for (const name of students) {
+      try {
+        await db.prepare(
+          'INSERT OR IGNORE INTO students (name) VALUES (?)'
+        ).bind(name).run();
+      } catch (e) {
+        console.warn(`Failed to insert student ${name}:`, e.message);
+      }
+    }
+
+    return new Response(JSON.stringify({ 
+      success: true,
+      message: '所有数据已清空并重新初始化'
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Clear all data error:', error);
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: '清空数据失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
 // 获取设置
 async function handleGetSettings(db) {
   try {
@@ -920,7 +1059,7 @@ async function handlePages(request, env, url) {
     } else if (path === '/logs') {
       return await renderLogsPage(env.DB, url);
     } else if (path === '/setup') {
-      return renderSetupPage();
+      return await renderSetupPage(env.DB);
     } else if (path === '/health') {
       return await handleHealthCheck(env.DB);
     }
@@ -1003,7 +1142,19 @@ function renderErrorPage(message) {
 }
 
 // 渲染初始化设置页面
-function renderSetupPage() {
+async function renderSetupPage(db) {
+  // 检查数据库中是否有数据
+  let hasData = false;
+  try {
+    const studentsCount = await db.prepare('SELECT COUNT(*) as count FROM students').first();
+    const tasksCount = await db.prepare('SELECT COUNT(*) as count FROM tasks').first();
+    const scoresCount = await db.prepare('SELECT COUNT(*) as count FROM score_records').first();
+    
+    hasData = (studentsCount.count > 0) || (tasksCount.count > 0) || (scoresCount.count > 0);
+  } catch (error) {
+    console.error('Error checking data:', error);
+  }
+
   const html = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -1171,6 +1322,27 @@ function renderSetupPage() {
             gap: 0.5rem;
         }
         
+        .warning-box {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid var(--danger);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+            color: var(--danger);
+        }
+        
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 1rem;
+        }
+        
+        .checkbox-group input[type="checkbox"] {
+            width: auto;
+            transform: scale(1.2);
+        }
+        
         @media (max-width: 480px) {
             .setup-container {
                 padding: 2rem 1.5rem;
@@ -1189,6 +1361,13 @@ function renderSetupPage() {
             欢迎使用班级评分系统！请先完成系统初始化设置。
         </div>
         
+        ${hasData ? `
+        <div class="warning-box">
+            <strong>⚠️ 检测到现有数据</strong>
+            <p>系统中已存在学生数据、评分记录或任务。如果您希望清空所有数据重新开始，请勾选下面的选项。</p>
+        </div>
+        ` : ''}
+        
         <form id="setupForm">
             <div class="form-section">
                 <h3>🏫 班级信息</h3>
@@ -1206,11 +1385,11 @@ function renderSetupPage() {
                 <h3>🔐 班级账号</h3>
                 <div class="input-group">
                     <div class="input-icon">👤</div>
-                    <input type="text" id="class_username" placeholder="班级登录用户名" value="2314" required>
+                    <input type="text" id="class_username" placeholder="班级登录用户名" required>
                 </div>
                 <div class="input-group">
                     <div class="input-icon">🔒</div>
-                    <input type="password" id="class_password" placeholder="班级登录密码" value="hzwy2314" required>
+                    <input type="password" id="class_password" placeholder="班级登录密码" required>
                 </div>
             </div>
             
@@ -1218,13 +1397,20 @@ function renderSetupPage() {
                 <h3>⚡ 管理员账号</h3>
                 <div class="input-group">
                     <div class="input-icon">👤</div>
-                    <input type="text" id="admin_username" placeholder="管理员用户名" value="2314admin" required>
+                    <input type="text" id="admin_username" placeholder="管理员用户名" required>
                 </div>
                 <div class="input-group">
                     <div class="input-icon">🔒</div>
-                    <input type="password" id="admin_password" placeholder="管理员密码" value="2314admin2314admin" required>
+                    <input type="password" id="admin_password" placeholder="管理员密码" required>
                 </div>
             </div>
+            
+            ${hasData ? `
+            <div class="checkbox-group">
+                <input type="checkbox" id="clear_data">
+                <label for="clear_data"><strong>清空所有现有数据并重新初始化</strong></label>
+            </div>
+            ` : ''}
             
             <button type="submit">🚀 初始化系统</button>
         </form>
@@ -1244,6 +1430,8 @@ function renderSetupPage() {
                 admin_username: document.getElementById('admin_username').value,
                 admin_password: document.getElementById('admin_password').value
             };
+
+            ${hasData ? `formData.clear_data = document.getElementById('clear_data').checked;` : ''}
 
             const submitBtn = e.target.querySelector('button');
             const originalText = submitBtn.textContent;
@@ -1472,16 +1660,7 @@ function renderLoginPage() {
             border-radius: 12px;
             font-size: 0.875rem;
             color: var(--text-light);
-        }
-        
-        .info-item {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 0.5rem;
-        }
-        
-        .info-item:last-child {
-            margin-bottom: 0;
+            text-align: center;
         }
         
         @media (max-width: 480px) {
@@ -1491,6 +1670,10 @@ function renderLoginPage() {
             
             h1 {
                 font-size: 1.75rem;
+            }
+            
+            .role-select {
+                flex-direction: column;
             }
         }
     </style>
@@ -1516,14 +1699,7 @@ function renderLoginPage() {
         </form>
         
         <div class="login-info">
-            <div class="info-item">
-                <span>班级账号:</span>
-                <span>2314 / hzwy2314</span>
-            </div>
-            <div class="info-item">
-                <span>班主任账号:</span>
-                <span>2314admin / 2314admin2314admin</span>
-            </div>
+            <p>请使用管理员分配的账号密码登录</p>
         </div>
         
         <div id="message" style="margin-top: 1rem; text-align: center; color: var(--danger); font-weight: 500;"></div>
@@ -1531,10 +1707,6 @@ function renderLoginPage() {
 
     <script>
         let currentRole = 'class';
-        const roleCredentials = {
-            class: { username: '2314', password: 'hzwy2314' },
-            admin: { username: '2314admin', password: '2314admin2314admin' }
-        };
 
         document.querySelectorAll('.role-btn').forEach(btn => {
             btn.addEventListener('click', () => {
@@ -1544,10 +1716,6 @@ function renderLoginPage() {
                 
                 if (currentRole === 'visitor') {
                     window.location.href = '/';
-                } else {
-                    const creds = roleCredentials[currentRole];
-                    document.getElementById('username').value = creds.username;
-                    document.getElementById('password').value = creds.password;
                 }
             });
         });
@@ -1591,10 +1759,6 @@ function renderLoginPage() {
                 submitBtn.disabled = false;
             }
         });
-
-        // 设置默认用户名密码
-        document.getElementById('username').value = '2314';
-        document.getElementById('password').value = 'hzwy2314';
     </script>
 </body>
 </html>
@@ -1612,9 +1776,8 @@ async function renderClassPage(db, request) {
       return Response.redirect(new URL('/login', request.url));
     }
 
-    const [studentsData, scoreCategories, tasks, settings] = await Promise.all([
+    const [studentsData, tasks, settings] = await Promise.all([
       handleGetStudents(db).then(r => r.json()),
-      db.prepare('SELECT * FROM score_categories ORDER BY type, id').all(),
       db.prepare('SELECT * FROM tasks ORDER BY created_at DESC LIMIT 10').all(),
       db.prepare('SELECT key, value FROM settings WHERE key IN (?, ?, ?)').bind('site_title', 'class_name', 'current_month').all()
     ]);
@@ -1628,7 +1791,11 @@ async function renderClassPage(db, request) {
       settingMap[row.key] = row.value;
     });
 
-    const currentMonth = settingMap.current_month || new Date().toISOString().slice(0, 7);
+    // 计算中考倒计时
+    const examDate = new Date('2026-06-16T00:00:00');
+    const now = new Date();
+    const timeDiff = examDate.getTime() - now.getTime();
+    const daysLeft = Math.ceil(timeDiff / (1000 * 3600 * 24));
 
     // 完整的班级页面HTML
     const html = `
@@ -1692,11 +1859,20 @@ async function renderClassPage(db, request) {
         }
         
         .date { 
-            font-size: 0.9rem; 
+            font-size: 1rem; 
             opacity: 0.9; 
             display: flex;
             align-items: center;
             gap: 0.5rem;
+        }
+        
+        .countdown {
+            background: rgba(255,255,255,0.2);
+            padding: 0.5rem 1rem;
+            border-radius: 12px;
+            font-weight: 600;
+            margin-left: 1rem;
+            border: 1px solid rgba(255,255,255,0.3);
         }
         
         .header-actions {
@@ -2207,194 +2383,6 @@ async function renderClassPage(db, request) {
             color: var(--text-light);
         }
         
-        .admin-panel {
-            position: fixed;
-            bottom: 2rem;
-            right: 2rem;
-            z-index: 100;
-        }
-        
-        .admin-btn {
-            background: var(--primary);
-            color: white;
-            border: none;
-            border-radius: 50%;
-            width: 60px;
-            height: 60px;
-            font-size: 1.5rem;
-            cursor: pointer;
-            box-shadow: var(--shadow-lg);
-            transition: all 0.3s ease;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            position: relative;
-            overflow: hidden;
-        }
-        
-        .admin-btn::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
-            transition: left 0.5s;
-        }
-        
-        .admin-btn:hover::before {
-            left: 100%;
-        }
-        
-        .admin-btn:hover {
-            transform: scale(1.1) rotate(90deg);
-            box-shadow: 0 15px 30px rgba(99, 102, 241, 0.4);
-        }
-        
-        .admin-menu {
-            position: absolute;
-            bottom: 70px;
-            right: 0;
-            background: var(--surface);
-            border-radius: 16px;
-            box-shadow: var(--shadow-lg);
-            padding: 1rem;
-            min-width: 200px;
-            display: none;
-            animation: slideInUp 0.3s ease;
-            border: 1px solid var(--border);
-        }
-        
-        .admin-menu.active {
-            display: block;
-        }
-        
-        .menu-item {
-            padding: 0.75rem 1rem;
-            border: none;
-            background: none;
-            width: 100%;
-            text-align: left;
-            cursor: pointer;
-            border-radius: 8px;
-            transition: background 0.2s ease;
-            color: var(--text);
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-        
-        .menu-item:hover {
-            background: var(--background);
-        }
-        
-        .menu-item.danger {
-            color: var(--danger);
-        }
-        
-        .menu-item.danger:hover {
-            background: rgba(239, 68, 68, 0.1);
-        }
-        
-        /* 两步评分模态框 */
-        .step-container {
-            display: none;
-        }
-        
-        .step-container.active {
-            display: block;
-            animation: fadeIn 0.3s ease;
-        }
-        
-        .step-indicator {
-            display: flex;
-            justify-content: center;
-            margin-bottom: 2rem;
-            gap: 0.5rem;
-        }
-        
-        .step-dot {
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            background: var(--border);
-            transition: all 0.3s ease;
-        }
-        
-        .step-dot.active {
-            background: var(--primary);
-            transform: scale(1.2);
-        }
-        
-        .step-title {
-            text-align: center;
-            margin-bottom: 1.5rem;
-            font-size: 1.3rem;
-            font-weight: 700;
-            color: var(--text);
-        }
-        
-        .student-highlight {
-            color: var(--primary);
-            font-weight: 700;
-        }
-        
-        @media (max-width: 768px) {
-            .main-content { 
-                grid-template-columns: 1fr; 
-                padding: 0 1rem 1rem; 
-                gap: 1.5rem;
-            }
-            
-            .header { 
-                padding: 1rem; 
-            }
-            
-            .header-content { 
-                flex-direction: column; 
-                gap: 1rem; 
-                text-align: center; 
-            }
-            
-            .header-actions {
-                width: 100%;
-                justify-content: center;
-            }
-            
-            .tasks-panel { 
-                width: 100%; 
-                right: -100%; 
-            }
-            
-            .score-section {
-                padding: 1.5rem;
-            }
-            
-            .announcement {
-                margin: 1rem;
-            }
-            
-            .admin-panel {
-                bottom: 1rem;
-                right: 1rem;
-            }
-            
-            .score-buttons {
-                grid-template-columns: repeat(2, 1fr);
-            }
-        }
-        
-        @media (max-width: 480px) {
-            .action-buttons {
-                flex-direction: column;
-            }
-            
-            .modal-content {
-                padding: 1.5rem;
-            }
-        }
-        
         /* 通知样式 */
         .notification {
             position: fixed;
@@ -2433,6 +2421,56 @@ async function renderClassPage(db, request) {
             from { transform: translateX(0); opacity: 1; }
             to { transform: translateX(100%); opacity: 0; }
         }
+        
+        @media (max-width: 768px) {
+            .main-content { 
+                grid-template-columns: 1fr; 
+                padding: 0 1rem 1rem; 
+                gap: 1.5rem;
+            }
+            
+            .header { 
+                padding: 1rem; 
+            }
+            
+            .header-content { 
+                flex-direction: column; 
+                gap: 1rem; 
+                text-align: center; 
+            }
+            
+            .header-actions {
+                width: 100%;
+                justify-content: center;
+            }
+            
+            .tasks-panel { 
+                width: 100%; 
+                right: -100%; 
+            }
+            
+            .score-section {
+                padding: 1.5rem;
+            }
+            
+            .announcement {
+                margin: 1rem;
+            }
+            
+            .score-buttons {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+        
+        @media (max-width: 480px) {
+            .action-buttons {
+                flex-direction: column;
+            }
+            
+            .modal-content {
+                padding: 1.5rem;
+            }
+        }
     </style>
 </head>
 <body>
@@ -2443,12 +2481,13 @@ async function renderClassPage(db, request) {
                 <div class="date">
                     <span>📅</span>
                     <span id="currentDate"></span>
+                    <div class="countdown" id="countdown">中考倒计时: ${daysLeft}天</div>
                 </div>
             </div>
             <div class="header-actions">
                 <button class="btn btn-primary" onclick="openTasksPanel()">
                     <span>📋</span>
-                    任务管理
+                    查看任务
                 </button>
                 <button class="btn btn-primary" onclick="openLogsPage()">
                     <span>📊</span>
@@ -2465,7 +2504,6 @@ async function renderClassPage(db, request) {
     <div class="announcement">
         <strong>📢 班级公告：</strong> 
         <span id="announcementText">欢迎使用班级综合评分系统！请遵守纪律，积极表现。</span>
-        <button onclick="editAnnouncement()" style="margin-left: 1rem; background: none; border: none; color: var(--primary); cursor: pointer; padding: 0.25rem 0.5rem; border-radius: 6px; transition: background 0.2s ease;">编辑</button>
     </div>
 
     <div class="main-content">
@@ -2663,18 +2701,7 @@ async function renderClassPage(db, request) {
     <!-- 任务面板 -->
     <div class="panel-overlay" id="panelOverlay" onclick="closeTasksPanel()"></div>
     <div class="tasks-panel" id="tasksPanel">
-        <h2 style="margin-bottom: 2rem; color: var(--text);">📋 任务管理系统</h2>
-        
-        <div style="margin-bottom: 2rem; background: var(--background); padding: 1.5rem; border-radius: 16px;">
-            <h3 style="margin-bottom: 1rem; color: var(--text);">发布新任务</h3>
-            <input type="text" id="taskTitle" placeholder="任务标题" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px; margin-bottom: 1rem;">
-            <textarea id="taskContent" placeholder="任务内容描述" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px; margin-bottom: 1rem; height: 120px; resize: vertical;"></textarea>
-            <input type="datetime-local" id="taskDeadline" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px; margin-bottom: 1.5rem;">
-            <button class="submit-btn" style="width: 100%; padding: 1rem; font-size: 1.1rem;" onclick="addTask()">
-                <span>🚀</span>
-                发布任务
-            </button>
-        </div>
+        <h2 style="margin-bottom: 2rem; color: var(--text);">📋 任务列表</h2>
         
         <h3 style="margin-bottom: 1rem; color: var(--text);">近期任务</h3>
         <div id="tasksList">
@@ -2687,33 +2714,10 @@ async function renderClassPage(db, request) {
                     <div class="task-content">${task.content}</div>
                     <div class="task-meta">
                         <span>发布者: ${task.created_by}</span>
-                        <span>${new Date(task.created_at).toLocaleDateString('zh-CN')}</span>
+                        <span>${new Date(task.created_at).toLocaleString('zh-CN')}</span>
                     </div>
                 </div>
             `).join('')}
-        </div>
-    </div>
-
-    <!-- 管理员功能面板 -->
-    <div class="admin-panel">
-        <button class="admin-btn" onclick="toggleAdminMenu()">⚙️</button>
-        <div class="admin-menu" id="adminMenu">
-            <button class="menu-item" onclick="createSnapshot()">
-                <span>💾</span>
-                保存月度数据
-            </button>
-            <button class="menu-item" onclick="showMonthlyData()">
-                <span>📈</span>
-                查看历史数据
-            </button>
-            <button class="menu-item" onclick="resetScores()">
-                <span>🔄</span>
-                重置当前分数
-            </button>
-            <button class="menu-item danger" onclick="clearAllData()">
-                <span>🗑️</span>
-                清空所有数据
-            </button>
         </div>
     </div>
 
@@ -2722,16 +2726,36 @@ async function renderClassPage(db, request) {
         let currentScoreType = 'add';
         let currentStudentName = '';
         let selectedScore = 1;
-        let isAdminMenuOpen = false;
         let currentStep = 1;
 
-        // 设置当前日期
-        document.getElementById('currentDate').textContent = new Date().toLocaleDateString('zh-CN', {
-            year: 'numeric',
-            month: 'long',
-            day: 'numeric',
-            weekday: 'long'
-        });
+        // 设置当前日期和时间
+        function updateDateTime() {
+            const now = new Date();
+            document.getElementById('currentDate').textContent = now.toLocaleString('zh-CN', {
+                year: 'numeric',
+                month: 'long',
+                day: 'numeric',
+                weekday: 'long',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+        }
+        
+        // 更新中考倒计时
+        function updateCountdown() {
+            const examDate = new Date('2026-06-16T00:00:00');
+            const now = new Date();
+            const timeDiff = examDate.getTime() - now.getTime();
+            const daysLeft = Math.ceil(timeDiff / (1000 * 3600 * 24));
+            document.getElementById('countdown').textContent = \`中考倒计时: \${daysLeft}天\`;
+        }
+
+        // 初始化时间和倒计时
+        updateDateTime();
+        updateCountdown();
+        setInterval(updateDateTime, 1000);
+        setInterval(updateCountdown, 60000); // 每分钟更新一次倒计时
 
         // 开始评分流程
         function startScoreProcess(studentId, type, studentName) {
@@ -2838,15 +2862,25 @@ async function renderClassPage(db, request) {
             const categorySelect = document.getElementById('categorySelect');
             categorySelect.innerHTML = '';
             
-            const categories = ${JSON.stringify((scoreCategories.results || []))};
-            const filteredCategories = categories.filter(cat => cat.type === currentScoreType);
-            
-            filteredCategories.forEach(cat => {
-                const option = document.createElement('option');
-                option.value = cat.id;
-                option.textContent = cat.name;
-                categorySelect.appendChild(option);
-            });
+            // 获取评分项目
+            fetch('/api/score-categories')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        const categories = data.categories;
+                        const filteredCategories = categories.filter(cat => cat.type === currentScoreType);
+                        
+                        filteredCategories.forEach(cat => {
+                            const option = document.createElement('option');
+                            option.value = cat.id;
+                            option.textContent = cat.name;
+                            categorySelect.appendChild(option);
+                        });
+                    }
+                })
+                .catch(error => {
+                    console.error('Error loading categories:', error);
+                });
         }
 
         // 提交分数
@@ -2956,166 +2990,6 @@ async function renderClassPage(db, request) {
             document.getElementById('panelOverlay').classList.remove('active');
         }
 
-        // 添加任务
-        async function addTask() {
-            const title = document.getElementById('taskTitle').value.trim();
-            const content = document.getElementById('taskContent').value.trim();
-            const deadline = document.getElementById('taskDeadline').value;
-
-            if (!title || !content) {
-                showNotification('请填写任务标题和内容', 'error');
-                return;
-            }
-
-            if (!deadline) {
-                showNotification('请设置任务截止时间', 'error');
-                return;
-            }
-
-            try {
-                const response = await fetch('/api/tasks', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        title,
-                        content,
-                        deadline,
-                        created_by: '班级账号'
-                    })
-                });
-
-                const result = await response.json();
-
-                if (result.success) {
-                    showNotification('任务发布成功！', 'success');
-                    document.getElementById('taskTitle').value = '';
-                    document.getElementById('taskContent').value = '';
-                    document.getElementById('taskDeadline').value = '';
-                    closeTasksPanel();
-                    setTimeout(() => location.reload(), 1500);
-                } else {
-                    showNotification('发布任务失败', 'error');
-                }
-            } catch (error) {
-                showNotification('网络错误，请重试', 'error');
-            }
-        }
-
-        // 管理员菜单
-        function toggleAdminMenu() {
-            const menu = document.getElementById('adminMenu');
-            isAdminMenuOpen = !isAdminMenuOpen;
-            menu.classList.toggle('active', isAdminMenuOpen);
-        }
-
-        // 点击外部关闭管理员菜单
-        document.addEventListener('click', function(e) {
-            if (!e.target.closest('.admin-panel') && isAdminMenuOpen) {
-                toggleAdminMenu();
-            }
-        });
-
-        // 创建月度快照
-        async function createSnapshot() {
-            const month = '${currentMonth}';
-            const title = prompt('请输入本次快照的标题（如：期中考核）:');
-            if (!title) return;
-
-            try {
-                const response = await fetch('/api/snapshot', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ month, title })
-                });
-
-                const result = await response.json();
-
-                if (result.success) {
-                    showNotification('月度数据保存成功！', 'success');
-                    toggleAdminMenu();
-                } else {
-                    showNotification('保存失败', 'error');
-                }
-            } catch (error) {
-                showNotification('网络错误，请重试', 'error');
-            }
-        }
-
-        // 重置分数
-        async function resetScores() {
-            if (!confirm('确定要重置所有学生的分数吗？此操作不可撤销！')) return;
-            
-            try {
-                const response = await fetch('/api/reset', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' }
-                });
-
-                const result = await response.json();
-
-                if (result.success) {
-                    showNotification('分数重置成功！', 'success');
-                    toggleAdminMenu();
-                    setTimeout(() => location.reload(), 1000);
-                } else {
-                    showNotification('重置失败', 'error');
-                }
-            } catch (error) {
-                showNotification('网络错误，请重试', 'error');
-            }
-        }
-
-        // 清空所有数据
-        async function clearAllData() {
-            if (!confirm('⚠️ 警告：这将清空所有数据（包括历史记录）！确定要继续吗？')) return;
-            if (!confirm('🚨 最后一次确认：此操作将永久删除所有数据！')) return;
-            
-            try {
-                await fetch('/api/reset', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' }
-                });
-                showNotification('所有数据已清空', 'success');
-                toggleAdminMenu();
-                setTimeout(() => location.reload(), 1000);
-            } catch (error) {
-                showNotification('操作失败', 'error');
-            }
-        }
-
-        // 显示月度数据
-        async function showMonthlyData() {
-            try {
-                const response = await fetch('/api/monthly');
-                const result = await response.json();
-                
-                if (!result.success || result.months.length === 0) {
-                    showNotification('暂无历史数据', 'info');
-                    return;
-                }
-                
-                let message = '历史月度数据:\\n';
-                result.months.forEach(month => {
-                    message += \`• \${month}\\n\`;
-                });
-                
-                alert(message);
-                toggleAdminMenu();
-            } catch (error) {
-                showNotification('获取数据失败', 'error');
-            }
-        }
-
-        // 编辑公告
-        function editAnnouncement() {
-            const currentText = document.getElementById('announcementText').textContent;
-            const newText = prompt('编辑班级公告:', currentText);
-            if (newText !== null) {
-                document.getElementById('announcementText').textContent = newText;
-                showNotification('公告更新成功！', 'success');
-            }
-        }
-
         // 打开日志页面
         function openLogsPage() {
             window.open('/logs', '_blank');
@@ -3168,10 +3042,12 @@ async function renderAdminPage(db, request) {
       return Response.redirect(new URL('/login', request.url));
     }
 
-    const [studentsData, logs, settings] = await Promise.all([
+    const [studentsData, logs, tasks, settings, scoreCategories] = await Promise.all([
       handleGetStudents(db).then(r => r.json()),
       db.prepare('SELECT ol.*, s.name as student_name FROM operation_logs ol JOIN students s ON ol.student_id = s.id ORDER BY ol.created_at DESC LIMIT 50').all(),
-      db.prepare('SELECT key, value FROM settings').all()
+      db.prepare('SELECT * FROM tasks ORDER BY created_at DESC').all(),
+      db.prepare('SELECT key, value FROM settings').all(),
+      db.prepare('SELECT * FROM score_categories ORDER BY type, id').all()
     ]);
 
     if (!studentsData.success) {
@@ -3182,6 +3058,12 @@ async function renderAdminPage(db, request) {
     (settings.results || []).forEach(row => {
       settingMap[row.key] = row.value;
     });
+
+    // 计算中考倒计时
+    const examDate = new Date('2026-06-16T00:00:00');
+    const now = new Date();
+    const timeDiff = examDate.getTime() - now.getTime();
+    const daysLeft = Math.ceil(timeDiff / (1000 * 3600 * 24));
 
     // 完整的管理员页面HTML
     const html = `
@@ -3235,6 +3117,23 @@ async function renderAdminPage(db, request) {
         .class-info h1 { 
             font-weight: 700; 
             margin-bottom: 0.5rem; 
+        }
+        
+        .date { 
+            font-size: 1rem; 
+            opacity: 0.9; 
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .countdown {
+            background: rgba(255,255,255,0.2);
+            padding: 0.5rem 1rem;
+            border-radius: 12px;
+            font-weight: 600;
+            margin-left: 1rem;
+            border: 1px solid rgba(255,255,255,0.3);
         }
         
         .admin-badge {
@@ -3467,6 +3366,137 @@ async function renderAdminPage(db, request) {
             transform: translateY(-2px);
         }
         
+        .action-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+            margin-top: 1.5rem;
+        }
+        
+        .action-card {
+            background: var(--background);
+            padding: 1.5rem;
+            border-radius: 16px;
+            border-left: 4px solid var(--primary);
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+        
+        .action-card:hover {
+            transform: translateY(-4px);
+            box-shadow: var(--shadow);
+        }
+        
+        .action-card.danger {
+            border-left-color: var(--danger);
+        }
+        
+        .action-card.warning {
+            border-left-color: var(--warning);
+        }
+        
+        .action-title {
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+            color: var(--text);
+        }
+        
+        .action-desc {
+            color: var(--text-light);
+            font-size: 0.875rem;
+        }
+        
+        .task-item {
+            background: var(--background);
+            padding: 1.5rem;
+            border-radius: 16px;
+            margin-bottom: 1rem;
+            border-left: 4px solid var(--primary);
+            transition: all 0.3s ease;
+        }
+        
+        .task-item:hover {
+            transform: translateX(8px);
+        }
+        
+        .task-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 0.75rem;
+        }
+        
+        .task-title {
+            font-weight: 700;
+            color: var(--text);
+            font-size: 1.1rem;
+        }
+        
+        .task-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+        
+        .task-deadline {
+            color: var(--danger);
+            font-size: 0.875rem;
+            font-weight: 600;
+        }
+        
+        .task-content {
+            color: var(--text-light);
+            line-height: 1.6;
+            margin-bottom: 1rem;
+        }
+        
+        .task-meta {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.875rem;
+            color: var(--text-light);
+        }
+        
+        .student-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .student-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem;
+            border-bottom: 1px solid var(--border);
+            transition: all 0.2s ease;
+        }
+        
+        .student-item:hover {
+            background: var(--background);
+        }
+        
+        .student-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+        
+        .small-btn {
+            padding: 0.5rem 1rem;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.875rem;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        
+        .btn-danger-small {
+            background: var(--danger);
+            color: white;
+        }
+        
+        .btn-danger-small:hover {
+            background: #dc2626;
+        }
+        
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(20px); }
             to { opacity: 1; transform: translateY(0); }
@@ -3492,6 +3522,10 @@ async function renderAdminPage(db, request) {
                 gap: 1rem;
                 text-align: center;
             }
+            
+            .action-grid {
+                grid-template-columns: 1fr;
+            }
         }
     </style>
 </head>
@@ -3502,7 +3536,11 @@ async function renderAdminPage(db, request) {
                 <h1>${settingMap.site_title || '2314班综合评分系统'}
                     <span class="admin-badge">管理员模式</span>
                 </h1>
-                <div>系统管理面板</div>
+                <div class="date">
+                    <span>📅</span>
+                    <span id="currentDate"></span>
+                    <div class="countdown" id="countdown">中考倒计时: ${daysLeft}天</div>
+                </div>
             </div>
             <div>
                 <a href="/class" class="btn btn-primary">📊 班级视图</a>
@@ -3563,22 +3601,82 @@ async function renderAdminPage(db, request) {
             </form>
         </div>
 
+        <!-- 学生管理 -->
+        <div class="card">
+            <div class="card-title">👨‍🎓 学生管理</div>
+            <div style="margin-bottom: 1.5rem;">
+                <div style="display: flex; gap: 1rem; margin-bottom: 1rem;">
+                    <input type="text" id="newStudentName" placeholder="输入学生姓名" style="flex: 1; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;">
+                    <button class="btn btn-success" onclick="addStudent()">添加学生</button>
+                </div>
+            </div>
+            <div class="student-list">
+                ${studentsData.students.map(student => `
+                    <div class="student-item">
+                        <span>${student.name}</span>
+                        <div class="student-actions">
+                            <span style="color: var(--text-light);">总分: ${student.total_score > 0 ? '+' : ''}${student.total_score}</span>
+                            <button class="small-btn btn-danger-small" onclick="deleteStudent(${student.id}, '${student.name}')">删除</button>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        </div>
+
+        <!-- 任务管理 -->
+        <div class="card">
+            <div class="card-title">📋 任务管理</div>
+            <div style="margin-bottom: 1.5rem; background: var(--background); padding: 1.5rem; border-radius: 16px;">
+                <h3 style="margin-bottom: 1rem; color: var(--text);">发布新任务</h3>
+                <input type="text" id="taskTitle" placeholder="任务标题" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px; margin-bottom: 1rem;">
+                <textarea id="taskContent" placeholder="任务内容描述" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px; margin-bottom: 1rem; height: 120px; resize: vertical;"></textarea>
+                <input type="datetime-local" id="taskDeadline" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px; margin-bottom: 1.5rem;">
+                <button class="btn btn-success" style="width: 100%; padding: 1rem; font-size: 1.1rem;" onclick="addTask()">
+                    <span>🚀</span>
+                    发布任务
+                </button>
+            </div>
+            
+            <h3 style="margin-bottom: 1rem; color: var(--text);">任务列表</h3>
+            <div id="tasksList">
+                ${(tasks.results || []).map(task => `
+                    <div class="task-item">
+                        <div class="task-header">
+                            <div class="task-title">${task.title}</div>
+                            <div class="task-actions">
+                                <button class="small-btn btn-danger-small" onclick="deleteTask(${task.id})">删除</button>
+                            </div>
+                        </div>
+                        <div class="task-content">${task.content}</div>
+                        <div class="task-meta">
+                            <span>截止时间: ${task.deadline ? new Date(task.deadline).toLocaleString('zh-CN') : '未设置'}</span>
+                            <span>发布时间: ${new Date(task.created_at).toLocaleString('zh-CN')}</span>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        </div>
+
         <!-- 系统管理 -->
         <div class="card">
             <div class="card-title">🔧 系统管理</div>
-            <div style="display: flex; flex-direction: column; gap: 1rem;">
-                <button class="btn btn-primary" onclick="createSnapshot()">
-                    💾 保存月度数据
-                </button>
-                <button class="btn btn-primary" onclick="showMonthlyData()">
-                    📈 查看历史数据
-                </button>
-                <button class="btn btn-danger" onclick="resetScores()">
-                    🔄 重置当前分数
-                </button>
-                <button class="btn btn-danger" onclick="clearAllData()">
-                    🗑️ 清空所有数据
-                </button>
+            <div class="action-grid">
+                <div class="action-card" onclick="createSnapshot()">
+                    <div class="action-title">💾 保存月度数据</div>
+                    <div class="action-desc">将当前所有学生分数保存为月度快照</div>
+                </div>
+                <div class="action-card" onclick="showMonthlyData()">
+                    <div class="action-title">📈 查看历史数据</div>
+                    <div class="action-desc">查看已保存的月度数据快照</div>
+                </div>
+                <div class="action-card warning" onclick="resetScores()">
+                    <div class="action-title">🔄 重置当前分数</div>
+                    <div class="action-desc">清空所有学生的当前分数记录</div>
+                </div>
+                <div class="action-card danger" onclick="clearAllData()">
+                    <div class="action-title">🗑️ 清空所有数据</div>
+                    <div class="action-desc">清空所有数据并重新初始化</div>
+                </div>
             </div>
         </div>
 
@@ -3621,6 +3719,35 @@ async function renderAdminPage(db, request) {
     </div>
 
     <script>
+        // 设置当前日期和时间
+        function updateDateTime() {
+            const now = new Date();
+            document.getElementById('currentDate').textContent = now.toLocaleString('zh-CN', {
+                year: 'numeric',
+                month: 'long',
+                day: 'numeric',
+                weekday: 'long',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+        }
+        
+        // 更新中考倒计时
+        function updateCountdown() {
+            const examDate = new Date('2026-06-16T00:00:00');
+            const now = new Date();
+            const timeDiff = examDate.getTime() - now.getTime();
+            const daysLeft = Math.ceil(timeDiff / (1000 * 3600 * 24));
+            document.getElementById('countdown').textContent = \`中考倒计时: \${daysLeft}天\`;
+        }
+
+        // 初始化时间和倒计时
+        updateDateTime();
+        updateCountdown();
+        setInterval(updateDateTime, 1000);
+        setInterval(updateCountdown, 60000);
+
         // 保存设置
         document.getElementById('settingsForm').addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -3647,25 +3774,137 @@ async function renderAdminPage(db, request) {
             }
         });
 
+        // 添加学生
+        async function addStudent() {
+            const name = document.getElementById('newStudentName').value.trim();
+            if (!name) {
+                alert('请输入学生姓名');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/student', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert('学生添加成功！');
+                    location.reload();
+                } else {
+                    alert('添加失败: ' + result.error);
+                }
+            } catch (error) {
+                alert('网络错误，请重试');
+            }
+        }
+
+        // 删除学生
+        async function deleteStudent(id, name) {
+            if (!confirm(\`确定要删除学生 "\${name}" 吗？此操作将删除该学生的所有评分记录！\`)) return;
+            
+            try {
+                const response = await fetch('/api/student', {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert('学生删除成功！');
+                    location.reload();
+                } else {
+                    alert('删除失败: ' + result.error);
+                }
+            } catch (error) {
+                alert('网络错误，请重试');
+            }
+        }
+
+        // 添加任务
+        async function addTask() {
+            const title = document.getElementById('taskTitle').value.trim();
+            const content = document.getElementById('taskContent').value.trim();
+            const deadline = document.getElementById('taskDeadline').value;
+
+            if (!title || !content) {
+                alert('请填写任务标题和内容');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/tasks', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        title,
+                        content,
+                        deadline,
+                        created_by: '班主任'
+                    })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    alert('任务发布成功！');
+                    location.reload();
+                } else {
+                    alert('发布任务失败: ' + result.error);
+                }
+            } catch (error) {
+                alert('网络错误，请重试');
+            }
+        }
+
+        // 删除任务
+        async function deleteTask(id) {
+            if (!confirm('确定要删除这个任务吗？')) return;
+            
+            try {
+                const response = await fetch('/api/tasks', {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    alert('任务删除成功！');
+                    location.reload();
+                } else {
+                    alert('删除任务失败: ' + result.error);
+                }
+            } catch (error) {
+                alert('网络错误，请重试');
+            }
+        }
+
         // 创建快照
         async function createSnapshot() {
             const month = '${new Date().toISOString().slice(0, 7)}';
-            const title = prompt('请输入本次快照的标题:');
+            const title = prompt('请输入本次快照的标题（如：期中考核）:');
             if (!title) return;
-            
+
             try {
                 const response = await fetch('/api/snapshot', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ month, title })
                 });
-                
+
                 const result = await response.json();
-                
+
                 if (result.success) {
                     alert('月度数据保存成功！');
                 } else {
-                    alert('保存失败');
+                    alert('保存失败: ' + result.error);
                 }
             } catch (error) {
                 alert('网络错误，请重试');
@@ -3710,7 +3949,7 @@ async function renderAdminPage(db, request) {
                     alert('分数重置成功！');
                     location.reload();
                 } else {
-                    alert('重置失败');
+                    alert('重置失败: ' + result.error);
                 }
             } catch (error) {
                 alert('网络错误，请重试');
@@ -3719,18 +3958,25 @@ async function renderAdminPage(db, request) {
 
         // 清空所有数据
         async function clearAllData() {
-            if (!confirm('⚠️ 警告：这将清空所有数据（包括历史记录）！确定要继续吗？')) return;
-            if (!confirm('🚨 最后一次确认：此操作将永久删除所有数据！')) return;
+            if (!confirm('⚠️ 警告：这将清空所有数据（包括历史记录和学生数据）！确定要继续吗？')) return;
+            if (!confirm('🚨 最后一次确认：此操作将永久删除所有数据并重新初始化！')) return;
             
             try {
-                await fetch('/api/reset', {
+                const response = await fetch('/api/clear-all', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' }
                 });
-                alert('所有数据已清空');
-                location.reload();
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert('所有数据已清空并重新初始化！');
+                    location.reload();
+                } else {
+                    alert('清空失败: ' + result.error);
+                }
             } catch (error) {
-                alert('操作失败');
+                alert('网络错误，请重试');
             }
         }
 
@@ -3768,6 +4014,12 @@ async function renderVisitorPage(db) {
     (settings.results || []).forEach(row => {
       settingMap[row.key] = row.value;
     });
+
+    // 计算中考倒计时
+    const examDate = new Date('2026-06-16T00:00:00');
+    const now = new Date();
+    const timeDiff = examDate.getTime() - now.getTime();
+    const daysLeft = Math.ceil(timeDiff / (1000 * 3600 * 24));
 
     // 完整的访客页面HTML
     const html = `
@@ -3819,6 +4071,16 @@ async function renderVisitorPage(db) {
         .header .subtitle {
             opacity: 0.9;
             margin-bottom: 1rem;
+        }
+        
+        .countdown {
+            background: rgba(255,255,255,0.2);
+            padding: 0.75rem 1.5rem;
+            border-radius: 12px;
+            font-weight: 600;
+            margin: 1rem auto;
+            border: 1px solid rgba(255,255,255,0.3);
+            display: inline-block;
         }
         
         .login-prompt { 
@@ -3962,6 +4224,7 @@ async function renderVisitorPage(db) {
     <div class="header">
         <h1>${settingMap.site_title || '2314班综合评分系统'}</h1>
         <div class="subtitle">${settingMap.class_name || '2314班'} - 访客视图</div>
+        <div class="countdown">中考倒计时: ${daysLeft}天</div>
     </div>
     
     <div class="container">
@@ -4036,6 +4299,11 @@ async function renderVisitorPage(db) {
 // 渲染日志页面
 async function renderLogsPage(db, url) {
   try {
+    const session = await validateSession(request, db);
+    if (!session) {
+      return Response.redirect(new URL('/login', request.url));
+    }
+
     const studentId = url.searchParams.get('studentId');
     
     let logs;
