@@ -75,16 +75,7 @@ async function initDatabase(db) {
       return { initialized: false, needsSetup: true };
     }
 
-    // 检查是否有学生数据
-    const studentsResult = await db.prepare('SELECT COUNT(*) as count FROM students').first();
-    const studentsCount = studentsResult ? studentsResult.count : 0;
-    
-    // 如果有数据，返回需要确认清空
-    if (studentsCount > 0) {
-      return { initialized: true, needsSetup: false, hasData: true };
-    }
-
-    return { initialized: true, needsSetup: false, hasData: false };
+    return { initialized: true, needsSetup: false };
   } catch (error) {
     console.error('Database initialization error:', error);
     throw new Error(`数据库初始化失败: ${error.message}`);
@@ -177,16 +168,7 @@ async function createAllTables(db) {
       )
     `).run();
 
-    console.log('All tables created successfully');
-  } catch (error) {
-    console.error('Table creation error:', error);
-    throw new Error(`创建数据库表失败: ${error.message}`);
-  }
-}
-
-// 初始化学生数据
-async function initStudentsData(db) {
-  try {
+    // 初始化学生数据
     const students = [
       '曾钰景', '陈金语', '陈金卓', '陈明英', '陈兴旺', '陈钰琳', '代紫涵', '丁玉文',
       '高建航', '高奇', '高思凡', '高兴扬', '关戎', '胡菡', '胡人溪', '胡延鑫',
@@ -244,10 +226,10 @@ async function initStudentsData(db) {
       }
     }
 
-    console.log('Initial data created successfully');
+    console.log('All tables created successfully');
   } catch (error) {
-    console.error('Initial data creation error:', error);
-    throw new Error(`初始化数据失败: ${error.message}`);
+    console.error('Table creation error:', error);
+    throw new Error(`创建数据库表失败: ${error.message}`);
   }
 }
 
@@ -266,13 +248,7 @@ async function handleAPI(request, env, url) {
     } else if (path === '/api/logout') {
       return handleLogout();
     } else if (path === '/api/students') {
-      if (request.method === 'GET') {
-        return await handleGetStudents(env.DB);
-      } else if (request.method === 'POST') {
-        return await handleAddStudent(request, env.DB);
-      } else if (request.method === 'DELETE') {
-        return await handleDeleteStudent(request, env.DB);
-      }
+      return await handleGetStudents(env.DB);
     } else if (path === '/api/score') {
       return await handleAddScore(request, env.DB);
     } else if (path === '/api/revoke') {
@@ -303,10 +279,6 @@ async function handleAPI(request, env, url) {
       return await handleSetup(request, env.DB);
     } else if (path === '/api/health') {
       return await handleHealthCheck(env.DB);
-    } else if (path === '/api/clear-all') {
-      return await handleClearAllData(request, env.DB);
-    } else if (path === '/api/ip-info') {
-      return await handleIPInfo(request);
     }
 
     return new Response(JSON.stringify({ error: 'API路径不存在' }), {
@@ -347,50 +319,10 @@ async function handleHealthCheck(db) {
   }
 }
 
-// IP信息查询
-async function handleIPInfo(request) {
-  try {
-    const clientIP = request.headers.get('CF-Connecting-IP') || 
-                    request.headers.get('X-Forwarded-For') || 
-                    'Unknown';
-    
-    // 使用免费IP API获取更多信息
-    const ipApiResponse = await fetch(`http://ip-api.com/json/${clientIP}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,query`);
-    const ipData = await ipApiResponse.json();
-    
-    return new Response(JSON.stringify({
-      success: true,
-      ip: clientIP,
-      details: ipData
-    }), {
-      headers: { 
-        'Content-Type': 'application/json',
-        'Cache-Control': 'no-cache'
-      }
-    });
-  } catch (error) {
-    // 如果外部API失败，至少返回IP
-    const clientIP = request.headers.get('CF-Connecting-IP') || 
-                    request.headers.get('X-Forwarded-For') || 
-                    'Unknown';
-    
-    return new Response(JSON.stringify({
-      success: true,
-      ip: clientIP,
-      details: { query: clientIP, country: 'Unknown', city: 'Unknown', isp: 'Unknown' }
-    }), {
-      headers: { 
-        'Content-Type': 'application/json',
-        'Cache-Control': 'no-cache'
-      }
-    });
-  }
-}
-
 // 初始化设置处理
 async function handleSetup(request, db) {
   try {
-    const { admin_username, admin_password, class_username, class_password, site_title, class_name, clear_existing } = await request.json();
+    const { admin_username, admin_password, class_username, class_password, site_title, class_name } = await request.json();
     
     // 验证必需字段
     if (!admin_username || !admin_password || !class_username || !class_password) {
@@ -401,19 +333,6 @@ async function handleSetup(request, db) {
         headers: { 'Content-Type': 'application/json' }
       });
     }
-
-    // 如果选择清空现有数据
-    if (clear_existing) {
-      await db.prepare('DELETE FROM score_records').run();
-      await db.prepare('DELETE FROM operation_logs').run();
-      await db.prepare('DELETE FROM monthly_snapshots').run();
-      await db.prepare('DELETE FROM tasks').run();
-      await db.prepare('DELETE FROM students').run();
-      await db.prepare('DELETE FROM score_categories').run();
-    }
-
-    // 初始化学生数据和评分类别
-    await initStudentsData(db);
 
     // 保存设置
     const settings = [
@@ -567,79 +486,6 @@ async function handleGetStudents(db) {
     return new Response(JSON.stringify({ 
       success: false,
       error: '获取学生数据失败: ' + error.message 
-    }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-}
-
-// 添加学生
-async function handleAddStudent(request, db) {
-  try {
-    const { name } = await request.json();
-    
-    if (!name) {
-      return new Response(JSON.stringify({ 
-        success: false, 
-        error: '学生姓名不能为空' 
-      }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    await db.prepare(
-      'INSERT INTO students (name) VALUES (?)'
-    ).bind(name).run();
-
-    return new Response(JSON.stringify({ 
-      success: true,
-      message: '学生添加成功'
-    }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    console.error('Add student error:', error);
-    return new Response(JSON.stringify({ 
-      success: false, 
-      error: '添加学生失败: ' + error.message 
-    }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-}
-
-// 删除学生
-async function handleDeleteStudent(request, db) {
-  try {
-    const { id } = await request.json();
-    
-    if (!id) {
-      return new Response(JSON.stringify({ 
-        success: false, 
-        error: '缺少学生ID' 
-      }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    // 删除学生相关的所有记录
-    await db.prepare('DELETE FROM score_records WHERE student_id = ?').bind(id).run();
-    await db.prepare('DELETE FROM operation_logs WHERE student_id = ?').bind(id).run();
-    await db.prepare('DELETE FROM students WHERE id = ?').bind(id).run();
-
-    return new Response(JSON.stringify({ 
-      success: true,
-      message: '学生删除成功'
-    }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    console.error('Delete student error:', error);
-    return new Response(JSON.stringify({ 
-      success: false, 
-      error: '删除学生失败: ' + error.message 
     }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' }
@@ -934,34 +780,6 @@ async function handleReset(request, db) {
   }
 }
 
-// 清空所有数据
-async function handleClearAllData(request, db) {
-  try {
-    await db.prepare('DELETE FROM score_records').run();
-    await db.prepare('DELETE FROM operation_logs').run();
-    await db.prepare('DELETE FROM monthly_snapshots').run();
-    await db.prepare('DELETE FROM tasks').run();
-    await db.prepare('DELETE FROM students').run();
-    await db.prepare('DELETE FROM score_categories').run();
-
-    return new Response(JSON.stringify({ 
-      success: true,
-      message: '所有数据已清空'
-    }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    console.error('Clear all data error:', error);
-    return new Response(JSON.stringify({ 
-      success: false, 
-      error: '清空数据失败: ' + error.message 
-    }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-}
-
 // 获取设置
 async function handleGetSettings(db) {
   try {
@@ -1098,11 +916,11 @@ async function handlePages(request, env, url) {
     } else if (path === '/admin') {
       return await renderAdminPage(env.DB, request);
     } else if (path === '/') {
-      return await renderVisitorPage(env.DB, request);
+      return await renderVisitorPage(env.DB);
     } else if (path === '/logs') {
       return await renderLogsPage(env.DB, url);
     } else if (path === '/setup') {
-      return await renderSetupPage(env.DB);
+      return renderSetupPage();
     } else if (path === '/health') {
       return await handleHealthCheck(env.DB);
     }
@@ -1185,10 +1003,7 @@ function renderErrorPage(message) {
 }
 
 // 渲染初始化设置页面
-async function renderSetupPage(db) {
-  // 检查数据库是否有数据
-  const initResult = await initDatabase(db);
-  
+function renderSetupPage() {
   const html = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -1264,15 +1079,6 @@ async function renderSetupPage(db) {
             color: var(--text-light);
             margin-bottom: 2rem;
             line-height: 1.6;
-        }
-        
-        .warning-box {
-            background: #fef3c7;
-            border: 1px solid #f59e0b;
-            border-radius: 12px;
-            padding: 1.5rem;
-            margin-bottom: 2rem;
-            color: #92400e;
         }
         
         .input-group { 
@@ -1365,18 +1171,6 @@ async function renderSetupPage(db) {
             gap: 0.5rem;
         }
         
-        .checkbox-group {
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-            margin-bottom: 1rem;
-        }
-        
-        .checkbox-group input[type="checkbox"] {
-            width: auto;
-            transform: scale(1.2);
-        }
-        
         @media (max-width: 480px) {
             .setup-container {
                 padding: 2rem 1.5rem;
@@ -1395,13 +1189,6 @@ async function renderSetupPage(db) {
             欢迎使用班级评分系统！请先完成系统初始化设置。
         </div>
         
-        ${initResult.hasData ? `
-        <div class="warning-box">
-            <strong>⚠️ 注意：</strong> 
-            检测到数据库已有数据。如果您想重新初始化系统，请选择下面的选项清空现有数据。
-        </div>
-        ` : ''}
-        
         <form id="setupForm">
             <div class="form-section">
                 <h3>🏫 班级信息</h3>
@@ -1419,11 +1206,11 @@ async function renderSetupPage(db) {
                 <h3>🔐 班级账号</h3>
                 <div class="input-group">
                     <div class="input-icon">👤</div>
-                    <input type="text" id="class_username" placeholder="班级登录用户名" required autocomplete="off">
+                    <input type="text" id="class_username" placeholder="班级登录用户名" value="2314" required>
                 </div>
                 <div class="input-group">
                     <div class="input-icon">🔒</div>
-                    <input type="password" id="class_password" placeholder="班级登录密码" required autocomplete="new-password">
+                    <input type="password" id="class_password" placeholder="班级登录密码" value="hzwy2314" required>
                 </div>
             </div>
             
@@ -1431,24 +1218,13 @@ async function renderSetupPage(db) {
                 <h3>⚡ 管理员账号</h3>
                 <div class="input-group">
                     <div class="input-icon">👤</div>
-                    <input type="text" id="admin_username" placeholder="管理员用户名" required autocomplete="off">
+                    <input type="text" id="admin_username" placeholder="管理员用户名" value="2314admin" required>
                 </div>
                 <div class="input-group">
                     <div class="input-icon">🔒</div>
-                    <input type="password" id="admin_password" placeholder="管理员密码" required autocomplete="new-password">
+                    <input type="password" id="admin_password" placeholder="管理员密码" value="2314admin2314admin" required>
                 </div>
             </div>
-            
-            ${initResult.hasData ? `
-            <div class="form-section">
-                <h3>🔄 数据选项</h3>
-                <div class="checkbox-group">
-                    <input type="checkbox" id="clear_existing">
-                    <label for="clear_existing">清空现有数据并重新初始化</label>
-                </div>
-                <small style="color: var(--text-light);">注意：此操作将删除所有现有学生数据、评分记录和任务。</small>
-            </div>
-            ` : ''}
             
             <button type="submit">🚀 初始化系统</button>
         </form>
@@ -1468,8 +1244,6 @@ async function renderSetupPage(db) {
                 admin_username: document.getElementById('admin_username').value,
                 admin_password: document.getElementById('admin_password').value
             };
-
-            ${initResult.hasData ? `formData.clear_existing = document.getElementById('clear_existing').checked;` : ''}
 
             const submitBtn = e.target.querySelector('button');
             const originalText = submitBtn.textContent;
@@ -1698,7 +1472,16 @@ function renderLoginPage() {
             border-radius: 12px;
             font-size: 0.875rem;
             color: var(--text-light);
-            text-align: center;
+        }
+        
+        .info-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.5rem;
+        }
+        
+        .info-item:last-child {
+            margin-bottom: 0;
         }
         
         @media (max-width: 480px) {
@@ -1708,10 +1491,6 @@ function renderLoginPage() {
             
             h1 {
                 font-size: 1.75rem;
-            }
-            
-            .role-select {
-                flex-direction: column;
             }
         }
     </style>
@@ -1727,18 +1506,26 @@ function renderLoginPage() {
         <form id="loginForm">
             <div class="input-group">
                 <div class="input-icon">👤</div>
-                <input type="text" id="username" placeholder="用户名" required autocomplete="username">
+                <input type="text" id="username" placeholder="用户名" required>
             </div>
             <div class="input-group">
                 <div class="input-icon">🔒</div>
-                <input type="password" id="password" placeholder="密码" required autocomplete="current-password">
+                <input type="password" id="password" placeholder="密码" required>
             </div>
             <button type="submit">登录系统</button>
         </form>
         
         <div class="login-info">
-            <p>请使用管理员分配的账号密码登录</p>
-            <p>首次使用请先完成系统初始化</p>
+            <div class="info-item">
+                <span>班级账号:</span>
+                <span>版权所有 2025 By Liuqinxi </span>
+                <span>由Cloudflare(赛博菩萨)提供cdn(内容分发网络)和worker(无服务器搭建)</span>
+            </div>
+            <div class="info-item">
+                <span>班主任账号:</span>
+                 <span>版权所有 2025 By Liuqinxi </span>
+                <span>由Cloudflare(赛博菩萨)提供cdn(内容分发网络)和worker(无服务器搭建)</span  
+            </div>
         </div>
         
         <div id="message" style="margin-top: 1rem; text-align: center; color: var(--danger); font-weight: 500;"></div>
@@ -1746,6 +1533,10 @@ function renderLoginPage() {
 
     <script>
         let currentRole = 'class';
+        const roleCredentials = {
+            class: { username: '2314', password: 'hzwy2314' },
+            admin: { username: '2314admin', password: '2314admin2314admin' }
+        };
 
         document.querySelectorAll('.role-btn').forEach(btn => {
             btn.addEventListener('click', () => {
@@ -1756,9 +1547,9 @@ function renderLoginPage() {
                 if (currentRole === 'visitor') {
                     window.location.href = '/';
                 } else {
-                    // 清空输入框
-                    document.getElementById('username').value = '';
-                    document.getElementById('password').value = '';
+                    const creds = roleCredentials[currentRole];
+                    document.getElementById('username').value = creds.username;
+                    document.getElementById('password').value = creds.password;
                 }
             });
         });
@@ -1802,6 +1593,10 @@ function renderLoginPage() {
                 submitBtn.disabled = false;
             }
         });
+
+        // 设置默认用户名密码
+        document.getElementById('username').value = '2314';
+        document.getElementById('password').value = 'hzwy2314';
     </script>
 </body>
 </html>
@@ -1836,12 +1631,6 @@ async function renderClassPage(db, request) {
     });
 
     const currentMonth = settingMap.current_month || new Date().toISOString().slice(0, 7);
-
-    // 计算中考倒计时
-    const examDate = new Date('2026-06-16T00:00:00');
-    const now = new Date();
-    const timeDiff = examDate.getTime() - now.getTime();
-    const daysLeft = Math.ceil(timeDiff / (1000 * 3600 * 24));
 
     // 完整的班级页面HTML
     const html = `
@@ -1904,28 +1693,12 @@ async function renderClassPage(db, request) {
             font-size: 1.75rem;
         }
         
-        .time-info {
+        .date { 
+            font-size: 0.9rem; 
+            opacity: 0.9; 
             display: flex;
-            gap: 2rem;
             align-items: center;
-        }
-        
-        .current-time {
-            font-size: 1.1rem;
-            font-weight: 600;
-            background: rgba(255,255,255,0.2);
-            padding: 0.5rem 1rem;
-            border-radius: 12px;
-            backdrop-filter: blur(10px);
-        }
-        
-        .countdown {
-            font-size: 1.1rem;
-            font-weight: 600;
-            background: rgba(239, 68, 68, 0.2);
-            padding: 0.5rem 1rem;
-            border-radius: 12px;
-            backdrop-filter: blur(10px);
+            gap: 0.5rem;
         }
         
         .header-actions {
@@ -2436,6 +2209,96 @@ async function renderClassPage(db, request) {
             color: var(--text-light);
         }
         
+        .admin-panel {
+            position: fixed;
+            bottom: 2rem;
+            right: 2rem;
+            z-index: 100;
+        }
+        
+        .admin-btn {
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            font-size: 1.5rem;
+            cursor: pointer;
+            box-shadow: var(--shadow-lg);
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .admin-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
+            transition: left 0.5s;
+        }
+        
+        .admin-btn:hover::before {
+            left: 100%;
+        }
+        
+        .admin-btn:hover {
+            transform: scale(1.1) rotate(90deg);
+            box-shadow: 0 15px 30px rgba(99, 102, 241, 0.4);
+        }
+        
+        .admin-menu {
+            position: absolute;
+            bottom: 70px;
+            right: 0;
+            background: var(--surface);
+            border-radius: 16px;
+            box-shadow: var(--shadow-lg);
+            padding: 1rem;
+            min-width: 200px;
+            display: none;
+            animation: slideInUp 0.3s ease;
+            border: 1px solid var(--border);
+        }
+        
+        .admin-menu.active {
+            display: block;
+        }
+        
+        .menu-item {
+            padding: 0.75rem 1rem;
+            border: none;
+            background: none;
+            width: 100%;
+            text-align: left;
+            cursor: pointer;
+            border-radius: 8px;
+            transition: background 0.2s ease;
+            color: var(--text);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .menu-item:hover {
+            background: var(--background);
+        }
+        
+        .menu-item.danger {
+            color: var(--danger);
+        }
+        
+        .menu-item.danger:hover {
+            background: rgba(239, 68, 68, 0.1);
+        }
+        
         /* 两步评分模态框 */
         .step-container {
             display: none;
@@ -2479,21 +2342,6 @@ async function renderClassPage(db, request) {
             font-weight: 700;
         }
         
-        /* 页脚样式 */
-        .footer {
-            background: var(--surface);
-            border-top: 1px solid var(--border);
-            padding: 2rem;
-            text-align: center;
-            color: var(--text-light);
-            margin-top: 3rem;
-        }
-        
-        .footer-content {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-        
         @media (max-width: 768px) {
             .main-content { 
                 grid-template-columns: 1fr; 
@@ -2529,13 +2377,13 @@ async function renderClassPage(db, request) {
                 margin: 1rem;
             }
             
-            .score-buttons {
-                grid-template-columns: repeat(2, 1fr);
+            .admin-panel {
+                bottom: 1rem;
+                right: 1rem;
             }
             
-            .time-info {
-                flex-direction: column;
-                gap: 0.5rem;
+            .score-buttons {
+                grid-template-columns: repeat(2, 1fr);
             }
         }
         
@@ -2594,15 +2442,15 @@ async function renderClassPage(db, request) {
         <div class="header-content">
             <div class="class-info">
                 <h1>${settingMap.site_title || '2314班综合评分系统'}</h1>
-                <div class="time-info">
-                    <div class="current-time" id="currentTime"></div>
-                    <div class="countdown">中考倒计时: <span id="daysLeft">${daysLeft}</span> 天</div>
+                <div class="date">
+                    <span>📅</span>
+                    <span id="currentDate"></span>
                 </div>
             </div>
             <div class="header-actions">
                 <button class="btn btn-primary" onclick="openTasksPanel()">
                     <span>📋</span>
-                    查看任务
+                    任务管理
                 </button>
                 <button class="btn btn-primary" onclick="openLogsPage()">
                     <span>📊</span>
@@ -2619,6 +2467,7 @@ async function renderClassPage(db, request) {
     <div class="announcement">
         <strong>📢 班级公告：</strong> 
         <span id="announcementText">欢迎使用班级综合评分系统！请遵守纪律，积极表现。</span>
+        <button onclick="editAnnouncement()" style="margin-left: 1rem; background: none; border: none; color: var(--primary); cursor: pointer; padding: 0.25rem 0.5rem; border-radius: 6px; transition: background 0.2s ease;">编辑</button>
     </div>
 
     <div class="main-content">
@@ -2790,7 +2639,6 @@ async function renderClassPage(db, request) {
                         <option value="历史老师">历史老师</option>
                         <option value="物理老师">物理老师</option>
                         <option value="化学老师">化学老师</option>
-                        <option value="班主任">班主任</option>
                     </select>
                 </div>
                 
@@ -2816,7 +2664,18 @@ async function renderClassPage(db, request) {
     <!-- 任务面板 -->
     <div class="panel-overlay" id="panelOverlay" onclick="closeTasksPanel()"></div>
     <div class="tasks-panel" id="tasksPanel">
-        <h2 style="margin-bottom: 2rem; color: var(--text);">📋 任务列表</h2>
+        <h2 style="margin-bottom: 2rem; color: var(--text);">📋 任务管理系统</h2>
+        
+        <div style="margin-bottom: 2rem; background: var(--background); padding: 1.5rem; border-radius: 16px;">
+            <h3 style="margin-bottom: 1rem; color: var(--text);">发布新任务</h3>
+            <input type="text" id="taskTitle" placeholder="任务标题" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px; margin-bottom: 1rem;">
+            <textarea id="taskContent" placeholder="任务内容描述" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px; margin-bottom: 1rem; height: 120px; resize: vertical;"></textarea>
+            <input type="datetime-local" id="taskDeadline" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px; margin-bottom: 1.5rem;">
+            <button class="submit-btn" style="width: 100%; padding: 1rem; font-size: 1.1rem;" onclick="addTask()">
+                <span>🚀</span>
+                发布任务
+            </button>
+        </div>
         
         <h3 style="margin-bottom: 1rem; color: var(--text);">近期任务</h3>
         <div id="tasksList">
@@ -2836,11 +2695,26 @@ async function renderClassPage(db, request) {
         </div>
     </div>
 
-    <!-- 页脚 -->
-    <div class="footer">
-        <div class="footer-content">
-            <p>版权所有 © 2025 By Liuqinxi</p>
-            <p>由 Cloudflare (赛博菩萨) 提供 CDN (内容分发网络) 和 Worker (无服务器搭建)</p>
+    <!-- 管理员功能面板 -->
+    <div class="admin-panel">
+        <button class="admin-btn" onclick="toggleAdminMenu()">⚙️</button>
+        <div class="admin-menu" id="adminMenu">
+            <button class="menu-item" onclick="createSnapshot()">
+                <span>💾</span>
+                保存月度数据
+            </button>
+            <button class="menu-item" onclick="showMonthlyData()">
+                <span>📈</span>
+                查看历史数据
+            </button>
+            <button class="menu-item" onclick="resetScores()">
+                <span>🔄</span>
+                重置当前分数
+            </button>
+            <button class="menu-item danger" onclick="clearAllData()">
+                <span>🗑️</span>
+                清空所有数据
+            </button>
         </div>
     </div>
 
@@ -2849,27 +2723,16 @@ async function renderClassPage(db, request) {
         let currentScoreType = 'add';
         let currentStudentName = '';
         let selectedScore = 1;
+        let isAdminMenuOpen = false;
         let currentStep = 1;
 
-        // 更新当前时间
-        function updateCurrentTime() {
-            const now = new Date();
-            const timeString = now.toLocaleString('zh-CN', {
-                year: 'numeric',
-                month: '2-digit',
-                day: '2-digit',
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit',
-                weekday: 'long'
-            });
-            document.getElementById('currentTime').textContent = timeString;
-        }
-        
-        // 初始更新
-        updateCurrentTime();
-        // 每秒更新一次
-        setInterval(updateCurrentTime, 1000);
+        // 设置当前日期
+        document.getElementById('currentDate').textContent = new Date().toLocaleDateString('zh-CN', {
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric',
+            weekday: 'long'
+        });
 
         // 开始评分流程
         function startScoreProcess(studentId, type, studentName) {
@@ -3094,6 +2957,171 @@ async function renderClassPage(db, request) {
             document.getElementById('panelOverlay').classList.remove('active');
         }
 
+        // 添加任务
+        async function addTask() {
+            const title = document.getElementById('taskTitle').value.trim();
+            const content = document.getElementById('taskContent').value.trim();
+            const deadline = document.getElementById('taskDeadline').value;
+
+            if (!title || !content) {
+                showNotification('请填写任务标题和内容', 'error');
+                return;
+            }
+
+            if (!deadline) {
+                showNotification('请设置任务截止时间', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/tasks', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        title,
+                        content,
+                        deadline,
+                        created_by: '班级账号'
+                    })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showNotification('任务发布成功！', 'success');
+                    document.getElementById('taskTitle').value = '';
+                    document.getElementById('taskContent').value = '';
+                    document.getElementById('taskDeadline').value = '';
+                    closeTasksPanel();
+                    setTimeout(() => location.reload(), 1500);
+                } else {
+                    showNotification('发布任务失败', 'error');
+                }
+            } catch (error) {
+                showNotification('网络错误，请重试', 'error');
+            }
+        }
+
+        // 管理员菜单
+        function toggleAdminMenu() {
+            const menu = document.getElementById('adminMenu');
+            isAdminMenuOpen = !isAdminMenuOpen;
+            menu.classList.toggle('active', isAdminMenuOpen);
+        }
+
+        // 点击外部关闭管理员菜单
+        document.addEventListener('click', function(e) {
+            if (!e.target.closest('.admin-panel') && isAdminMenuOpen) {
+                toggleAdminMenu();
+            }
+        });
+
+        // 创建月度快照
+        async function createSnapshot() {
+            const month = '${currentMonth}';
+            const title = prompt('请输入本次快照的标题（如：期中考核）:');
+            if (!title) return;
+
+            try {
+                const response = await fetch('/api/snapshot', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ month, title })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showNotification('月度数据保存成功！', 'success');
+                    toggleAdminMenu();
+                } else {
+                    showNotification('保存失败', 'error');
+                }
+            } catch (error) {
+                showNotification('网络错误，请重试', 'error');
+            }
+        }
+
+        // 重置分数
+        async function resetScores() {
+            if (!confirm('确定要重置所有学生的分数吗？此操作不可撤销！')) return;
+            
+            try {
+                const response = await fetch('/api/reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showNotification('分数重置成功！', 'success');
+                    toggleAdminMenu();
+                    setTimeout(() => location.reload(), 1000);
+                } else {
+                    showNotification('重置失败', 'error');
+                }
+            } catch (error) {
+                showNotification('网络错误，请重试', 'error');
+            }
+        }
+
+        // 清空所有数据
+        async function clearAllData() {
+            if (!confirm('⚠️ 警告：这将清空所有数据（包括历史记录）！确定要继续吗？')) return;
+            if (!confirm('🚨 最后一次确认：此操作将永久删除所有数据！')) return;
+            
+            try {
+                await fetch('/api/reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                showNotification('所有数据已清空', 'success');
+                toggleAdminMenu();
+                setTimeout(() => location.reload(), 1000);
+            } catch (error) {
+                showNotification('操作失败', 'error');
+            }
+        }
+
+        // 显示月度数据
+        async function showMonthlyData() {
+            try {
+                const response = await fetch('/api/monthly');
+                const result = await response.json();
+                
+                if (!result.success || result.months.length === 0) {
+                    showNotification('暂无历史数据', 'info');
+                    return;
+                }
+                
+                let message = '历史月度数据:\\n';
+                result.months.forEach(month => {
+                    message += \`• \${month}\\n\`;
+                });
+                
+                alert(message);
+                toggleAdminMenu();
+            } catch (error) {
+                showNotification('获取数据失败', 'error');
+            }
+        }
+
+        // 编辑公告
+        function editAnnouncement() {
+            const currentText = document.getElementById('announcementText').textContent;
+            const newText = prompt('编辑班级公告:', currentText);
+            if (newText !== null) {
+                document.getElementById('announcementText').textContent = newText;
+                showNotification('公告更新成功！', 'success');
+            }
+        }
+
+        // 打开日志页面
+        function openLogsPage() {
+            window.open('/logs', '_blank');
+        }
+
         // 退出登录
         async function logout() {
             try {
@@ -3102,11 +3130,6 @@ async function renderClassPage(db, request) {
             } catch (error) {
                 window.location.href = '/login';
             }
-        }
-
-        // 打开日志页面
-        function openLogsPage() {
-            window.open('/logs', '_blank');
         }
 
         // 显示所有学生分数详情
@@ -3146,11 +3169,10 @@ async function renderAdminPage(db, request) {
       return Response.redirect(new URL('/login', request.url));
     }
 
-    const [studentsData, logs, settings, tasks] = await Promise.all([
+    const [studentsData, logs, settings] = await Promise.all([
       handleGetStudents(db).then(r => r.json()),
       db.prepare('SELECT ol.*, s.name as student_name FROM operation_logs ol JOIN students s ON ol.student_id = s.id ORDER BY ol.created_at DESC LIMIT 50').all(),
-      db.prepare('SELECT key, value FROM settings').all(),
-      db.prepare('SELECT * FROM tasks ORDER BY created_at DESC').all()
+      db.prepare('SELECT key, value FROM settings').all()
     ]);
 
     if (!studentsData.success) {
@@ -3161,12 +3183,6 @@ async function renderAdminPage(db, request) {
     (settings.results || []).forEach(row => {
       settingMap[row.key] = row.value;
     });
-
-    // 计算中考倒计时
-    const examDate = new Date('2026-06-16T00:00:00');
-    const now = new Date();
-    const timeDiff = examDate.getTime() - now.getTime();
-    const daysLeft = Math.ceil(timeDiff / (1000 * 3600 * 24));
 
     // 完整的管理员页面HTML
     const html = `
@@ -3220,28 +3236,6 @@ async function renderAdminPage(db, request) {
         .class-info h1 { 
             font-weight: 700; 
             margin-bottom: 0.5rem; 
-        }
-        
-        .time-info {
-            display: flex;
-            gap: 1rem;
-            align-items: center;
-        }
-        
-        .current-time {
-            font-size: 1rem;
-            font-weight: 600;
-            background: rgba(255,255,255,0.2);
-            padding: 0.5rem 1rem;
-            border-radius: 12px;
-        }
-        
-        .countdown {
-            font-size: 1rem;
-            font-weight: 600;
-            background: rgba(239, 68, 68, 0.2);
-            padding: 0.5rem 1rem;
-            border-radius: 12px;
         }
         
         .admin-badge {
@@ -3474,108 +3468,9 @@ async function renderAdminPage(db, request) {
             transform: translateY(-2px);
         }
         
-        .task-management {
-            display: grid;
-            gap: 1rem;
-        }
-        
-        .task-form {
-            background: var(--background);
-            padding: 1.5rem;
-            border-radius: 16px;
-        }
-        
-        .task-list {
-            max-height: 400px;
-            overflow-y: auto;
-        }
-        
-        .task-item {
-            background: var(--surface);
-            padding: 1rem;
-            border-radius: 12px;
-            margin-bottom: 1rem;
-            border-left: 4px solid var(--primary);
-        }
-        
-        .task-header {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 0.5rem;
-        }
-        
-        .task-title {
-            font-weight: 600;
-            color: var(--text);
-        }
-        
-        .task-actions {
-            display: flex;
-            gap: 0.5rem;
-        }
-        
-        .delete-btn {
-            background: var(--danger);
-            color: white;
-            border: none;
-            border-radius: 6px;
-            padding: 0.25rem 0.5rem;
-            cursor: pointer;
-            font-size: 0.75rem;
-        }
-        
-        .student-management {
-            display: grid;
-            gap: 1rem;
-        }
-        
-        .student-form {
-            display: flex;
-            gap: 1rem;
-        }
-        
-        .student-form input {
-            flex: 1;
-            padding: 1rem;
-            border: 2px solid var(--border);
-            border-radius: 12px;
-        }
-        
-        .student-list {
-            max-height: 300px;
-            overflow-y: auto;
-        }
-        
-        .student-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 1rem;
-            border-bottom: 1px solid var(--border);
-        }
-        
-        .student-item:last-child {
-            border-bottom: none;
-        }
-        
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(20px); }
             to { opacity: 1; transform: translateY(0); }
-        }
-        
-        /* 页脚样式 */
-        .footer {
-            background: var(--surface);
-            border-top: 1px solid var(--border);
-            padding: 2rem;
-            text-align: center;
-            color: var(--text-light);
-            margin-top: 3rem;
-        }
-        
-        .footer-content {
-            max-width: 1400px;
-            margin: 0 auto;
         }
         
         @media (max-width: 768px) {
@@ -3598,11 +3493,6 @@ async function renderAdminPage(db, request) {
                 gap: 1rem;
                 text-align: center;
             }
-            
-            .time-info {
-                flex-direction: column;
-                gap: 0.5rem;
-            }
         }
     </style>
 </head>
@@ -3613,10 +3503,7 @@ async function renderAdminPage(db, request) {
                 <h1>${settingMap.site_title || '2314班综合评分系统'}
                     <span class="admin-badge">管理员模式</span>
                 </h1>
-                <div class="time-info">
-                    <div class="current-time" id="currentTime"></div>
-                    <div class="countdown">中考倒计时: <span id="daysLeft">${daysLeft}</span> 天</div>
-                </div>
+                <div>系统管理面板</div>
             </div>
             <div>
                 <a href="/class" class="btn btn-primary">📊 班级视图</a>
@@ -3659,79 +3546,22 @@ async function renderAdminPage(db, request) {
                 </div>
                 <div class="form-group">
                     <label>班级账号</label>
-                    <input type="text" name="class_username" value="${settingMap.class_username || ''}" required autocomplete="off">
+                    <input type="text" name="class_username" value="${settingMap.class_username || ''}" required>
                 </div>
                 <div class="form-group">
                     <label>班级密码</label>
-                    <input type="password" name="class_password" value="${settingMap.class_password || ''}" required autocomplete="new-password">
+                    <input type="password" name="class_password" value="${settingMap.class_password || ''}" required>
                 </div>
                 <div class="form-group">
                     <label>管理员账号</label>
-                    <input type="text" name="admin_username" value="${settingMap.admin_username || ''}" required autocomplete="off">
+                    <input type="text" name="admin_username" value="${settingMap.admin_username || ''}" required>
                 </div>
                 <div class="form-group">
                     <label>管理员密码</label>
-                    <input type="password" name="admin_password" value="${settingMap.admin_password || ''}" required autocomplete="new-password">
+                    <input type="password" name="admin_password" value="${settingMap.admin_password || ''}" required>
                 </div>
                 <button type="submit" class="btn btn-success">💾 保存设置</button>
             </form>
-        </div>
-
-        <!-- 任务管理 -->
-        <div class="card">
-            <div class="card-title">📋 任务管理</div>
-            <div class="task-management">
-                <div class="task-form">
-                    <h3>发布新任务</h3>
-                    <div class="form-group">
-                        <input type="text" id="taskTitle" placeholder="任务标题" required>
-                    </div>
-                    <div class="form-group">
-                        <textarea id="taskContent" placeholder="任务内容" style="width: 100%; height: 100px; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;" required></textarea>
-                    </div>
-                    <div class="form-group">
-                        <input type="datetime-local" id="taskDeadline">
-                    </div>
-                    <button class="btn btn-success" onclick="addTask()">发布任务</button>
-                </div>
-                <div class="task-list">
-                    <h3>任务列表</h3>
-                    ${(tasks.results || []).map(task => `
-                        <div class="task-item">
-                            <div class="task-header">
-                                <div class="task-title">${task.title}</div>
-                                <div class="task-actions">
-                                    <button class="delete-btn" onclick="deleteTask(${task.id})">删除</button>
-                                </div>
-                            </div>
-                            <div class="task-content">${task.content}</div>
-                            <div class="task-meta">
-                                <span>截止: ${task.deadline ? new Date(task.deadline).toLocaleString('zh-CN') : '未设置'}</span>
-                                <span>发布: ${new Date(task.created_at).toLocaleString('zh-CN')}</span>
-                            </div>
-                        </div>
-                    `).join('')}
-                </div>
-            </div>
-        </div>
-
-        <!-- 学生管理 -->
-        <div class="card">
-            <div class="card-title">👥 学生管理</div>
-            <div class="student-management">
-                <div class="student-form">
-                    <input type="text" id="studentName" placeholder="学生姓名" required>
-                    <button class="btn btn-success" onclick="addStudent()">添加学生</button>
-                </div>
-                <div class="student-list">
-                    ${(studentsData.students || []).map(student => `
-                        <div class="student-item">
-                            <span>${student.name}</span>
-                            <button class="delete-btn" onclick="deleteStudent(${student.id})">删除</button>
-                        </div>
-                    `).join('')}
-                </div>
-            </div>
         </div>
 
         <!-- 系统管理 -->
@@ -3791,35 +3621,7 @@ async function renderAdminPage(db, request) {
         </div>
     </div>
 
-    <!-- 页脚 -->
-    <div class="footer">
-        <div class="footer-content">
-            <p>版权所有 © 2025 By Liuqinxi</p>
-            <p>由 Cloudflare (赛博菩萨) 提供 CDN (内容分发网络) 和 Worker (无服务器搭建)</p>
-        </div>
-    </div>
-
     <script>
-        // 更新当前时间
-        function updateCurrentTime() {
-            const now = new Date();
-            const timeString = now.toLocaleString('zh-CN', {
-                year: 'numeric',
-                month: '2-digit',
-                day: '2-digit',
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit',
-                weekday: 'long'
-            });
-            document.getElementById('currentTime').textContent = timeString;
-        }
-        
-        // 初始更新
-        updateCurrentTime();
-        // 每秒更新一次
-        setInterval(updateCurrentTime, 1000);
-
         // 保存设置
         document.getElementById('settingsForm').addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -3845,118 +3647,6 @@ async function renderAdminPage(db, request) {
                 alert('网络错误，请重试');
             }
         });
-
-        // 添加学生
-        async function addStudent() {
-            const name = document.getElementById('studentName').value.trim();
-            if (!name) {
-                alert('请输入学生姓名');
-                return;
-            }
-            
-            try {
-                const response = await fetch('/api/students', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name })
-                });
-                
-                const result = await response.json();
-                
-                if (result.success) {
-                    alert('学生添加成功！');
-                    location.reload();
-                } else {
-                    alert('添加失败，请重试');
-                }
-            } catch (error) {
-                alert('网络错误，请重试');
-            }
-        }
-
-        // 删除学生
-        async function deleteStudent(id) {
-            if (!confirm('确定要删除这个学生吗？这将删除该学生的所有评分记录！')) return;
-            
-            try {
-                const response = await fetch('/api/students', {
-                    method: 'DELETE',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ id })
-                });
-                
-                const result = await response.json();
-                
-                if (result.success) {
-                    alert('学生删除成功！');
-                    location.reload();
-                } else {
-                    alert('删除失败，请重试');
-                }
-            } catch (error) {
-                alert('网络错误，请重试');
-            }
-        }
-
-        // 添加任务
-        async function addTask() {
-            const title = document.getElementById('taskTitle').value.trim();
-            const content = document.getElementById('taskContent').value.trim();
-            const deadline = document.getElementById('taskDeadline').value;
-
-            if (!title || !content) {
-                alert('请填写任务标题和内容');
-                return;
-            }
-
-            try {
-                const response = await fetch('/api/tasks', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        title,
-                        content,
-                        deadline,
-                        created_by: '班主任'
-                    })
-                });
-
-                const result = await response.json();
-
-                if (result.success) {
-                    alert('任务发布成功！');
-                    location.reload();
-                } else {
-                    alert('发布任务失败');
-                }
-            } catch (error) {
-                alert('网络错误，请重试');
-            }
-        }
-
-        // 删除任务
-        async function deleteTask(id) {
-            if (!confirm('确定要删除这个任务吗？')) return;
-            
-            try {
-                const response = await fetch('/api/tasks', {
-                    method: 'DELETE',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ id })
-                });
-
-                const result = await response.json();
-
-                if (result.success) {
-                    alert('任务删除成功！');
-                    location.reload();
-                } else {
-                    alert('删除任务失败');
-                }
-            } catch (error) {
-                alert('网络错误，请重试');
-            }
-        }
 
         // 创建快照
         async function createSnapshot() {
@@ -4034,21 +3724,14 @@ async function renderAdminPage(db, request) {
             if (!confirm('🚨 最后一次确认：此操作将永久删除所有数据！')) return;
             
             try {
-                const response = await fetch('/api/clear-all', {
+                await fetch('/api/reset', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' }
                 });
-                
-                const result = await response.json();
-                
-                if (result.success) {
-                    alert('所有数据已清空');
-                    location.reload();
-                } else {
-                    alert('操作失败');
-                }
+                alert('所有数据已清空');
+                location.reload();
             } catch (error) {
-                alert('网络错误，请重试');
+                alert('操作失败');
             }
         }
 
@@ -4075,7 +3758,7 @@ async function renderAdminPage(db, request) {
 }
 
 // 渲染访客页面
-async function renderVisitorPage(db, request) {
+async function renderVisitorPage(db) {
   try {
     const studentsData = await handleGetStudents(db).then(r => r.json());
     const settings = await db.prepare(
@@ -4086,19 +3769,6 @@ async function renderVisitorPage(db, request) {
     (settings.results || []).forEach(row => {
       settingMap[row.key] = row.value;
     });
-
-    // 获取IP信息
-    let ipInfo = { ip: 'Unknown', details: { country: 'Unknown', city: 'Unknown', isp: 'Unknown' } };
-    try {
-      const ipResponse = await fetch(new URL('/api/ip-info', request.url), {
-        headers: request.headers
-      });
-      if (ipResponse.ok) {
-        ipInfo = await ipResponse.json();
-      }
-    } catch (error) {
-      console.error('Failed to get IP info:', error);
-    }
 
     // 完整的访客页面HTML
     const html = `
@@ -4264,110 +3934,9 @@ async function renderVisitorPage(db, request) {
         .negative { color: var(--danger); font-weight: 600; }
         .total { color: var(--primary); font-weight: 700; }
         
-        /* 弹窗样式 */
-        .modal-overlay {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.5);
-            z-index: 1000;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            animation: fadeIn 0.3s ease;
-            backdrop-filter: blur(5px);
-            padding: 1rem;
-        }
-        
-        .modal-content {
-            background: var(--surface);
-            padding: 2.5rem;
-            border-radius: 24px;
-            width: 100%;
-            max-width: 500px;
-            animation: slideUp 0.4s cubic-bezier(0.4, 0, 0.2, 1);
-            box-shadow: var(--shadow);
-            border: 1px solid var(--border);
-            position: relative;
-        }
-        
-        .modal-close {
-            position: absolute;
-            top: 1rem;
-            right: 1rem;
-            background: none;
-            border: none;
-            font-size: 1.5rem;
-            cursor: pointer;
-            color: var(--text-light);
-            transition: color 0.3s ease;
-            width: 40px;
-            height: 40px;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        
-        .modal-close:hover {
-            color: var(--danger);
-            background: rgba(239, 68, 68, 0.1);
-        }
-        
-        .ip-info {
-            background: var(--background);
-            padding: 1.5rem;
-            border-radius: 12px;
-            margin: 1rem 0;
-        }
-        
-        .ip-item {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 0.5rem;
-            padding: 0.5rem 0;
-            border-bottom: 1px solid var(--border);
-        }
-        
-        .ip-item:last-child {
-            border-bottom: none;
-            margin-bottom: 0;
-        }
-        
-        .ip-label {
-            font-weight: 600;
-            color: var(--text);
-        }
-        
-        .ip-value {
-            color: var(--text-light);
-        }
-        
-        /* 页脚样式 */
-        .footer {
-            background: var(--surface);
-            border-top: 1px solid var(--border);
-            padding: 2rem;
-            text-align: center;
-            color: var(--text-light);
-            margin-top: 3rem;
-        }
-        
-        .footer-content {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-        
         @keyframes fadeIn {
-            from { opacity: 0; } 
-            to { opacity: 1; } 
-        }
-        
-        @keyframes slideUp { 
-            from { transform: translateY(30px); opacity: 0; } 
-            to { transform: translateY(0); opacity: 1; } 
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
         }
         
         @keyframes slideInUp {
@@ -4391,41 +3960,6 @@ async function renderVisitorPage(db, request) {
     </style>
 </head>
 <body>
-    <!-- IP信息弹窗 -->
-    <div class="modal-overlay" id="ipModal">
-        <div class="modal-content">
-            <button class="modal-close" onclick="closeIpModal()">×</button>
-            <h2 style="text-align: center; margin-bottom: 1.5rem; color: var(--text);">🌐 访问信息</h2>
-            
-            <div class="ip-info">
-                <div class="ip-item">
-                    <span class="ip-label">IP地址:</span>
-                    <span class="ip-value">${ipInfo.ip}</span>
-                </div>
-                <div class="ip-item">
-                    <span class="ip-label">国家:</span>
-                    <span class="ip-value">${ipInfo.details.country || 'Unknown'}</span>
-                </div>
-                <div class="ip-item">
-                    <span class="ip-label">城市:</span>
-                    <span class="ip-value">${ipInfo.details.city || 'Unknown'}</span>
-                </div>
-                <div class="ip-item">
-                    <span class="ip-label">运营商:</span>
-                    <span class="ip-value">${ipInfo.details.isp || 'Unknown'}</span>
-                </div>
-                <div class="ip-item">
-                    <span class="ip-label">延迟:</span>
-                    <span class="ip-value" id="latency">计算中...</span>
-                </div>
-            </div>
-            
-            <button class="login-btn" style="width: 100%; text-align: center;" onclick="closeIpModal()">
-                进入系统
-            </button>
-        </div>
-    </div>
-    
     <div class="header">
         <h1>${settingMap.site_title || '2314班综合评分系统'}</h1>
         <div class="subtitle">${settingMap.class_name || '2314班'} - 访客视图</div>
@@ -4488,48 +4022,6 @@ async function renderVisitorPage(db, request) {
             </div>
         </div>
     </div>
-    
-    <!-- 页脚 -->
-    <div class="footer">
-        <div class="footer-content">
-            <p>版权所有 © 2025 By Liuqinxi</p>
-            <p>由 Cloudflare (赛博菩萨) 提供 CDN (内容分发网络) 和 Worker (无服务器搭建)</p>
-        </div>
-    </div>
-
-    <script>
-        // 显示IP信息弹窗
-        window.addEventListener('load', () => {
-            setTimeout(() => {
-                document.getElementById('ipModal').style.display = 'flex';
-                calculateLatency();
-            }, 1000);
-        });
-        
-        // 关闭IP信息弹窗
-        function closeIpModal() {
-            document.getElementById('ipModal').style.display = 'none';
-        }
-        
-        // 点击弹窗外部关闭
-        document.getElementById('ipModal').addEventListener('click', function(e) {
-            if (e.target === this) closeIpModal();
-        });
-        
-        // 计算延迟
-        function calculateLatency() {
-            const startTime = performance.now();
-            fetch('/api/health')
-                .then(() => {
-                    const endTime = performance.now();
-                    const latency = Math.round(endTime - startTime);
-                    document.getElementById('latency').textContent = latency + 'ms';
-                })
-                .catch(() => {
-                    document.getElementById('latency').textContent = '计算失败';
-                });
-        }
-    </script>
 </body>
 </html>
     `;
@@ -4665,21 +4157,6 @@ async function renderLogsPage(db, url) {
             text-decoration: none;
             font-weight: 600;
         }
-        
-        /* 页脚样式 */
-        .footer {
-            background: var(--surface);
-            border-top: 1px solid var(--border);
-            padding: 2rem;
-            text-align: center;
-            color: var(--text-light);
-            margin-top: 3rem;
-        }
-        
-        .footer-content {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
     </style>
 </head>
 <body>
@@ -4732,14 +4209,6 @@ async function renderLogsPage(db, url) {
             `).join('')}
         </tbody>
     </table>
-    
-    <!-- 页脚 -->
-    <div class="footer">
-        <div class="footer-content">
-            <p>版权所有 © 2025 By Liuqinxi</p>
-            <p>由 Cloudflare (赛博菩萨) 提供 CDN (内容分发网络) 和 Worker (无服务器搭建)</p>
-        </div>
-    </div>
     
     <script>
         function filterLogs() {
