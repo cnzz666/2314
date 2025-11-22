@@ -1,20 +1,26 @@
-﻿// 替换原来的 initDatabase 函数和 fetch 处理函数
+﻿// cloudflare-worker.js - 完整班级评分系统
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
 
     try {
-      // 检查数据库连接是否正常
+      // 检查数据库连接
       if (!env.DB) {
-        return new Response('数据库连接未配置', { status: 500 });
+        return new Response(JSON.stringify({ 
+          error: '数据库连接失败: DB变量未正确绑定',
+          details: '请检查D1数据库绑定设置'
+        }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
       }
 
       // 初始化数据库
-      const isInitialized = await initDatabase(env.DB);
+      const initResult = await initDatabase(env.DB);
       
       // 检查是否需要初始化设置
-      if (!isInitialized && path !== '/setup' && path !== '/api/setup' && !path.startsWith('/api/')) {
+      if (!initResult.initialized && path !== '/setup' && path !== '/api/setup' && path !== '/health') {
         return Response.redirect(new URL('/setup', request.url));
       }
 
@@ -26,54 +32,54 @@ export default {
       // 页面路由
       return await handlePages(request, env, url);
     } catch (error) {
-      console.error('Error:', error);
-      return new Response(JSON.stringify({ error: '服务器错误: ' + error.message }), {
+      console.error('Global Error:', error);
+      return new Response(JSON.stringify({ 
+        error: '服务器错误',
+        details: error.message
+      }), {
         status: 500,
         headers: { 'Content-Type': 'application/json' }
       });
     }
   }
-}
+};
 
-// 替换原来的 initDatabase 函数
+// 初始化数据库
 async function initDatabase(db) {
-  if (!db) {
-    throw new Error('数据库连接不可用');
-  }
-
   try {
+    // 首先测试数据库连接
+    await db.prepare('SELECT 1').run();
+    
     // 检查设置表是否存在
+    let settingsExist = true;
     try {
       await db.prepare('SELECT 1 FROM settings LIMIT 1').run();
     } catch (e) {
-      // 表不存在，需要初始化
-      console.log('创建数据库表...');
-      await createAllTables(db);
-      return false; // 需要设置
+      settingsExist = false;
     }
 
-    // 检查是否已有设置
-    const settings = await db.prepare('SELECT COUNT(*) as count FROM settings').first();
-    return settings.count > 0;
+    if (!settingsExist) {
+      // 表不存在，需要初始化所有表
+      await createAllTables(db);
+      return { initialized: false, needsSetup: true };
+    }
+
+    // 检查是否已有设置数据
+    const settingsCount = await db.prepare('SELECT COUNT(*) as count FROM settings').first();
+    
+    if (settingsCount.count === 0) {
+      return { initialized: false, needsSetup: true };
+    }
+
+    return { initialized: true, needsSetup: false };
   } catch (error) {
     console.error('Database initialization error:', error);
-    // 如果表不存在，创建它们
-    try {
-      await createAllTables(db);
-      return false;
-    } catch (createError) {
-      console.error('Failed to create tables:', createError);
-      throw createError;
-    }
+    throw new Error(`数据库初始化失败: ${error.message}`);
   }
 }
 
-// 确保 createAllTables 函数存在且正确
+// 创建所有表
 async function createAllTables(db) {
-  if (!db) {
-    throw new Error('数据库连接不可用');
-  }
-
   try {
     // 创建学生表
     await db.exec(`
@@ -174,8 +180,8 @@ async function createAllTables(db) {
         await db.prepare(
           'INSERT OR IGNORE INTO students (name) VALUES (?)'
         ).bind(name).run();
-      } catch (error) {
-        console.error(`Error inserting student ${name}:`, error);
+      } catch (e) {
+        console.warn(`Failed to insert student ${name}:`, e.message);
       }
     }
 
@@ -211,33 +217,30 @@ async function createAllTables(db) {
         await db.prepare(
           'INSERT OR IGNORE INTO score_categories (name, type, weight) VALUES (?, ?, ?)'
         ).bind(name, type, weight).run();
-      } catch (error) {
-        console.error(`Error inserting category ${name}:`, error);
+      } catch (e) {
+        console.warn(`Failed to insert category ${name}:`, e.message);
       }
     }
 
-    console.log('所有数据库表创建完成');
-    return false; // 需要设置
+    console.log('All tables created successfully');
   } catch (error) {
-    console.error('Error creating tables:', error);
-    throw error;
+    console.error('Table creation error:', error);
+    throw new Error(`创建数据库表失败: ${error.message}`);
   }
 }
 
+// API处理
 async function handleAPI(request, env, url) {
   const path = url.pathname;
 
-  // 检查数据库连接
-  if (!env.DB) {
-    return new Response(JSON.stringify({ error: '数据库连接失败' }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-
   try {
+    // 确保数据库连接可用
+    if (!env.DB) {
+      throw new Error('数据库连接不可用');
+    }
+
     if (path === '/api/login') {
-      return await handleLogin(request, env.DB);
+      return await handleLogin(request, env);
     } else if (path === '/api/logout') {
       return handleLogout();
     } else if (path === '/api/students') {
@@ -270,12 +273,42 @@ async function handleAPI(request, env, url) {
       return await handleGetMonthlyData(request, env.DB);
     } else if (path === '/api/setup') {
       return await handleSetup(request, env.DB);
+    } else if (path === '/api/health') {
+      return await handleHealthCheck(env.DB);
     }
 
-    return new Response('Not Found', { status: 404 });
+    return new Response(JSON.stringify({ error: 'API路径不存在' }), {
+      status: 404,
+      headers: { 'Content-Type': 'application/json' }
+    });
   } catch (error) {
     console.error('API Error:', error);
-    return new Response(JSON.stringify({ error: 'API错误: ' + error.message }), {
+    return new Response(JSON.stringify({ 
+      error: 'API处理错误',
+      details: error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// 健康检查
+async function handleHealthCheck(db) {
+  try {
+    await db.prepare('SELECT 1').run();
+    return new Response(JSON.stringify({ 
+      status: 'healthy',
+      database: 'connected'
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ 
+      status: 'unhealthy',
+      database: 'disconnected',
+      error: error.message
+    }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' }
     });
@@ -284,77 +317,124 @@ async function handleAPI(request, env, url) {
 
 // 初始化设置处理
 async function handleSetup(request, env) {
-  const { admin_username, admin_password, class_username, class_password, site_title, class_name } = await request.json();
-  
-  // 保存设置
-  const settings = [
-    ['class_username', class_username],
-    ['class_password', class_password],
-    ['admin_username', admin_username],
-    ['admin_password', admin_password],
-    ['site_title', site_title],
-    ['class_name', class_name],
-    ['current_month', new Date().toISOString().slice(0, 7)]
-  ];
+  try {
+    const { admin_username, admin_password, class_username, class_password, site_title, class_name } = await request.json();
+    
+    // 验证必需字段
+    if (!admin_username || !admin_password || !class_username || !class_password) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '请填写所有必需字段' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
-  for (const [key, value] of settings) {
-    await env.DB.prepare(
-      'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)'
-    ).bind(key, value).run();
+    // 保存设置
+    const settings = [
+      ['class_username', class_username],
+      ['class_password', class_password],
+      ['admin_username', admin_username],
+      ['admin_password', admin_password],
+      ['site_title', site_title || '2314班综合评分系统'],
+      ['class_name', class_name || '2314班'],
+      ['current_month', new Date().toISOString().slice(0, 7)]
+    ];
+
+    for (const [key, value] of settings) {
+      await env.DB.prepare(
+        'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)'
+      ).bind(key, value).run();
+    }
+
+    return new Response(JSON.stringify({ 
+      success: true,
+      message: '系统初始化成功'
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Setup error:', error);
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: '初始化失败: ' + error.message 
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
-
-  return new Response(JSON.stringify({ success: true }), {
-    headers: { 'Content-Type': 'application/json' }
-  });
 }
 
 // 登录处理
 async function handleLogin(request, env) {
-  const { username, password } = await request.json();
-  
-  const settings = await env.DB.prepare(
-    'SELECT key, value FROM settings WHERE key IN (?, ?, ?, ?)'
-  ).bind('class_username', 'class_password', 'admin_username', 'admin_password').all();
-
-  const settingMap = {};
-  settings.results.forEach(row => {
-    settingMap[row.key] = row.value;
-  });
-
-  let role = '';
-  if (username === settingMap.class_username && password === settingMap.class_password) {
-    role = 'class';
-  } else if (username === settingMap.admin_username && password === settingMap.admin_password) {
-    role = 'admin';
-  }
-
-  if (role) {
-    const sessionId = generateSessionId();
-    const expires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    const cookie = `session=${sessionId}; Path=/; HttpOnly; Expires=${expires.toUTCString()}; SameSite=Lax`;
+  try {
+    const { username, password } = await request.json();
     
-    // 存储会话信息
-    await env.DB.prepare(
-      'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)'
-    ).bind(`session_${sessionId}`, JSON.stringify({ username, role, expires: expires.getTime() })).run();
-    
-    return new Response(JSON.stringify({ success: true, role }), {
-      headers: {
-        'Content-Type': 'application/json',
-        'Set-Cookie': cookie
-      }
+    const settings = await env.DB.prepare(
+      'SELECT key, value FROM settings WHERE key IN (?, ?, ?, ?)'
+    ).bind('class_username', 'class_password', 'admin_username', 'admin_password').all();
+
+    const settingMap = {};
+    settings.results.forEach(row => {
+      settingMap[row.key] = row.value;
+    });
+
+    let role = '';
+    if (username === settingMap.class_username && password === settingMap.class_password) {
+      role = 'class';
+    } else if (username === settingMap.admin_username && password === settingMap.admin_password) {
+      role = 'admin';
+    }
+
+    if (role) {
+      const sessionId = generateSessionId();
+      const expires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+      const cookie = `session=${sessionId}; Path=/; HttpOnly; Expires=${expires.toUTCString()}; SameSite=Lax`;
+      
+      // 存储会话信息
+      await env.DB.prepare(
+        'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)'
+      ).bind(`session_${sessionId}`, JSON.stringify({ 
+        username, 
+        role, 
+        expires: expires.getTime() 
+      })).run();
+      
+      return new Response(JSON.stringify({ 
+        success: true, 
+        role,
+        message: '登录成功'
+      }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Set-Cookie': cookie
+        }
+      });
+    }
+
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: '用户名或密码错误' 
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: '登录失败: ' + error.message 
+    }), {
+      headers: { 'Content-Type': 'application/json' }
     });
   }
-
-  return new Response(JSON.stringify({ success: false, error: '用户名或密码错误' }), {
-    headers: { 'Content-Type': 'application/json' }
-  });
 }
 
 // 登出处理
 async function handleLogout() {
   const cookie = 'session=; Path=/; HttpOnly; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax';
-  return new Response(JSON.stringify({ success: true }), {
+  return new Response(JSON.stringify({ 
+    success: true,
+    message: '登出成功'
+  }), {
     headers: {
       'Content-Type': 'application/json',
       'Set-Cookie': cookie
@@ -364,249 +444,466 @@ async function handleLogout() {
 
 // 获取学生数据
 async function handleGetStudents(db) {
-  const students = await db.prepare(`
-    SELECT s.id, s.name, 
-           COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE 0 END), 0) as add_score,
-           COALESCE(SUM(CASE WHEN sc.type = 'minus' THEN sr.score ELSE 0 END), 0) as minus_score,
-           COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE -sr.score END), 0) as total_score
-    FROM students s
-    LEFT JOIN score_records sr ON s.id = sr.student_id
-    LEFT JOIN score_categories sc ON sr.category_id = sc.id
-    GROUP BY s.id, s.name
-    ORDER BY total_score DESC
-  `).all();
+  try {
+    const students = await db.prepare(`
+      SELECT s.id, s.name, 
+             COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE 0 END), 0) as add_score,
+             COALESCE(SUM(CASE WHEN sc.type = 'minus' THEN sr.score ELSE 0 END), 0) as minus_score,
+             COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE -sr.score END), 0) as total_score
+      FROM students s
+      LEFT JOIN score_records sr ON s.id = sr.student_id
+      LEFT JOIN score_categories sc ON sr.category_id = sc.id
+      GROUP BY s.id, s.name
+      ORDER BY total_score DESC
+    `).all();
 
-  const addRankings = [...students.results]
-    .map(s => ({ ...s, score: s.add_score }))
-    .sort((a, b) => b.score - a.score);
-  
-  const minusRankings = [...students.results]
-    .map(s => ({ ...s, score: s.minus_score }))
-    .sort((a, b) => b.score - a.score);
+    const addRankings = [...students.results]
+      .map(s => ({ ...s, score: s.add_score }))
+      .sort((a, b) => b.score - a.score);
+    
+    const minusRankings = [...students.results]
+      .map(s => ({ ...s, score: s.minus_score }))
+      .sort((a, b) => b.score - a.score);
 
-  return new Response(JSON.stringify({
-    students: students.results,
-    addRankings: addRankings.slice(0, 10),
-    minusRankings: minusRankings.slice(0, 10)
-  }), {
-    headers: { 
-      'Content-Type': 'application/json',
-      'Cache-Control': 'no-cache'
-    }
-  });
+    return new Response(JSON.stringify({
+      success: true,
+      students: students.results,
+      addRankings: addRankings.slice(0, 10),
+      minusRankings: minusRankings.slice(0, 10)
+    }), {
+      headers: { 
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache'
+      }
+    });
+  } catch (error) {
+    console.error('Get students error:', error);
+    return new Response(JSON.stringify({ 
+      success: false,
+      error: '获取学生数据失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
 }
 
 // 添加分数
 async function handleAddScore(request, db) {
-  const { studentId, categoryId, score, operator, note } = await request.json();
-  
-  // 获取类别信息
-  const category = await db.prepare(
-    'SELECT name, type FROM score_categories WHERE id = ?'
-  ).bind(categoryId).first();
-  
-  if (!category) {
-    return new Response(JSON.stringify({ success: false, error: '评分项目不存在' }), {
+  try {
+    const { studentId, categoryId, score, operator, note } = await request.json();
+    
+    // 验证必需字段
+    if (!studentId || !categoryId || !score || !operator) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '缺少必需字段' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // 获取类别信息
+    const category = await db.prepare(
+      'SELECT name, type FROM score_categories WHERE id = ?'
+    ).bind(categoryId).first();
+    
+    if (!category) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '评分项目不存在' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // 插入评分记录
+    await db.prepare(
+      'INSERT INTO score_records (student_id, category_id, score, operator, note) VALUES (?, ?, ?, ?, ?)'
+    ).bind(studentId, categoryId, score, operator, note).run();
+
+    // 记录操作日志
+    await db.prepare(
+      'INSERT INTO operation_logs (student_id, action_type, score_change, operator, category_name, note) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(studentId, category.type, category.type === 'add' ? score : -score, operator, category.name, note).run();
+
+    return new Response(JSON.stringify({ 
+      success: true,
+      message: '评分成功'
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Add score error:', error);
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: '评分失败: ' + error.message 
+    }), {
+      status: 500,
       headers: { 'Content-Type': 'application/json' }
     });
   }
-
-  // 插入评分记录
-  await db.prepare(
-    'INSERT INTO score_records (student_id, category_id, score, operator, note) VALUES (?, ?, ?, ?, ?)'
-  ).bind(studentId, categoryId, score, operator, note).run();
-
-  // 记录操作日志
-  await db.prepare(
-    'INSERT INTO operation_logs (student_id, action_type, score_change, operator, category_name, note) VALUES (?, ?, ?, ?, ?, ?)'
-  ).bind(studentId, category.type, category.type === 'add' ? score : -score, operator, category.name, note).run();
-
-  return new Response(JSON.stringify({ success: true }), {
-    headers: { 'Content-Type': 'application/json' }
-  });
 }
 
 // 撤销操作
 async function handleRevokeScore(request, db) {
-  const { studentId } = await request.json();
-  
-  // 获取最近一条记录
-  const lastRecord = await db.prepare(`
-    SELECT sr.id, sr.score, sc.type, sc.name as category_name, sr.operator, sr.note
-    FROM score_records sr
-    JOIN score_categories sc ON sr.category_id = sc.id
-    WHERE sr.student_id = ?
-    ORDER BY sr.created_at DESC 
-    LIMIT 1
-  `).bind(studentId).first();
+  try {
+    const { studentId } = await request.json();
+    
+    if (!studentId) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '缺少学生ID' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
-  if (!lastRecord) {
-    return new Response(JSON.stringify({ success: false, error: '没有可撤销的记录' }), {
+    // 获取最近一条记录
+    const lastRecord = await db.prepare(`
+      SELECT sr.id, sr.score, sc.type, sc.name as category_name, sr.operator, sr.note
+      FROM score_records sr
+      JOIN score_categories sc ON sr.category_id = sc.id
+      WHERE sr.student_id = ?
+      ORDER BY sr.created_at DESC 
+      LIMIT 1
+    `).bind(studentId).first();
+
+    if (!lastRecord) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '没有可撤销的记录' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // 删除记录
+    await db.prepare('DELETE FROM score_records WHERE id = ?').bind(lastRecord.id).run();
+
+    // 记录撤销日志
+    await db.prepare(
+      'INSERT INTO operation_logs (student_id, action_type, score_change, operator, category_name, note) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(studentId, 'revoke', lastRecord.type === 'add' ? -lastRecord.score : lastRecord.score, 
+           lastRecord.operator, `撤销: ${lastRecord.category_name}`, '撤销操作').run();
+
+    return new Response(JSON.stringify({ 
+      success: true,
+      message: '撤销成功'
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Revoke score error:', error);
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: '撤销失败: ' + error.message 
+    }), {
+      status: 500,
       headers: { 'Content-Type': 'application/json' }
     });
   }
-
-  // 删除记录
-  await db.prepare('DELETE FROM score_records WHERE id = ?').bind(lastRecord.id).run();
-
-  // 记录撤销日志
-  await db.prepare(
-    'INSERT INTO operation_logs (student_id, action_type, score_change, operator, category_name, note) VALUES (?, ?, ?, ?, ?, ?)'
-  ).bind(studentId, 'revoke', lastRecord.type === 'add' ? -lastRecord.score : lastRecord.score, 
-         lastRecord.operator, `撤销: ${lastRecord.category_name}`, '撤销操作').run();
-
-  return new Response(JSON.stringify({ success: true }), {
-    headers: { 'Content-Type': 'application/json' }
-  });
 }
 
 // 获取任务
 async function handleGetTasks(db) {
-  const tasks = await db.prepare(
-    'SELECT * FROM tasks ORDER BY created_at DESC'
-  ).all();
+  try {
+    const tasks = await db.prepare(
+      'SELECT * FROM tasks ORDER BY created_at DESC'
+    ).all();
 
-  return new Response(JSON.stringify(tasks.results), {
-    headers: { 'Content-Type': 'application/json' }
-  });
+    return new Response(JSON.stringify({
+      success: true,
+      tasks: tasks.results
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Get tasks error:', error);
+    return new Response(JSON.stringify({ 
+      success: false,
+      error: '获取任务失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
 }
 
 // 添加任务
 async function handleAddTask(request, db) {
-  const { title, content, deadline, created_by } = await request.json();
-  
-  await db.prepare(
-    'INSERT INTO tasks (title, content, deadline, created_by) VALUES (?, ?, ?, ?)'
-  ).bind(title, content, deadline, created_by).run();
+  try {
+    const { title, content, deadline, created_by } = await request.json();
+    
+    if (!title || !content) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '请填写任务标题和内容' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
-  return new Response(JSON.stringify({ success: true }), {
-    headers: { 'Content-Type': 'application/json' }
-  });
+    await db.prepare(
+      'INSERT INTO tasks (title, content, deadline, created_by) VALUES (?, ?, ?, ?)'
+    ).bind(title, content, deadline, created_by).run();
+
+    return new Response(JSON.stringify({ 
+      success: true,
+      message: '任务发布成功'
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Add task error:', error);
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: '发布任务失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
 }
 
 // 删除任务
 async function handleDeleteTask(request, db) {
-  const { id } = await request.json();
-  
-  await db.prepare('DELETE FROM tasks WHERE id = ?').bind(id).run();
+  try {
+    const { id } = await request.json();
+    
+    if (!id) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '缺少任务ID' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
-  return new Response(JSON.stringify({ success: true }), {
-    headers: { 'Content-Type': 'application/json' }
-  });
+    await db.prepare('DELETE FROM tasks WHERE id = ?').bind(id).run();
+
+    return new Response(JSON.stringify({ 
+      success: true,
+      message: '任务删除成功'
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Delete task error:', error);
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: '删除任务失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
 }
 
 // 创建快照
 async function handleSnapshot(request, db) {
-  const { month, title } = await request.json();
-  
-  // 获取当前所有学生分数
-  const students = await db.prepare(`
-    SELECT s.name, 
-           COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE 0 END), 0) as add_score,
-           COALESCE(SUM(CASE WHEN sc.type = 'minus' THEN sr.score ELSE 0 END), 0) as minus_score,
-           COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE -sr.score END), 0) as total_score
-    FROM students s
-    LEFT JOIN score_records sr ON s.id = sr.student_id
-    LEFT JOIN score_categories sc ON sr.category_id = sc.id
-    GROUP BY s.id, s.name
-  `).all();
+  try {
+    const { month, title } = await request.json();
+    
+    if (!month || !title) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '缺少月份或标题' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
-  // 保存快照
-  for (const student of students.results) {
-    await db.prepare(
-      'INSERT INTO monthly_snapshots (month, student_name, add_score, minus_score, total_score) VALUES (?, ?, ?, ?, ?)'
-    ).bind(`${month}-${title}`, student.name, student.add_score, student.minus_score, student.total_score).run();
+    // 获取当前所有学生分数
+    const students = await db.prepare(`
+      SELECT s.name, 
+             COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE 0 END), 0) as add_score,
+             COALESCE(SUM(CASE WHEN sc.type = 'minus' THEN sr.score ELSE 0 END), 0) as minus_score,
+             COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE -sr.score END), 0) as total_score
+      FROM students s
+      LEFT JOIN score_records sr ON s.id = sr.student_id
+      LEFT JOIN score_categories sc ON sr.category_id = sc.id
+      GROUP BY s.id, s.name
+    `).all();
+
+    // 保存快照
+    for (const student of students.results) {
+      await db.prepare(
+        'INSERT INTO monthly_snapshots (month, student_name, add_score, minus_score, total_score) VALUES (?, ?, ?, ?, ?)'
+      ).bind(`${month}-${title}`, student.name, student.add_score, student.minus_score, student.total_score).run();
+    }
+
+    return new Response(JSON.stringify({ 
+      success: true,
+      message: '月度数据保存成功'
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Snapshot error:', error);
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: '保存快照失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
-
-  return new Response(JSON.stringify({ success: true }), {
-    headers: { 'Content-Type': 'application/json' }
-  });
 }
 
 // 重置分数
 async function handleReset(request, db) {
-  await db.prepare('DELETE FROM score_records').run();
-  await db.prepare('DELETE FROM operation_logs').run();
+  try {
+    await db.prepare('DELETE FROM score_records').run();
+    await db.prepare('DELETE FROM operation_logs').run();
 
-  return new Response(JSON.stringify({ success: true }), {
-    headers: { 'Content-Type': 'application/json' }
-  });
+    return new Response(JSON.stringify({ 
+      success: true,
+      message: '分数重置成功'
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Reset error:', error);
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: '重置失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
 }
 
 // 获取设置
 async function handleGetSettings(db) {
-  const settings = await db.prepare('SELECT key, value FROM settings').all();
-  const settingMap = {};
-  settings.results.forEach(row => {
-    settingMap[row.key] = row.value;
-  });
-  
-  return new Response(JSON.stringify(settingMap), {
-    headers: { 'Content-Type': 'application/json' }
-  });
+  try {
+    const settings = await db.prepare('SELECT key, value FROM settings').all();
+    const settingMap = {};
+    settings.results.forEach(row => {
+      settingMap[row.key] = row.value;
+    });
+    
+    return new Response(JSON.stringify({
+      success: true,
+      settings: settingMap
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Get settings error:', error);
+    return new Response(JSON.stringify({ 
+      success: false,
+      error: '获取设置失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
 }
 
 // 更新设置
 async function handleUpdateSettings(request, db) {
-  const settings = await request.json();
-  
-  for (const [key, value] of Object.entries(settings)) {
-    await db.prepare(
-      'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)'
-    ).bind(key, value).run();
-  }
+  try {
+    const settings = await request.json();
+    
+    for (const [key, value] of Object.entries(settings)) {
+      await db.prepare(
+        'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)'
+      ).bind(key, value).run();
+    }
 
-  return new Response(JSON.stringify({ success: true }), {
-    headers: { 'Content-Type': 'application/json' }
-  });
+    return new Response(JSON.stringify({ 
+      success: true,
+      message: '设置更新成功'
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Update settings error:', error);
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: '更新设置失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
 }
 
 // 获取操作日志
 async function handleGetLogs(request, db) {
-  const { studentId } = Object.fromEntries(new URL(request.url).searchParams);
-  
-  let query = `
-    SELECT ol.*, s.name as student_name 
-    FROM operation_logs ol
-    JOIN students s ON ol.student_id = s.id
-  `;
-  let params = [];
+  try {
+    const { studentId } = Object.fromEntries(new URL(request.url).searchParams);
+    
+    let query = `
+      SELECT ol.*, s.name as student_name 
+      FROM operation_logs ol
+      JOIN students s ON ol.student_id = s.id
+    `;
+    let params = [];
 
-  if (studentId) {
-    query += ' WHERE ol.student_id = ?';
-    params.push(studentId);
+    if (studentId) {
+      query += ' WHERE ol.student_id = ?';
+      params.push(studentId);
+    }
+
+    query += ' ORDER BY ol.created_at DESC LIMIT 100';
+
+    const logs = await db.prepare(query).bind(...params).all();
+
+    return new Response(JSON.stringify({
+      success: true,
+      logs: logs.results
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Get logs error:', error);
+    return new Response(JSON.stringify({ 
+      success: false,
+      error: '获取日志失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
-
-  query += ' ORDER BY ol.created_at DESC LIMIT 100';
-
-  const logs = await db.prepare(query).bind(...params).all();
-
-  return new Response(JSON.stringify(logs.results), {
-    headers: { 'Content-Type': 'application/json' }
-  });
 }
 
 // 获取月度数据
 async function handleGetMonthlyData(request, db) {
-  const months = await db.prepare(
-    'SELECT DISTINCT month FROM monthly_snapshots ORDER BY month DESC'
-  ).all();
+  try {
+    const months = await db.prepare(
+      'SELECT DISTINCT month FROM monthly_snapshots ORDER BY month DESC'
+    ).all();
 
-  return new Response(JSON.stringify(months.results.map(m => m.month)), {
-    headers: { 'Content-Type': 'application/json' }
-  });
+    return new Response(JSON.stringify({
+      success: true,
+      months: months.results.map(m => m.month)
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Get monthly data error:', error);
+    return new Response(JSON.stringify({ 
+      success: false,
+      error: '获取月度数据失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
 }
 
-// 在 handlePages 函数开始处添加数据库检查
+// 页面处理
 async function handlePages(request, env, url) {
   const path = url.pathname;
   
-  // 检查数据库连接
-  if (!env.DB) {
-    return new Response('数据库连接失败', { status: 500 });
-  }
-
   try {
+    if (!env.DB) {
+      throw new Error('数据库连接不可用');
+    }
+
     if (path === '/login') {
       return renderLoginPage();
     } else if (path === '/class') {
@@ -619,12 +916,14 @@ async function handlePages(request, env, url) {
       return await renderLogsPage(env.DB, url);
     } else if (path === '/setup') {
       return renderSetupPage();
+    } else if (path === '/health') {
+      return await handleHealthCheck(env.DB);
     }
 
     return renderLoginPage();
   } catch (error) {
     console.error('Page render error:', error);
-    return new Response('页面渲染错误: ' + error.message, { status: 500 });
+    return renderErrorPage('页面渲染错误: ' + error.message);
   }
 }
 
@@ -637,32 +936,65 @@ function generateSessionId() {
 
 // 验证会话
 async function validateSession(request, db) {
-  const cookieHeader = request.headers.get('Cookie');
-  if (!cookieHeader) return null;
-
-  const cookies = Object.fromEntries(
-    cookieHeader.split(';').map(c => c.trim().split('='))
-  );
-  
-  const sessionId = cookies.session;
-  if (!sessionId) return null;
-
-  const sessionData = await db.prepare(
-    'SELECT value FROM settings WHERE key = ?'
-  ).bind(`session_${sessionId}`).first();
-
-  if (!sessionData) return null;
-
   try {
+    const cookieHeader = request.headers.get('Cookie');
+    if (!cookieHeader) return null;
+
+    const cookies = Object.fromEntries(
+      cookieHeader.split(';').map(c => c.trim().split('='))
+    );
+    
+    const sessionId = cookies.session;
+    if (!sessionId) return null;
+
+    const sessionData = await db.prepare(
+      'SELECT value FROM settings WHERE key = ?'
+    ).bind(`session_${sessionId}`).first();
+
+    if (!sessionData) return null;
+
     const session = JSON.parse(sessionData.value);
     if (session.expires < Date.now()) {
       await db.prepare('DELETE FROM settings WHERE key = ?').bind(`session_${sessionId}`).run();
       return null;
     }
     return session;
-  } catch {
+  } catch (error) {
+    console.error('Session validation error:', error);
     return null;
   }
+}
+
+// 渲染错误页面
+function renderErrorPage(message) {
+  const html = `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>系统错误</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Inter', sans-serif; }
+        body { background: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 2rem; }
+        .error-container { background: white; padding: 3rem; border-radius: 20px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); text-align: center; max-width: 500px; }
+        h1 { color: #ef4444; margin-bottom: 1rem; }
+        p { color: #64748b; margin-bottom: 2rem; line-height: 1.6; }
+        .btn { background: #6366f1; color: white; padding: 1rem 2rem; border: none; border-radius: 12px; text-decoration: none; display: inline-block; }
+    </style>
+</head>
+<body>
+    <div class="error-container">
+        <h1>⚠️ 系统错误</h1>
+        <p>${message}</p>
+        <a href="/" class="btn">返回首页</a>
+    </div>
+</body>
+</html>
+  `;
+  return new Response(html, {
+    headers: { 'Content-Type': 'text/html; charset=utf-8' }
+  });
 }
 
 // 渲染初始化设置页面
@@ -1269,26 +1601,32 @@ function renderLoginPage() {
 
 // 渲染班级页面
 async function renderClassPage(db, request) {
-  const session = await validateSession(request, db);
-  if (!session || session.role !== 'class') {
-    return Response.redirect(new URL('/login', request.url));
-  }
+  try {
+    const session = await validateSession(request, db);
+    if (!session || session.role !== 'class') {
+      return Response.redirect(new URL('/login', request.url));
+    }
 
-  const [studentsData, scoreCategories, tasks, settings] = await Promise.all([
-    handleGetStudents(db).then(r => r.json()),
-    db.prepare('SELECT * FROM score_categories ORDER BY type, id').all(),
-    db.prepare('SELECT * FROM tasks ORDER BY created_at DESC LIMIT 10').all(),
-    db.prepare('SELECT key, value FROM settings WHERE key IN (?, ?, ?)').bind('site_title', 'class_name', 'current_month').all()
-  ]);
+    const [studentsData, scoreCategories, tasks, settings] = await Promise.all([
+      handleGetStudents(db).then(r => r.json()),
+      db.prepare('SELECT * FROM score_categories ORDER BY type, id').all(),
+      db.prepare('SELECT * FROM tasks ORDER BY created_at DESC LIMIT 10').all(),
+      db.prepare('SELECT key, value FROM settings WHERE key IN (?, ?, ?)').bind('site_title', 'class_name', 'current_month').all()
+    ]);
 
-  const settingMap = {};
-  settings.results.forEach(row => {
-    settingMap[row.key] = row.value;
-  });
+    if (!studentsData.success) {
+      throw new Error(studentsData.error);
+    }
 
-  const currentMonth = settingMap.current_month || new Date().toISOString().slice(0, 7);
+    const settingMap = {};
+    settings.results.forEach(row => {
+      settingMap[row.key] = row.value;
+    });
 
-  const html = `
+    const currentMonth = settingMap.current_month || new Date().toISOString().slice(0, 7);
+
+    // 完整的班级页面HTML
+    const html = `
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -2807,302 +3145,41 @@ async function renderClassPage(db, request) {
     </script>
 </body>
 </html>
-  `;
-  return new Response(html, {
-    headers: { 'Content-Type': 'text/html; charset=utf-8' }
-  });
-}
-
-// 渲染访客页面
-async function renderVisitorPage(db) {
-  const studentsData = await handleGetStudents(db).then(r => r.json());
-  const settings = await db.prepare(
-    'SELECT key, value FROM settings WHERE key IN (?, ?)'
-  ).bind('site_title', 'class_name').all();
-
-  const settingMap = {};
-  settings.results.forEach(row => {
-    settingMap[row.key] = row.value;
-  });
-
-  const html = `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${settingMap.site_title || '班级评分系统'} - 访客视图</title>
-    <style>
-        * { 
-            margin: 0; padding: 0; box-sizing: border-box; 
-            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
-        }
-        
-        :root {
-            --primary: #6366f1;
-            --primary-dark: #4f46e5;
-            --secondary: #10b981;
-            --danger: #ef4444;
-            --background: #f8fafc;
-            --surface: #ffffff;
-            --text: #1e293b;
-            --text-light: #64748b;
-            --border: #e2e8f0;
-            --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
-        }
-        
-        body { 
-            background: var(--background); 
-            color: var(--text);
-            min-height: 100vh;
-        }
-        
-        .header { 
-            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); 
-            color: white; 
-            padding: 2rem 1rem; 
-            text-align: center;
-            box-shadow: var(--shadow);
-        }
-        
-        .header h1 { 
-            font-weight: 700; 
-            margin-bottom: 0.5rem;
-            font-size: 2rem;
-        }
-        
-        .header .subtitle {
-            opacity: 0.9;
-            margin-bottom: 1rem;
-        }
-        
-        .login-prompt { 
-            text-align: center; 
-            padding: 2rem 1rem; 
-            background: var(--surface);
-            margin: 1rem;
-            border-radius: 16px;
-            box-shadow: var(--shadow);
-            animation: slideInUp 0.5s ease;
-        }
-        
-        .login-btn { 
-            background: linear-gradient(135deg, var(--primary), var(--primary-dark)); 
-            color: white; 
-            padding: 1rem 2rem; 
-            border: none; 
-            border-radius: 12px; 
-            text-decoration: none; 
-            display: inline-block; 
-            margin-top: 1rem;
-            font-weight: 600;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
-        }
-        
-        .login-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 20px rgba(99, 102, 241, 0.4);
-        }
-        
-        .ranking-table { 
-            width: 100%; 
-            border-collapse: separate; 
-            border-spacing: 0;
-            background: var(--surface);
-            border-radius: 16px;
-            overflow: hidden;
-            box-shadow: var(--shadow);
-            margin: 1rem 0;
-            animation: fadeIn 0.6s ease;
-        }
-        
-        .ranking-table th, .ranking-table td { 
-            padding: 1.25rem 1rem; 
-            text-align: center; 
-            border-bottom: 1px solid var(--border);
-            transition: all 0.2s ease;
-        }
-        
-        .ranking-table th { 
-            background: var(--background); 
-            font-weight: 600; 
-            color: var(--text-light);
-        }
-        
-        .ranking-table tr:last-child td { 
-            border-bottom: none; 
-        }
-        
-        .ranking-table tr:hover td {
-            background: var(--background);
-            transform: scale(1.02);
-        }
-        
-        .container { 
-            padding: 1rem; 
-            max-width: 600px; 
-            margin: 0 auto; 
-        }
-        
-        .section-title {
-            font-size: 1.5rem;
-            font-weight: 700;
-            margin: 2rem 0 1rem;
-            text-align: center;
-            color: var(--text);
-        }
-        
-        .rank-badge {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            width: 2rem;
-            height: 2rem;
-            border-radius: 50%;
-            background: var(--primary);
-            color: white;
-            font-weight: 700;
-            font-size: 0.875rem;
-            transition: all 0.3s ease;
-        }
-        
-        .rank-badge:hover {
-            transform: scale(1.1) rotate(5deg);
-        }
-        
-        .rank-1 { 
-            background: linear-gradient(135deg, #f59e0b, #d97706);
-            box-shadow: 0 4px 12px rgba(245, 158, 11, 0.3);
-        }
-        .rank-2 { 
-            background: linear-gradient(135deg, #6b7280, #4b5563);
-            box-shadow: 0 4px 12px rgba(107, 114, 128, 0.3);
-        }
-        .rank-3 { 
-            background: linear-gradient(135deg, #92400e, #78350f);
-            box-shadow: 0 4px 12px rgba(146, 64, 14, 0.3);
-        }
-        
-        .positive { color: var(--secondary); font-weight: 600; }
-        .negative { color: var(--danger); font-weight: 600; }
-        .total { color: var(--primary); font-weight: 700; }
-        
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        
-        @keyframes slideInUp {
-            from { transform: translateY(30px); opacity: 0; }
-            to { transform: translateY(0); opacity: 1; }
-        }
-        
-        @media (max-width: 480px) {
-            .header h1 {
-                font-size: 1.5rem;
-            }
-            
-            .ranking-table {
-                font-size: 0.9rem;
-            }
-            
-            .ranking-table th, .ranking-table td {
-                padding: 1rem 0.5rem;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>${settingMap.site_title || '2314班综合评分系统'}</h1>
-        <div class="subtitle">${settingMap.class_name || '2314班'} - 访客视图</div>
-    </div>
+    `;
     
-    <div class="container">
-        <div class="login-prompt">
-            <p style="font-size: 1.1rem; margin-bottom: 1rem; color: var(--text);">查看完整功能请登录系统</p>
-            <a href="/login" class="login-btn">🔐 立即登录</a>
-        </div>
-        
-        <div class="section-title">🏆 学生评分总榜</div>
-        
-        <table class="ranking-table">
-            <thead>
-                <tr>
-                    <th width="80">排名</th>
-                    <th>姓名</th>
-                    <th width="120">总分</th>
-                </tr>
-            </thead>
-            <tbody>
-                ${studentsData.students.map((student, index) => `
-                    <tr>
-                        <td>
-                            <div class="rank-badge ${index < 3 ? `rank-${index + 1}` : ''}">
-                                ${index + 1}
-                            </div>
-                        </td>
-                        <td>${student.name}</td>
-                        <td class="total">
-                            ${student.total_score > 0 ? '+' : ''}${student.total_score}
-                        </td>
-                    </tr>
-                `).join('')}
-            </tbody>
-        </table>
-        
-        <div class="section-title">📈 排行榜</div>
-        
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 2rem;">
-            <div style="background: var(--surface); padding: 1.5rem; border-radius: 16px; box-shadow: var(--shadow); animation: fadeIn 0.6s ease 0.1s both;">
-                <h3 style="margin-bottom: 1rem; color: var(--secondary); text-align: center;">👍 加分榜</h3>
-                ${studentsData.addRankings.slice(0, 5).map((student, index) => `
-                    <div style="display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: ${index < 4 ? '1px solid var(--border)' : 'none'};">
-                        <span>${index + 1}. ${student.name}</span>
-                        <span class="positive">${student.add_score}</span>
-                    </div>
-                `).join('')}
-            </div>
-            
-            <div style="background: var(--surface); padding: 1.5rem; border-radius: 16px; box-shadow: var(--shadow); animation: fadeIn 0.6s ease 0.2s both;">
-                <h3 style="margin-bottom: 1rem; color: var(--danger); text-align: center;">👎 扣分榜</h3>
-                ${studentsData.minusRankings.slice(0, 5).map((student, index) => `
-                    <div style="display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: ${index < 4 ? '1px solid var(--border)' : 'none'};">
-                        <span>${index + 1}. ${student.name}</span>
-                        <span class="negative">${student.minus_score}</span>
-                    </div>
-                `).join('')}
-            </div>
-        </div>
-    </div>
-</body>
-</html>
-  `;
-  return new Response(html, {
-    headers: { 'Content-Type': 'text/html; charset=utf-8' }
-  });
+    return new Response(html, {
+      headers: { 'Content-Type': 'text/html; charset=utf-8' }
+    });
+  } catch (error) {
+    return renderErrorPage('班级页面加载失败: ' + error.message);
+  }
 }
 
 // 渲染管理员页面
 async function renderAdminPage(db, request) {
-  const session = await validateSession(request, db);
-  if (!session || session.role !== 'admin') {
-    return Response.redirect(new URL('/login', request.url));
-  }
+  try {
+    const session = await validateSession(request, db);
+    if (!session || session.role !== 'admin') {
+      return Response.redirect(new URL('/login', request.url));
+    }
 
-  const [studentsData, logs, settings] = await Promise.all([
-    handleGetStudents(db).then(r => r.json()),
-    db.prepare('SELECT * FROM operation_logs ORDER BY created_at DESC LIMIT 50').all(),
-    db.prepare('SELECT key, value FROM settings').all()
-  ]);
+    const [studentsData, logs, settings] = await Promise.all([
+      handleGetStudents(db).then(r => r.json()),
+      db.prepare('SELECT * FROM operation_logs ORDER BY created_at DESC LIMIT 50').all(),
+      db.prepare('SELECT key, value FROM settings').all()
+    ]);
 
-  const settingMap = {};
-  settings.results.forEach(row => {
-    settingMap[row.key] = row.value;
-  });
+    if (!studentsData.success) {
+      throw new Error(studentsData.error);
+    }
 
-  const html = `
+    const settingMap = {};
+    settings.results.forEach(row => {
+      settingMap[row.key] = row.value;
+    });
+
+    // 完整的管理员页面HTML
+    const html = `
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -3664,39 +3741,322 @@ async function renderAdminPage(db, request) {
     </script>
 </body>
 </html>
-  `;
-  return new Response(html, {
-    headers: { 'Content-Type': 'text/html; charset=utf-8' }
-  });
+    `;
+    
+    return new Response(html, {
+      headers: { 'Content-Type': 'text/html; charset=utf-8' }
+    });
+  } catch (error) {
+    return renderErrorPage('管理员页面加载失败: ' + error.message);
+  }
+}
+
+// 渲染访客页面
+async function renderVisitorPage(db) {
+  try {
+    const studentsData = await handleGetStudents(db).then(r => r.json());
+    const settings = await db.prepare(
+      'SELECT key, value FROM settings WHERE key IN (?, ?)'
+    ).bind('site_title', 'class_name').all();
+
+    const settingMap = {};
+    settings.results.forEach(row => {
+      settingMap[row.key] = row.value;
+    });
+
+    // 完整的访客页面HTML
+    const html = `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${settingMap.site_title || '班级评分系统'} - 访客视图</title>
+    <style>
+        * { 
+            margin: 0; padding: 0; box-sizing: border-box; 
+            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
+        }
+        
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #10b981;
+            --danger: #ef4444;
+            --background: #f8fafc;
+            --surface: #ffffff;
+            --text: #1e293b;
+            --text-light: #64748b;
+            --border: #e2e8f0;
+            --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+        }
+        
+        body { 
+            background: var(--background); 
+            color: var(--text);
+            min-height: 100vh;
+        }
+        
+        .header { 
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); 
+            color: white; 
+            padding: 2rem 1rem; 
+            text-align: center;
+            box-shadow: var(--shadow);
+        }
+        
+        .header h1 { 
+            font-weight: 700; 
+            margin-bottom: 0.5rem;
+            font-size: 2rem;
+        }
+        
+        .header .subtitle {
+            opacity: 0.9;
+            margin-bottom: 1rem;
+        }
+        
+        .login-prompt { 
+            text-align: center; 
+            padding: 2rem 1rem; 
+            background: var(--surface);
+            margin: 1rem;
+            border-radius: 16px;
+            box-shadow: var(--shadow);
+            animation: slideInUp 0.5s ease;
+        }
+        
+        .login-btn { 
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark)); 
+            color: white; 
+            padding: 1rem 2rem; 
+            border: none; 
+            border-radius: 12px; 
+            text-decoration: none; 
+            display: inline-block; 
+            margin-top: 1rem;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+        }
+        
+        .login-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(99, 102, 241, 0.4);
+        }
+        
+        .ranking-table { 
+            width: 100%; 
+            border-collapse: separate; 
+            border-spacing: 0;
+            background: var(--surface);
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: var(--shadow);
+            margin: 1rem 0;
+            animation: fadeIn 0.6s ease;
+        }
+        
+        .ranking-table th, .ranking-table td { 
+            padding: 1.25rem 1rem; 
+            text-align: center; 
+            border-bottom: 1px solid var(--border);
+            transition: all 0.2s ease;
+        }
+        
+        .ranking-table th { 
+            background: var(--background); 
+            font-weight: 600; 
+            color: var(--text-light);
+        }
+        
+        .ranking-table tr:last-child td { 
+            border-bottom: none; 
+        }
+        
+        .ranking-table tr:hover td {
+            background: var(--background);
+            transform: scale(1.02);
+        }
+        
+        .container { 
+            padding: 1rem; 
+            max-width: 600px; 
+            margin: 0 auto; 
+        }
+        
+        .section-title {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin: 2rem 0 1rem;
+            text-align: center;
+            color: var(--text);
+        }
+        
+        .rank-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 2rem;
+            height: 2rem;
+            border-radius: 50%;
+            background: var(--primary);
+            color: white;
+            font-weight: 700;
+            font-size: 0.875rem;
+            transition: all 0.3s ease;
+        }
+        
+        .rank-badge:hover {
+            transform: scale(1.1) rotate(5deg);
+        }
+        
+        .rank-1 { 
+            background: linear-gradient(135deg, #f59e0b, #d97706);
+            box-shadow: 0 4px 12px rgba(245, 158, 11, 0.3);
+        }
+        .rank-2 { 
+            background: linear-gradient(135deg, #6b7280, #4b5563);
+            box-shadow: 0 4px 12px rgba(107, 114, 128, 0.3);
+        }
+        .rank-3 { 
+            background: linear-gradient(135deg, #92400e, #78350f);
+            box-shadow: 0 4px 12px rgba(146, 64, 14, 0.3);
+        }
+        
+        .positive { color: var(--secondary); font-weight: 600; }
+        .negative { color: var(--danger); font-weight: 600; }
+        .total { color: var(--primary); font-weight: 700; }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        @keyframes slideInUp {
+            from { transform: translateY(30px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+        
+        @media (max-width: 480px) {
+            .header h1 {
+                font-size: 1.5rem;
+            }
+            
+            .ranking-table {
+                font-size: 0.9rem;
+            }
+            
+            .ranking-table th, .ranking-table td {
+                padding: 1rem 0.5rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>${settingMap.site_title || '2314班综合评分系统'}</h1>
+        <div class="subtitle">${settingMap.class_name || '2314班'} - 访客视图</div>
+    </div>
+    
+    <div class="container">
+        <div class="login-prompt">
+            <p style="font-size: 1.1rem; margin-bottom: 1rem; color: var(--text);">查看完整功能请登录系统</p>
+            <a href="/login" class="login-btn">🔐 立即登录</a>
+        </div>
+        
+        <div class="section-title">🏆 学生评分总榜</div>
+        
+        <table class="ranking-table">
+            <thead>
+                <tr>
+                    <th width="80">排名</th>
+                    <th>姓名</th>
+                    <th width="120">总分</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${studentsData.success ? studentsData.students.map((student, index) => `
+                    <tr>
+                        <td>
+                            <div class="rank-badge ${index < 3 ? `rank-${index + 1}` : ''}">
+                                ${index + 1}
+                            </div>
+                        </td>
+                        <td>${student.name}</td>
+                        <td class="total">
+                            ${student.total_score > 0 ? '+' : ''}${student.total_score}
+                        </td>
+                    </tr>
+                `).join('') : '<tr><td colspan="3" style="text-align: center; padding: 2rem;">加载中...</td></tr>'}
+            </tbody>
+        </table>
+        
+        <div class="section-title">📈 排行榜</div>
+        
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 2rem;">
+            <div style="background: var(--surface); padding: 1.5rem; border-radius: 16px; box-shadow: var(--shadow); animation: fadeIn 0.6s ease 0.1s both;">
+                <h3 style="margin-bottom: 1rem; color: var(--secondary); text-align: center;">👍 加分榜</h3>
+                ${studentsData.success ? studentsData.addRankings.slice(0, 5).map((student, index) => `
+                    <div style="display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: ${index < 4 ? '1px solid var(--border)' : 'none'};">
+                        <span>${index + 1}. ${student.name}</span>
+                        <span class="positive">${student.add_score}</span>
+                    </div>
+                `).join('') : '<div style="text-align: center; padding: 1rem;">加载中...</div>'}
+            </div>
+            
+            <div style="background: var(--surface); padding: 1.5rem; border-radius: 16px; box-shadow: var(--shadow); animation: fadeIn 0.6s ease 0.2s both;">
+                <h3 style="margin-bottom: 1rem; color: var(--danger); text-align: center;">👎 扣分榜</h3>
+                ${studentsData.success ? studentsData.minusRankings.slice(0, 5).map((student, index) => `
+                    <div style="display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: ${index < 4 ? '1px solid var(--border)' : 'none'};">
+                        <span>${index + 1}. ${student.name}</span>
+                        <span class="negative">${student.minus_score}</span>
+                    </div>
+                `).join('') : '<div style="text-align: center; padding: 1rem;">加载中...</div>'}
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+    `;
+    
+    return new Response(html, {
+      headers: { 'Content-Type': 'text/html; charset=utf-8' }
+    });
+  } catch (error) {
+    return renderErrorPage('访客页面加载失败: ' + error.message);
+  }
 }
 
 // 渲染日志页面
 async function renderLogsPage(db, url) {
-  const studentId = url.searchParams.get('studentId');
-  
-  let logs;
-  if (studentId) {
-    logs = await db.prepare(`
-      SELECT ol.*, s.name as student_name 
-      FROM operation_logs ol
-      JOIN students s ON ol.student_id = s.id
-      WHERE ol.student_id = ?
-      ORDER BY ol.created_at DESC
-      LIMIT 100
-    `).bind(studentId).all();
-  } else {
-    logs = await db.prepare(`
-      SELECT ol.*, s.name as student_name 
-      FROM operation_logs ol
-      JOIN students s ON ol.student_id = s.id
-      ORDER BY ol.created_at DESC
-      LIMIT 100
-    `).all();
-  }
+  try {
+    const studentId = url.searchParams.get('studentId');
+    
+    let logs;
+    if (studentId) {
+      logs = await db.prepare(`
+        SELECT ol.*, s.name as student_name 
+        FROM operation_logs ol
+        JOIN students s ON ol.student_id = s.id
+        WHERE ol.student_id = ?
+        ORDER BY ol.created_at DESC
+        LIMIT 100
+      `).bind(studentId).all();
+    } else {
+      logs = await db.prepare(`
+        SELECT ol.*, s.name as student_name 
+        FROM operation_logs ol
+        JOIN students s ON ol.student_id = s.id
+        ORDER BY ol.created_at DESC
+        LIMIT 100
+      `).all();
+    }
 
-  const students = await db.prepare('SELECT id, name FROM students ORDER BY name').all();
+    const students = await db.prepare('SELECT id, name FROM students ORDER BY name').all();
 
-  const html = `
+    // 完整的日志页面HTML
+    const html = `
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -3860,8 +4220,12 @@ async function renderLogsPage(db, url) {
     </script>
 </body>
 </html>
-  `;
-  return new Response(html, {
-    headers: { 'Content-Type': 'text/html; charset=utf-8' }
-  });
+    `;
+    
+    return new Response(html, {
+      headers: { 'Content-Type': 'text/html; charset=utf-8' }
+    });
+  } catch (error) {
+    return renderErrorPage('日志页面加载失败: ' + error.message);
+  }
 }
