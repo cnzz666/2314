@@ -1517,12 +1517,10 @@ function renderLoginPage() {
         
         <div class="login-info">
             <div class="info-item">
-                <span>班级账号:</span>
                 <span>版权所有 2025 By Liuqinxi </span>
                 <span>由Cloudflare(赛博菩萨)提供cdn(内容分发网络)和worker(无服务器搭建)</span>
             </div>
             <div class="info-item">
-                <span>班主任账号:</span>
                  <span>版权所有 2025 By Liuqinxi </span>
                 <span>由Cloudflare(赛博菩萨)提供cdn(内容分发网络)和worker(无服务器搭建)</span  
             </div>
@@ -1534,8 +1532,8 @@ function renderLoginPage() {
     <script>
         let currentRole = 'class';
         const roleCredentials = {
-            class: { username: '2314', password: 'hzwy2314' },
-            admin: { username: '2314admin', password: '2314admin2314admin' }
+            class: { username: '2314', password: '' },
+            admin: { username: '2314admin', password: '' }
         };
 
         document.querySelectorAll('.role-btn').forEach(btn => {
