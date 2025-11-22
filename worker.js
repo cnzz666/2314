@@ -48,7 +48,10 @@ export default {
 async function initDatabase(db) {
   try {
     // 首先测试数据库连接
-    await db.prepare('SELECT 1').run();
+    const testResult = await db.prepare('SELECT 1').run();
+    if (!testResult) {
+      throw new Error('数据库连接测试失败');
+    }
     
     // 检查设置表是否存在
     let settingsExist = true;
@@ -65,9 +68,10 @@ async function initDatabase(db) {
     }
 
     // 检查是否已有设置数据
-    const settingsCount = await db.prepare('SELECT COUNT(*) as count FROM settings').first();
+    const settingsResult = await db.prepare('SELECT COUNT(*) as count FROM settings').first();
+    const settingsCount = settingsResult ? settingsResult.count : 0;
     
-    if (settingsCount.count === 0) {
+    if (settingsCount === 0) {
       return { initialized: false, needsSetup: true };
     }
 
@@ -82,16 +86,16 @@ async function initDatabase(db) {
 async function createAllTables(db) {
   try {
     // 创建学生表
-    await db.exec(`
+    await db.prepare(`
       CREATE TABLE IF NOT EXISTS students (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
-    `);
+    `).run();
 
     // 创建评分项表
-    await db.exec(`
+    await db.prepare(`
       CREATE TABLE IF NOT EXISTS score_categories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
@@ -99,10 +103,10 @@ async function createAllTables(db) {
         weight INTEGER DEFAULT 1,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
-    `);
+    `).run();
 
     // 创建评分记录表
-    await db.exec(`
+    await db.prepare(`
       CREATE TABLE IF NOT EXISTS score_records (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         student_id INTEGER,
@@ -114,10 +118,10 @@ async function createAllTables(db) {
         FOREIGN KEY (student_id) REFERENCES students (id),
         FOREIGN KEY (category_id) REFERENCES score_categories (id)
       )
-    `);
+    `).run();
 
     // 创建任务表
-    await db.exec(`
+    await db.prepare(`
       CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT,
@@ -126,19 +130,19 @@ async function createAllTables(db) {
         created_by TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
-    `);
+    `).run();
 
     // 创建系统设置表
-    await db.exec(`
+    await db.prepare(`
       CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
-    `);
+    `).run();
 
     // 创建月度快照表
-    await db.exec(`
+    await db.prepare(`
       CREATE TABLE IF NOT EXISTS monthly_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         month TEXT,
@@ -148,10 +152,10 @@ async function createAllTables(db) {
         total_score INTEGER,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
-    `);
+    `).run();
 
     // 创建操作日志表
-    await db.exec(`
+    await db.prepare(`
       CREATE TABLE IF NOT EXISTS operation_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         student_id INTEGER,
@@ -162,7 +166,7 @@ async function createAllTables(db) {
         note TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
-    `);
+    `).run();
 
     // 初始化学生数据
     const students = [
@@ -316,7 +320,7 @@ async function handleHealthCheck(db) {
 }
 
 // 初始化设置处理
-async function handleSetup(request, env) {
+async function handleSetup(request, db) {
   try {
     const { admin_username, admin_password, class_username, class_password, site_title, class_name } = await request.json();
     
@@ -342,7 +346,7 @@ async function handleSetup(request, env) {
     ];
 
     for (const [key, value] of settings) {
-      await env.DB.prepare(
+      await db.prepare(
         'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)'
       ).bind(key, value).run();
     }
@@ -457,17 +461,18 @@ async function handleGetStudents(db) {
       ORDER BY total_score DESC
     `).all();
 
-    const addRankings = [...students.results]
+    const studentsArray = students.results || [];
+    const addRankings = [...studentsArray]
       .map(s => ({ ...s, score: s.add_score }))
       .sort((a, b) => b.score - a.score);
     
-    const minusRankings = [...students.results]
+    const minusRankings = [...studentsArray]
       .map(s => ({ ...s, score: s.minus_score }))
       .sort((a, b) => b.score - a.score);
 
     return new Response(JSON.stringify({
       success: true,
-      students: students.results,
+      students: studentsArray,
       addRankings: addRankings.slice(0, 10),
       minusRankings: minusRankings.slice(0, 10)
     }), {
@@ -614,7 +619,7 @@ async function handleGetTasks(db) {
 
     return new Response(JSON.stringify({
       success: true,
-      tasks: tasks.results
+      tasks: tasks.results || []
     }), {
       headers: { 'Content-Type': 'application/json' }
     });
@@ -727,7 +732,7 @@ async function handleSnapshot(request, db) {
     `).all();
 
     // 保存快照
-    for (const student of students.results) {
+    for (const student of (students.results || [])) {
       await db.prepare(
         'INSERT INTO monthly_snapshots (month, student_name, add_score, minus_score, total_score) VALUES (?, ?, ?, ?, ?)'
       ).bind(`${month}-${title}`, student.name, student.add_score, student.minus_score, student.total_score).run();
@@ -780,7 +785,7 @@ async function handleGetSettings(db) {
   try {
     const settings = await db.prepare('SELECT key, value FROM settings').all();
     const settingMap = {};
-    settings.results.forEach(row => {
+    (settings.results || []).forEach(row => {
       settingMap[row.key] = row.value;
     });
     
@@ -854,7 +859,7 @@ async function handleGetLogs(request, db) {
 
     return new Response(JSON.stringify({
       success: true,
-      logs: logs.results
+      logs: logs.results || []
     }), {
       headers: { 'Content-Type': 'application/json' }
     });
@@ -879,7 +884,7 @@ async function handleGetMonthlyData(request, db) {
 
     return new Response(JSON.stringify({
       success: true,
-      months: months.results.map(m => m.month)
+      months: (months.results || []).map(m => m.month)
     }), {
       headers: { 'Content-Type': 'application/json' }
     });
@@ -1619,7 +1624,7 @@ async function renderClassPage(db, request) {
     }
 
     const settingMap = {};
-    settings.results.forEach(row => {
+    (settings.results || []).forEach(row => {
       settingMap[row.key] = row.value;
     });
 
@@ -2673,11 +2678,11 @@ async function renderClassPage(db, request) {
         
         <h3 style="margin-bottom: 1rem; color: var(--text);">近期任务</h3>
         <div id="tasksList">
-            ${tasks.results.map(task => `
+            ${(tasks.results || []).map(task => `
                 <div class="task-item">
                     <div class="task-header">
                         <div class="task-title">${task.title}</div>
-                        <div class="task-deadline">${new Date(task.deadline).toLocaleDateString('zh-CN')}</div>
+                        <div class="task-deadline">${task.deadline ? new Date(task.deadline).toLocaleDateString('zh-CN') : '未设置'}</div>
                     </div>
                     <div class="task-content">${task.content}</div>
                     <div class="task-meta">
@@ -2833,7 +2838,7 @@ async function renderClassPage(db, request) {
             const categorySelect = document.getElementById('categorySelect');
             categorySelect.innerHTML = '';
             
-            const categories = ${JSON.stringify(scoreCategories.results)};
+            const categories = ${JSON.stringify((scoreCategories.results || []))};
             const filteredCategories = categories.filter(cat => cat.type === currentScoreType);
             
             filteredCategories.forEach(cat => {
@@ -3082,15 +3087,15 @@ async function renderClassPage(db, request) {
         async function showMonthlyData() {
             try {
                 const response = await fetch('/api/monthly');
-                const months = await response.json();
+                const result = await response.json();
                 
-                if (months.length === 0) {
+                if (!result.success || result.months.length === 0) {
                     showNotification('暂无历史数据', 'info');
                     return;
                 }
                 
                 let message = '历史月度数据:\\n';
-                months.forEach(month => {
+                result.months.forEach(month => {
                     message += \`• \${month}\\n\`;
                 });
                 
@@ -3165,7 +3170,7 @@ async function renderAdminPage(db, request) {
 
     const [studentsData, logs, settings] = await Promise.all([
       handleGetStudents(db).then(r => r.json()),
-      db.prepare('SELECT * FROM operation_logs ORDER BY created_at DESC LIMIT 50').all(),
+      db.prepare('SELECT ol.*, s.name as student_name FROM operation_logs ol JOIN students s ON ol.student_id = s.id ORDER BY ol.created_at DESC LIMIT 50').all(),
       db.prepare('SELECT key, value FROM settings').all()
     ]);
 
@@ -3174,7 +3179,7 @@ async function renderAdminPage(db, request) {
     }
 
     const settingMap = {};
-    settings.results.forEach(row => {
+    (settings.results || []).forEach(row => {
       settingMap[row.key] = row.value;
     });
 
@@ -3593,7 +3598,7 @@ async function renderAdminPage(db, request) {
                         </tr>
                     </thead>
                     <tbody>
-                        ${logs.results.map(log => `
+                        ${(logs.results || []).map(log => `
                             <tr>
                                 <td>${new Date(log.created_at).toLocaleString('zh-CN')}</td>
                                 <td>${log.student_name}</td>
@@ -3671,15 +3676,15 @@ async function renderAdminPage(db, request) {
         async function showMonthlyData() {
             try {
                 const response = await fetch('/api/monthly');
-                const months = await response.json();
+                const result = await response.json();
                 
-                if (months.length === 0) {
+                if (!result.success || result.months.length === 0) {
                     alert('暂无历史数据');
                     return;
                 }
                 
                 let message = '历史月度数据:\\n\\n';
-                months.forEach(month => {
+                result.months.forEach(month => {
                     message += \`• \${month}\\n\`;
                 });
                 
@@ -3760,7 +3765,7 @@ async function renderVisitorPage(db) {
     ).bind('site_title', 'class_name').all();
 
     const settingMap = {};
-    settings.results.forEach(row => {
+    (settings.results || []).forEach(row => {
       settingMap[row.key] = row.value;
     });
 
@@ -3976,7 +3981,7 @@ async function renderVisitorPage(db) {
                 </tr>
             </thead>
             <tbody>
-                ${studentsData.success ? studentsData.students.map((student, index) => `
+                ${studentsData.success ? (studentsData.students || []).map((student, index) => `
                     <tr>
                         <td>
                             <div class="rank-badge ${index < 3 ? `rank-${index + 1}` : ''}">
@@ -3997,7 +4002,7 @@ async function renderVisitorPage(db) {
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 2rem;">
             <div style="background: var(--surface); padding: 1.5rem; border-radius: 16px; box-shadow: var(--shadow); animation: fadeIn 0.6s ease 0.1s both;">
                 <h3 style="margin-bottom: 1rem; color: var(--secondary); text-align: center;">👍 加分榜</h3>
-                ${studentsData.success ? studentsData.addRankings.slice(0, 5).map((student, index) => `
+                ${studentsData.success ? (studentsData.addRankings || []).slice(0, 5).map((student, index) => `
                     <div style="display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: ${index < 4 ? '1px solid var(--border)' : 'none'};">
                         <span>${index + 1}. ${student.name}</span>
                         <span class="positive">${student.add_score}</span>
@@ -4007,7 +4012,7 @@ async function renderVisitorPage(db) {
             
             <div style="background: var(--surface); padding: 1.5rem; border-radius: 16px; box-shadow: var(--shadow); animation: fadeIn 0.6s ease 0.2s both;">
                 <h3 style="margin-bottom: 1rem; color: var(--danger); text-align: center;">👎 扣分榜</h3>
-                ${studentsData.success ? studentsData.minusRankings.slice(0, 5).map((student, index) => `
+                ${studentsData.success ? (studentsData.minusRankings || []).slice(0, 5).map((student, index) => `
                     <div style="display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: ${index < 4 ? '1px solid var(--border)' : 'none'};">
                         <span>${index + 1}. ${student.name}</span>
                         <span class="negative">${student.minus_score}</span>
@@ -4163,7 +4168,7 @@ async function renderLogsPage(db, url) {
     <div class="filters">
         <select id="studentFilter">
             <option value="">所有学生</option>
-            ${students.results.map(s => `
+            ${(students.results || []).map(s => `
                 <option value="${s.id}" ${studentId == s.id ? 'selected' : ''}>${s.name}</option>
             `).join('')}
         </select>
@@ -4184,7 +4189,7 @@ async function renderLogsPage(db, url) {
             </tr>
         </thead>
         <tbody>
-            ${logs.results.map(log => `
+            ${(logs.results || []).map(log => `
                 <tr>
                     <td>${new Date(log.created_at).toLocaleString('zh-CN')}</td>
                     <td>${log.student_name}</td>
