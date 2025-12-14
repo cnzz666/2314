@@ -1,9 +1,8 @@
-﻿﻿// cloudflare-worker.js - 现代化班级评分系统
+﻿// cloudflare-worker.js - 重构版班级评分系统
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
-    const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
 
     try {
       // 检查数据库连接
@@ -31,7 +30,7 @@ export default {
       }
 
       // 页面路由
-      return await handlePages(request, env, url, clientIP);
+      return await handlePages(request, env, url);
     } catch (error) {
       console.error('Global Error:', error);
       return new Response(JSON.stringify({ 
@@ -91,6 +90,7 @@ async function createAllTables(db) {
       CREATE TABLE IF NOT EXISTS students (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE,
+        last_scored DATETIME DEFAULT CURRENT_TIMESTAMP,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `).run();
@@ -102,6 +102,7 @@ async function createAllTables(db) {
         name TEXT,
         type TEXT,
         weight INTEGER DEFAULT 1,
+        requires_note BOOLEAN DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `).run();
@@ -115,6 +116,8 @@ async function createAllTables(db) {
         score INTEGER,
         operator TEXT,
         note TEXT,
+        ip_address TEXT,
+        user_agent TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (student_id) REFERENCES students (id),
         FOREIGN KEY (category_id) REFERENCES score_categories (id)
@@ -129,6 +132,7 @@ async function createAllTables(db) {
         content TEXT,
         deadline DATETIME,
         created_by TEXT,
+        ip_address TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `).run();
@@ -146,7 +150,7 @@ async function createAllTables(db) {
     await db.prepare(`
       CREATE TABLE IF NOT EXISTS monthly_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        snapshot_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+        snapshot_date DATETIME DEFAULT CURRENT_TIMESTAMP,
         title TEXT,
         month TEXT,
         student_name TEXT,
@@ -179,6 +183,7 @@ async function createAllTables(db) {
         ip TEXT PRIMARY KEY,
         username TEXT,
         role TEXT,
+        last_login DATETIME DEFAULT CURRENT_TIMESTAMP,
         expires DATETIME,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
@@ -208,37 +213,39 @@ async function createAllTables(db) {
     // 初始化评分类别
     const scoreCategories = [
       // 加分项
-      ['作业完成质量优秀', 'add', 1],
-      ['天天练达标', 'add', 1],
-      ['准时上课', 'add', 1],
-      ['卫生完成优秀', 'add', 1],
-      ['行为习惯良好', 'add', 1],
-      ['早操出勤', 'add', 1],
-      ['上课专注', 'add', 1],
-      ['任务完成优秀', 'add', 1],
-      ['课堂表现积极', 'add', 1],
-      ['帮助同学', 'add', 1],
-      ['其他加分项', 'add', 1],
+      ['作业完成质量优秀', 'add', 1, 0],
+      ['天天练达标', 'add', 1, 0],
+      ['准时上课', 'add', 1, 0],
+      ['卫生完成优秀', 'add', 1, 0],
+      ['行为习惯良好', 'add', 1, 0],
+      ['早操出勤', 'add', 1, 0],
+      ['上课专注', 'add', 1, 0],
+      ['任务完成优秀', 'add', 1, 0],
+      ['课堂表现积极', 'add', 1, 0],
+      ['帮助同学', 'add', 1, 0],
       
       // 减分项
-      ['上课违纪', 'minus', 1],
-      ['作业完成质量差', 'minus', 1],
-      ['天天练未达标', 'minus', 1],
-      ['迟到', 'minus', 1],
-      ['卫生未完成', 'minus', 1],
-      ['行为习惯差', 'minus', 1],
-      ['早操缺勤', 'minus', 1],
-      ['上课不专注', 'minus', 1],
-      ['未交/拖延作业', 'minus', 1],
-      ['破坏课堂纪律', 'minus', 1],
-      ['其他扣分项', 'minus', 1]
+      ['上课违纪', 'minus', 1, 0],
+      ['作业完成质量差', 'minus', 1, 0],
+      ['天天练未达标', 'minus', 1, 0],
+      ['迟到', 'minus', 1, 0],
+      ['卫生未完成', 'minus', 1, 0],
+      ['行为习惯差', 'minus', 1, 0],
+      ['早操缺勤', 'minus', 1, 0],
+      ['上课不专注', 'minus', 1, 0],
+      ['未交/拖延作业', 'minus', 1, 0],
+      ['破坏课堂纪律', 'minus', 1, 0],
+      
+      // 其他项（需要备注）
+      ['其他加分项', 'add', 1, 1],
+      ['其他扣分项', 'minus', 1, 1]
     ];
 
-    for (const [name, type, weight] of scoreCategories) {
+    for (const [name, type, weight, requiresNote] of scoreCategories) {
       try {
         await db.prepare(
-          'INSERT OR IGNORE INTO score_categories (name, type, weight) VALUES (?, ?, ?)'
-        ).bind(name, type, weight).run();
+          'INSERT OR IGNORE INTO score_categories (name, type, weight, requires_note) VALUES (?, ?, ?, ?)'
+        ).bind(name, type, weight, requiresNote).run();
       } catch (e) {
         console.warn(`Failed to insert category ${name}:`, e.message);
       }
@@ -254,7 +261,6 @@ async function createAllTables(db) {
 // API处理
 async function handleAPI(request, env, url) {
   const path = url.pathname;
-  const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
 
   try {
     // 确保数据库连接可用
@@ -263,22 +269,22 @@ async function handleAPI(request, env, url) {
     }
 
     if (path === '/api/login') {
-      return await handleLogin(request, env, clientIP);
+      return await handleLogin(request, env);
     } else if (path === '/api/logout') {
-      return await handleLogout(request, env.DB, clientIP);
+      return await handleLogout(request, env.DB);
     } else if (path === '/api/students') {
       return await handleGetStudents(env.DB);
     } else if (path === '/api/score') {
-      return await handleAddScore(request, env.DB, clientIP, request.headers.get('User-Agent'));
-    } else if (path === '/api/score-batch') {
-      return await handleBatchScore(request, env.DB, clientIP, request.headers.get('User-Agent'));
+      return await handleAddScore(request, env.DB);
+    } else if (path === '/api/batch-score') {
+      return await handleBatchScore(request, env.DB);
     } else if (path === '/api/revoke') {
-      return await handleRevokeScore(request, env.DB, clientIP);
+      return await handleRevokeScore(request, env.DB);
     } else if (path === '/api/tasks') {
       if (request.method === 'GET') {
         return await handleGetTasks(env.DB);
       } else if (request.method === 'POST') {
-        return await handleAddTask(request, env.DB, clientIP);
+        return await handleAddTask(request, env.DB);
       } else if (request.method === 'DELETE') {
         return await handleDeleteTask(request, env.DB);
       }
@@ -294,6 +300,8 @@ async function handleAPI(request, env, url) {
       }
     } else if (path === '/api/logs') {
       return await handleGetLogs(request, env.DB);
+    } else if (path === '/api/student-logs') {
+      return await handleGetStudentLogs(request, env.DB);
     } else if (path === '/api/monthly') {
       return await handleGetMonthlyData(request, env.DB);
     } else if (path === '/api/snapshots') {
@@ -302,8 +310,10 @@ async function handleAPI(request, env, url) {
       return await handleSetup(request, env.DB);
     } else if (path === '/api/health') {
       return await handleHealthCheck(env.DB);
-    } else if (path === '/api/ip-session') {
-      return await handleIPSession(request, env.DB, clientIP);
+    } else if (path === '/api/check-ip') {
+      return await handleCheckIP(request, env.DB);
+    } else if (path === '/api/ranking') {
+      return await handleGetRanking(env.DB);
     }
 
     return new Response(JSON.stringify({ error: 'API路径不存在' }), {
@@ -344,23 +354,30 @@ async function handleHealthCheck(db) {
   }
 }
 
-// IP会话处理
-async function handleIPSession(request, db, clientIP) {
+// 检查IP会话
+async function handleCheckIP(request, db) {
   try {
+    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+    const userAgent = request.headers.get('User-Agent') || '';
+    
+    // 检查是否有有效的IP会话
     const session = await db.prepare(
-      'SELECT username, role, expires FROM ip_sessions WHERE ip = ? AND expires > ?'
-    ).bind(clientIP, new Date().toISOString()).first();
+      'SELECT * FROM ip_sessions WHERE ip = ? AND expires > ?'
+    ).bind(ip, new Date().toISOString()).first();
     
     return new Response(JSON.stringify({ 
       success: true,
-      session: session || null
+      hasSession: !!session,
+      ip: ip,
+      session: session
     }), {
       headers: { 'Content-Type': 'application/json' }
     });
   } catch (error) {
+    console.error('Check IP error:', error);
     return new Response(JSON.stringify({ 
-      success: false,
-      error: error.message
+      success: false, 
+      error: '检查IP失败: ' + error.message 
     }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' }
@@ -374,7 +391,7 @@ async function handleSetup(request, db) {
     const { admin_password, class_username, class_password, site_title, class_name } = await request.json();
     
     // 验证必需字段
-    if (!class_username || !class_password || !admin_password) {
+    if (!class_username || !class_password) {
       return new Response(JSON.stringify({ 
         success: false, 
         error: '请填写所有必需字段' 
@@ -387,6 +404,7 @@ async function handleSetup(request, db) {
     const settings = [
       ['class_username', class_username],
       ['class_password', class_password],
+      ['admin_username', '2314admin'],
       ['admin_password', admin_password],
       ['site_title', site_title || '2314班综合评分系统'],
       ['class_name', class_name || '2314班'],
@@ -417,14 +435,15 @@ async function handleSetup(request, db) {
 }
 
 // 登录处理
-async function handleLogin(request, env, clientIP) {
+async function handleLogin(request, env) {
   try {
     const { username, password } = await request.json();
-    const userAgent = request.headers.get('User-Agent') || 'unknown';
+    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+    const userAgent = request.headers.get('User-Agent') || '';
     
     const settings = await env.DB.prepare(
-      'SELECT key, value FROM settings WHERE key IN (?, ?, ?)'
-    ).bind('class_username', 'class_password', 'admin_password').all();
+      'SELECT key, value FROM settings WHERE key IN (?, ?, ?, ?)'
+    ).bind('class_username', 'class_password', 'admin_username', 'admin_password').all();
 
     const settingMap = {};
     settings.results.forEach(row => {
@@ -434,26 +453,28 @@ async function handleLogin(request, env, clientIP) {
     let role = '';
     if (username === settingMap.class_username && password === settingMap.class_password) {
       role = 'class';
-    } else if (password === settingMap.admin_password) {
+    } else if (username === '2314admin' && password === settingMap.admin_password) {
       role = 'admin';
     }
 
     if (role) {
-      // 存储IP会话
-      const expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30天
+      // 创建IP会话（30天有效期）
+      const expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+      
       await env.DB.prepare(
         'INSERT OR REPLACE INTO ip_sessions (ip, username, role, expires) VALUES (?, ?, ?, ?)'
-      ).bind(clientIP, username, role, expires.toISOString()).run();
+      ).bind(ip, username, role, expires.toISOString()).run();
       
       // 记录登录日志
       await env.DB.prepare(
         'INSERT INTO operation_logs (student_id, action_type, score_change, operator, category_name, note, ip_address, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-      ).bind(0, 'login', 0, username, '系统登录', `${role}用户登录`, clientIP, userAgent).run();
+      ).bind(0, 'login', 0, username, '系统登录', `IP: ${ip}, UA: ${userAgent.substring(0, 100)}`, ip, userAgent).run();
       
       return new Response(JSON.stringify({ 
         success: true, 
         role,
-        message: '登录成功'
+        message: '登录成功',
+        ip: ip
       }), {
         headers: { 'Content-Type': 'application/json' }
       });
@@ -477,9 +498,12 @@ async function handleLogin(request, env, clientIP) {
 }
 
 // 登出处理
-async function handleLogout(request, db, clientIP) {
+async function handleLogout(request, db) {
   try {
-    await db.prepare('DELETE FROM ip_sessions WHERE ip = ?').bind(clientIP).run();
+    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+    
+    // 删除IP会话
+    await db.prepare('DELETE FROM ip_sessions WHERE ip = ?').bind(ip).run();
     
     return new Response(JSON.stringify({ 
       success: true,
@@ -491,7 +515,7 @@ async function handleLogout(request, db, clientIP) {
     console.error('Logout error:', error);
     return new Response(JSON.stringify({ 
       success: false,
-      error: '登出失败: ' + error.message
+      error: '登出失败: ' + error.message 
     }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' }
@@ -499,8 +523,8 @@ async function handleLogout(request, db, clientIP) {
   }
 }
 
-// 获取学生数据
-async function handleGetStudents(db) {
+// 获取排名数据
+async function handleGetRanking(db) {
   try {
     const students = await db.prepare(`
       SELECT s.id, s.name, 
@@ -514,11 +538,45 @@ async function handleGetStudents(db) {
       ORDER BY total_score DESC
     `).all();
 
-    const studentsArray = students.results || [];
+    return new Response(JSON.stringify({
+      success: true,
+      ranking: students.results || []
+    }), {
+      headers: { 
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache'
+      }
+    });
+  } catch (error) {
+    console.error('Get ranking error:', error);
+    return new Response(JSON.stringify({ 
+      success: false,
+      error: '获取排名数据失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// 获取学生数据（按最近评分时间排序）
+async function handleGetStudents(db) {
+  try {
+    const students = await db.prepare(`
+      SELECT s.id, s.name, s.last_scored,
+             COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE 0 END), 0) as add_score,
+             COALESCE(SUM(CASE WHEN sc.type = 'minus' THEN sr.score ELSE 0 END), 0) as minus_score,
+             COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE -sr.score END), 0) as total_score
+      FROM students s
+      LEFT JOIN score_records sr ON s.id = sr.student_id
+      LEFT JOIN score_categories sc ON sr.category_id = sc.id
+      GROUP BY s.id, s.name, s.last_scored
+      ORDER BY s.last_scored DESC, s.name ASC
+    `).all();
 
     return new Response(JSON.stringify({
       success: true,
-      students: studentsArray
+      students: students.results || []
     }), {
       headers: { 
         'Content-Type': 'application/json',
@@ -538,9 +596,9 @@ async function handleGetStudents(db) {
 }
 
 // 添加分数
-async function handleAddScore(request, db, clientIP, userAgent) {
+async function handleAddScore(request, db) {
   try {
-    const { studentId, categoryId, score, operator, note } = await request.json();
+    const { studentId, categoryId, score, operator, note, ip, userAgent } = await request.json();
     
     // 验证必需字段
     if (!studentId || !categoryId || !score || !operator) {
@@ -554,7 +612,7 @@ async function handleAddScore(request, db, clientIP, userAgent) {
 
     // 获取类别信息
     const category = await db.prepare(
-      'SELECT name, type FROM score_categories WHERE id = ?'
+      'SELECT name, type, requires_note FROM score_categories WHERE id = ?'
     ).bind(categoryId).first();
     
     if (!category) {
@@ -566,25 +624,30 @@ async function handleAddScore(request, db, clientIP, userAgent) {
       });
     }
 
-    // 检查是否为其他项且无备注
-    if ((category.name === '其他加分项' || category.name === '其他扣分项') && (!note || note.trim() === '')) {
+    // 如果类别需要备注但备注为空
+    if (category.requires_note && (!note || note.trim() === '')) {
       return new Response(JSON.stringify({ 
         success: false, 
-        error: '其他项必须填写备注' 
+        error: '该项目必须填写备注' 
       }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
+    // 更新学生最后评分时间
+    await db.prepare(
+      'UPDATE students SET last_scored = CURRENT_TIMESTAMP WHERE id = ?'
+    ).bind(studentId).run();
+
     // 插入评分记录
     await db.prepare(
-      'INSERT INTO score_records (student_id, category_id, score, operator, note) VALUES (?, ?, ?, ?, ?)'
-    ).bind(studentId, categoryId, score, operator, note || '').run();
+      'INSERT INTO score_records (student_id, category_id, score, operator, note, ip_address, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).bind(studentId, categoryId, score, operator, note, ip, userAgent).run();
 
     // 记录操作日志
     await db.prepare(
       'INSERT INTO operation_logs (student_id, action_type, score_change, operator, category_name, note, ip_address, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-    ).bind(studentId, category.type, category.type === 'add' ? score : -score, operator, category.name, note || '', clientIP, userAgent).run();
+    ).bind(studentId, category.type, category.type === 'add' ? score : -score, operator, category.name, note, ip, userAgent).run();
 
     return new Response(JSON.stringify({ 
       success: true,
@@ -605,15 +668,15 @@ async function handleAddScore(request, db, clientIP, userAgent) {
 }
 
 // 批量评分
-async function handleBatchScore(request, db, clientIP, userAgent) {
+async function handleBatchScore(request, db) {
   try {
-    const { studentIds, categoryId, score, operator, note } = await request.json();
+    const { studentIds, categoryId, score, operator, note, ip, userAgent } = await request.json();
     
     // 验证必需字段
     if (!studentIds || !Array.isArray(studentIds) || studentIds.length === 0 || !categoryId || !score || !operator) {
       return new Response(JSON.stringify({ 
         success: false, 
-        error: '缺少必需字段' 
+        error: '缺少必需字段或学生列表为空' 
       }), {
         headers: { 'Content-Type': 'application/json' }
       });
@@ -621,7 +684,7 @@ async function handleBatchScore(request, db, clientIP, userAgent) {
 
     // 获取类别信息
     const category = await db.prepare(
-      'SELECT name, type FROM score_categories WHERE id = ?'
+      'SELECT name, type, requires_note FROM score_categories WHERE id = ?'
     ).bind(categoryId).first();
     
     if (!category) {
@@ -633,26 +696,32 @@ async function handleBatchScore(request, db, clientIP, userAgent) {
       });
     }
 
-    // 检查是否为其他项且无备注
-    if ((category.name === '其他加分项' || category.name === '其他扣分项') && (!note || note.trim() === '')) {
+    // 如果类别需要备注但备注为空
+    if (category.requires_note && (!note || note.trim() === '')) {
       return new Response(JSON.stringify({ 
         success: false, 
-        error: '其他项必须填写备注' 
+        error: '该项目必须填写备注' 
       }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
-    // 批量插入评分记录
+    // 开始事务
     for (const studentId of studentIds) {
+      // 更新学生最后评分时间
       await db.prepare(
-        'INSERT INTO score_records (student_id, category_id, score, operator, note) VALUES (?, ?, ?, ?, ?)'
-      ).bind(studentId, categoryId, score, operator, note || '').run();
+        'UPDATE students SET last_scored = CURRENT_TIMESTAMP WHERE id = ?'
+      ).bind(studentId).run();
+
+      // 插入评分记录
+      await db.prepare(
+        'INSERT INTO score_records (student_id, category_id, score, operator, note, ip_address, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      ).bind(studentId, categoryId, score, operator, note, ip, userAgent).run();
 
       // 记录操作日志
       await db.prepare(
         'INSERT INTO operation_logs (student_id, action_type, score_change, operator, category_name, note, ip_address, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-      ).bind(studentId, category.type, category.type === 'add' ? score : -score, operator, category.name, note || '', clientIP, userAgent).run();
+      ).bind(studentId, category.type, category.type === 'add' ? score : -score, operator, category.name, note, ip, userAgent).run();
     }
 
     return new Response(JSON.stringify({ 
@@ -674,7 +743,7 @@ async function handleBatchScore(request, db, clientIP, userAgent) {
 }
 
 // 撤销操作
-async function handleRevokeScore(request, db, clientIP) {
+async function handleRevokeScore(request, db) {
   try {
     const { recordId } = await request.json();
     
@@ -709,9 +778,9 @@ async function handleRevokeScore(request, db, clientIP) {
 
     // 记录撤销日志
     await db.prepare(
-      'INSERT INTO operation_logs (student_id, action_type, score_change, operator, category_name, note, ip_address) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      'INSERT INTO operation_logs (student_id, action_type, score_change, operator, category_name, note) VALUES (?, ?, ?, ?, ?, ?)'
     ).bind(record.student_id, 'revoke', record.type === 'add' ? -record.score : record.score, 
-           record.operator, `撤销: ${record.category_name}`, '撤销操作', clientIP).run();
+           record.operator, `撤销: ${record.category_name}`, `撤销操作，原备注: ${record.note}`).run();
 
     return new Response(JSON.stringify({ 
       success: true,
@@ -724,6 +793,46 @@ async function handleRevokeScore(request, db, clientIP) {
     return new Response(JSON.stringify({ 
       success: false, 
       error: '撤销失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// 获取学生日志
+async function handleGetStudentLogs(request, db) {
+  try {
+    const { studentId } = Object.fromEntries(new URL(request.url).searchParams);
+    
+    if (!studentId) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '缺少学生ID' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    const logs = await db.prepare(`
+      SELECT sr.*, sc.name as category_name, sc.type as category_type
+      FROM score_records sr
+      JOIN score_categories sc ON sr.category_id = sc.id
+      WHERE sr.student_id = ?
+      ORDER BY sr.created_at DESC
+    `).bind(studentId).all();
+
+    return new Response(JSON.stringify({
+      success: true,
+      logs: logs.results || []
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Get student logs error:', error);
+    return new Response(JSON.stringify({ 
+      success: false,
+      error: '获取学生日志失败: ' + error.message 
     }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' }
@@ -757,9 +866,9 @@ async function handleGetTasks(db) {
 }
 
 // 添加任务
-async function handleAddTask(request, db, clientIP) {
+async function handleAddTask(request, db) {
   try {
-    const { title, content, deadline, created_by } = await request.json();
+    const { title, content, deadline, created_by, ip } = await request.json();
     
     if (!title || !content) {
       return new Response(JSON.stringify({ 
@@ -771,13 +880,8 @@ async function handleAddTask(request, db, clientIP) {
     }
 
     await db.prepare(
-      'INSERT INTO tasks (title, content, deadline, created_by) VALUES (?, ?, ?, ?)'
-    ).bind(title, content, deadline, created_by).run();
-
-    // 记录操作日志
-    await db.prepare(
-      'INSERT INTO operation_logs (student_id, action_type, score_change, operator, category_name, note, ip_address) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).bind(0, 'task', 0, created_by, '发布任务', title, clientIP).run();
+      'INSERT INTO tasks (title, content, deadline, created_by, ip_address) VALUES (?, ?, ?, ?, ?)'
+    ).bind(title, content, deadline, created_by, ip).run();
 
     return new Response(JSON.stringify({ 
       success: true,
@@ -846,7 +950,6 @@ async function handleSnapshot(request, db) {
     }
 
     const month = new Date().toISOString().slice(0, 7);
-    const snapshotTime = new Date().toISOString();
 
     // 获取当前所有学生分数
     const students = await db.prepare(`
@@ -863,15 +966,13 @@ async function handleSnapshot(request, db) {
     // 保存快照
     for (const student of (students.results || [])) {
       await db.prepare(
-        'INSERT INTO monthly_snapshots (snapshot_time, title, month, student_name, add_score, minus_score, total_score) VALUES (?, ?, ?, ?, ?, ?, ?)'
-      ).bind(snapshotTime, title, month, student.name, student.add_score, student.minus_score, student.total_score).run();
+        'INSERT INTO monthly_snapshots (snapshot_date, title, month, student_name, add_score, minus_score, total_score) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      ).bind(new Date().toISOString(), title, month, student.name, student.add_score, student.minus_score, student.total_score).run();
     }
 
     return new Response(JSON.stringify({ 
       success: true,
-      message: '快照保存成功',
-      snapshot_time: snapshotTime,
-      title: title
+      message: '快照保存成功'
     }), {
       headers: { 'Content-Type': 'application/json' }
     });
@@ -891,7 +992,7 @@ async function handleSnapshot(request, db) {
 async function handleGetSnapshots(request, db) {
   try {
     const snapshots = await db.prepare(
-      'SELECT DISTINCT snapshot_time, title, month FROM monthly_snapshots ORDER BY snapshot_time DESC'
+      'SELECT DISTINCT title, snapshot_date FROM monthly_snapshots ORDER BY snapshot_date DESC'
     ).all();
 
     return new Response(JSON.stringify({
@@ -915,8 +1016,19 @@ async function handleGetSnapshots(request, db) {
 // 重置分数
 async function handleReset(request, db) {
   try {
+    const { confirm } = await request.json();
+    
+    if (!confirm) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '需要确认操作' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     await db.prepare('DELETE FROM score_records').run();
-    await db.prepare('DELETE FROM operation_logs WHERE action_type != "login"').run();
+    await db.prepare('DELETE FROM operation_logs').run();
 
     return new Response(JSON.stringify({ 
       success: true,
@@ -1000,13 +1112,12 @@ async function handleGetLogs(request, db) {
     let query = `
       SELECT ol.*, s.name as student_name 
       FROM operation_logs ol
-      LEFT JOIN students s ON ol.student_id = s.id
-      WHERE ol.student_id != 0
+      JOIN students s ON ol.student_id = s.id
     `;
     let params = [];
 
     if (studentId) {
-      query += ' AND ol.student_id = ?';
+      query += ' WHERE ol.student_id = ?';
       params.push(studentId);
     }
 
@@ -1035,24 +1146,23 @@ async function handleGetLogs(request, db) {
 // 获取月度数据
 async function handleGetMonthlyData(request, db) {
   try {
-    const { snapshot_time } = Object.fromEntries(new URL(request.url).searchParams);
+    const { title } = Object.fromEntries(new URL(request.url).searchParams);
     
     let query = 'SELECT * FROM monthly_snapshots';
     let params = [];
     
-    if (snapshot_time) {
-      query += ' WHERE snapshot_time = ?';
-      params.push(snapshot_time);
+    if (title) {
+      query += ' WHERE title = ?';
+      params.push(title);
     }
     
     query += ' ORDER BY total_score DESC';
-    
+
     const data = await db.prepare(query).bind(...params).all();
 
     return new Response(JSON.stringify({
       success: true,
-      data: data.results || [],
-      snapshot_time: snapshot_time || null
+      data: data.results || []
     }), {
       headers: { 'Content-Type': 'application/json' }
     });
@@ -1068,8 +1178,37 @@ async function handleGetMonthlyData(request, db) {
   }
 }
 
+// 验证IP会话
+async function validateIPSession(request, db) {
+  try {
+    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+    
+    const session = await db.prepare(
+      'SELECT * FROM ip_sessions WHERE ip = ? AND expires > ?'
+    ).bind(ip, new Date().toISOString()).first();
+    
+    if (session) {
+      // 更新最后登录时间
+      await db.prepare(
+        'UPDATE ip_sessions SET last_login = CURRENT_TIMESTAMP WHERE ip = ?'
+      ).bind(ip).run();
+      
+      return {
+        authenticated: true,
+        role: session.role,
+        username: session.username
+      };
+    }
+    
+    return { authenticated: false };
+  } catch (error) {
+    console.error('Validate IP session error:', error);
+    return { authenticated: false };
+  }
+}
+
 // 页面处理
-async function handlePages(request, env, url, clientIP) {
+async function handlePages(request, env, url) {
   const path = url.pathname;
   
   try {
@@ -1078,35 +1217,38 @@ async function handlePages(request, env, url, clientIP) {
     }
 
     // 检查IP会话
-    const ipSession = await env.DB.prepare(
-      'SELECT username, role, expires FROM ip_sessions WHERE ip = ? AND expires > ?'
-    ).bind(clientIP, new Date().toISOString()).first();
-
+    const ipSession = await validateIPSession(request, env.DB);
+    
     if (path === '/login') {
-      return renderLoginPage(ipSession);
+      return renderLoginPage();
     } else if (path === '/class') {
-      return await renderClassPage(env.DB, request, clientIP, ipSession);
+      return await renderClassPage(env.DB, request, ipSession);
     } else if (path === '/admin') {
-      return await renderAdminPage(env.DB, request, clientIP, ipSession);
+      return await renderAdminPage(env.DB, request, ipSession);
     } else if (path === '/') {
       return await renderVisitorPage(env.DB);
-    } else if (path === '/logs') {
-      return await renderLogsPage(env.DB, url);
     } else if (path === '/snapshots') {
-      return await renderSnapshotsPage(env.DB);
+      return await renderSnapshotsPage(env.DB, request, ipSession);
     } else if (path === '/snapshot-view') {
-      return await renderSnapshotViewPage(env.DB, url);
+      return await renderSnapshotViewPage(env.DB, request);
     } else if (path === '/setup') {
       return renderSetupPage();
     } else if (path === '/health') {
       return await handleHealthCheck(env.DB);
     }
 
-    return renderLoginPage(ipSession);
+    return renderLoginPage();
   } catch (error) {
     console.error('Page render error:', error);
     return renderErrorPage('页面渲染错误: ' + error.message);
   }
+}
+
+// 生成会话ID
+function generateSessionId() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('') + Date.now().toString(36);
 }
 
 // 渲染错误页面
@@ -1119,107 +1261,16 @@ function renderErrorPage(message) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>系统错误</title>
     <style>
-        * { 
-            margin: 0; padding: 0; box-sizing: border-box; 
-            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
-        }
-        
-        body { 
-            background: #e0f7fa;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 1rem;
-            position: relative;
-            overflow: hidden;
-        }
-        
-        body::after {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-image: url('https://tc.ilqx.dpdns.org/api/bing/wallpaper');
-            background-size: cover;
-            background-position: center;
-            filter: blur(8px);
-            z-index: -2;
-        }
-        
-        body::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(45deg, rgba(79, 195, 247, 0.2), rgba(176, 196, 222, 0.2));
-            z-index: -1;
-        }
-        
-        .error-container {
-            background: rgba(255, 255, 255, 0.3);
-            padding: 3rem;
-            border-radius: 15px;
-            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
-            backdrop-filter: blur(5px);
-            border: 1px solid rgba(79, 195, 247, 0.3);
-            text-align: center;
-            max-width: 500px;
-            transform: scale(0.5);
-            opacity: 0.5;
-            filter: blur(10px);
-            transition: transform 1s ease-out, opacity 1s ease-out, filter 1s ease-out;
-        }
-        
-        .error-container.loaded {
-            transform: scale(1);
-            opacity: 1;
-            filter: blur(0);
-        }
-        
-        .error-container:hover {
-            transform: scale(1.03);
-            box-shadow: 0 12px 40px rgba(79, 195, 247, 0.5), 0 0 20px rgba(176, 196, 222, 0.3);
-        }
-        
-        h1 { 
-            color: #0277bd;
-            margin-bottom: 1rem;
-            text-shadow: 0 0 5px rgba(79, 195, 247, 0.3);
-        }
-        
-        p { 
-            color: #333333;
-            margin-bottom: 2rem;
-            line-height: 1.6;
-        }
-        
-        .btn { 
-            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
-            color: #333333;
-            padding: 1rem 2rem;
-            border: none;
-            border-radius: 25px;
-            text-decoration: none;
-            display: inline-block;
-            font-weight: bold;
-            transition: all 0.3s ease;
-            cursor: pointer;
-        }
-        
-        .btn:hover {
-            background: linear-gradient(45deg, #29b6f6, #4fc3f7);
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(79, 195, 247, 0.4);
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Inter', sans-serif; }
+        body { background: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 2rem; }
+        .error-container { background: white; padding: 3rem; border-radius: 20px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); text-align: center; max-width: 500px; }
+        h1 { color: #ef4444; margin-bottom: 1rem; }
+        p { color: #64748b; margin-bottom: 2rem; line-height: 1.6; }
+        .btn { background: #6366f1; color: white; padding: 1rem 2rem; border: none; border-radius: 12px; text-decoration: none; display: inline-block; }
     </style>
 </head>
 <body>
-    <div class="error-container loaded">
+    <div class="error-container">
         <h1>⚠️ 系统错误</h1>
         <p>${message}</p>
         <a href="/" class="btn">返回首页</a>
@@ -1247,152 +1298,158 @@ function renderSetupPage() {
             font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
         }
         
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --background: #f8fafc;
+            --surface: #ffffff;
+            --text: #1e293b;
+            --text-light: #64748b;
+            --border: #e2e8f0;
+            --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+        }
+        
         body { 
-            background: #e0f7fa;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+            min-height: 100vh; 
+            display: flex; 
+            align-items: center; 
             justify-content: center;
             padding: 1rem;
+        }
+        
+        .setup-container {
+            background: var(--surface); 
+            padding: 3rem; 
+            border-radius: 24px;
+            box-shadow: var(--shadow); 
+            width: 100%; 
+            max-width: 500px;
+            transform: translateY(0); 
+            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
             position: relative;
             overflow: hidden;
         }
         
-        body::after {
+        .setup-container::before {
             content: '';
             position: absolute;
             top: 0;
             left: 0;
-            width: 100%;
-            height: 100%;
-            background-image: url('https://tc.ilqx.dpdns.org/api/bing/wallpaper');
-            background-size: cover;
-            background-position: center;
-            filter: blur(8px);
-            z-index: -2;
-        }
-        
-        body::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(45deg, rgba(79, 195, 247, 0.2), rgba(176, 196, 222, 0.2));
-            z-index: -1;
-        }
-        
-        .setup-container {
-            background: rgba(255, 255, 255, 0.3);
-            padding: 3rem;
-            border-radius: 15px;
-            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
-            backdrop-filter: blur(5px);
-            border: 1px solid rgba(79, 195, 247, 0.3);
-            width: 100%;
-            max-width: 500px;
-            transform: scale(0.5);
-            opacity: 0.5;
-            filter: blur(10px);
-            transition: transform 1s ease-out, opacity 1s ease-out, filter 1s ease-out;
-            position: relative;
-        }
-        
-        .setup-container.loaded {
-            transform: scale(1);
-            opacity: 1;
-            filter: blur(0);
-        }
-        
-        .setup-container:hover {
-            transform: scale(1.03);
-            box-shadow: 0 12px 40px rgba(79, 195, 247, 0.5), 0 0 20px rgba(176, 196, 222, 0.3);
+            right: 0;
+            height: 4px;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
         }
         
         h1 { 
-            text-align: center;
-            margin-bottom: 2rem;
-            color: #0277bd;
-            text-shadow: 0 0 5px rgba(79, 195, 247, 0.3);
+            text-align: center; 
+            margin-bottom: 2rem; 
+            color: var(--text); 
+            font-weight: 700;
+            font-size: 2rem;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
         }
         
         .subtitle {
             text-align: center;
-            color: #333333;
+            color: var(--text-light);
             margin-bottom: 2rem;
             line-height: 1.6;
-            opacity: 0.9;
         }
         
         .input-group { 
-            margin-bottom: 1.5rem;
+            margin-bottom: 1.5rem; 
+            position: relative;
         }
         
         input { 
-            width: 100%;
-            padding: 1rem;
-            background-color: rgba(255, 255, 255, 0.5);
-            border: 1px solid rgba(79, 195, 247, 0.5);
-            border-radius: 25px;
-            font-size: 1rem;
-            color: #333333;
-            text-align: center;
-            outline: none;
+            width: 100%; 
+            padding: 1rem 1rem 1rem 3rem; 
+            border: 2px solid var(--border); 
+            border-radius: 12px; 
+            font-size: 1rem; 
             transition: all 0.3s ease;
+            background: var(--surface);
+            color: var(--text);
         }
         
-        input:focus {
-            background-color: rgba(255, 255, 255, 0.7);
-            border-color: #0277bd;
-            box-shadow: 0 0 10px rgba(79, 195, 247, 0.3);
+        input:focus { 
+            outline: none; 
+            border-color: var(--primary); 
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1); 
+            transform: translateY(-2px);
+        }
+        
+        .input-icon {
+            position: absolute;
+            left: 1rem;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-light);
+            transition: color 0.3s ease;
+        }
+        
+        input:focus + .input-icon {
+            color: var(--primary);
         }
         
         button { 
-            width: 100%;
-            padding: 1rem;
-            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
-            border: none;
-            border-radius: 25px;
-            color: #333333;
-            font-weight: bold;
-            cursor: pointer;
+            width: 100%; 
+            padding: 1rem; 
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark)); 
+            color: white; 
+            border: none; 
+            border-radius: 12px; 
+            font-size: 1rem; 
+            font-weight: 600;
+            cursor: pointer; 
             transition: all 0.3s ease;
-            text-transform: uppercase;
-            letter-spacing: 1px;
+            position: relative;
+            overflow: hidden;
         }
         
-        button:hover {
-            background: linear-gradient(45deg, #29b6f6, #4fc3f7);
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(79, 195, 247, 0.4);
+        button::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.5s;
         }
         
-        button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
+        button:hover::before {
+            left: 100%;
+        }
+        
+        button:hover { 
+            transform: translateY(-2px); 
+            box-shadow: 0 10px 25px -5px rgba(99, 102, 241, 0.4);
+        }
+        
+        button:active {
+            transform: translateY(0);
         }
         
         .form-section {
             margin-bottom: 2rem;
             padding: 1.5rem;
-            background: rgba(255, 255, 255, 0.2);
+            background: var(--background);
             border-radius: 12px;
         }
         
         .form-section h3 {
             margin-bottom: 1rem;
-            color: #0277bd;
+            color: var(--text);
             display: flex;
             align-items: center;
             gap: 0.5rem;
-        }
-        
-        #message {
-            margin-top: 1rem;
-            text-align: center;
-            color: #ef4444;
-            font-weight: 500;
         }
         
         @media (max-width: 480px) {
@@ -1407,7 +1464,7 @@ function renderSetupPage() {
     </style>
 </head>
 <body>
-    <div class="setup-container loaded">
+    <div class="setup-container">
         <h1>系统初始化</h1>
         <div class="subtitle">
             欢迎使用班级评分系统！请先完成系统初始化设置。
@@ -1417,9 +1474,11 @@ function renderSetupPage() {
             <div class="form-section">
                 <h3>🏫 班级信息</h3>
                 <div class="input-group">
+                    <div class="input-icon">📝</div>
                     <input type="text" id="site_title" placeholder="网站标题" value="2314班综合评分系统" required>
                 </div>
                 <div class="input-group">
+                    <div class="input-icon">👨‍🏫</div>
                     <input type="text" id="class_name" placeholder="班级名称" value="2314班" required>
                 </div>
             </div>
@@ -1427,24 +1486,31 @@ function renderSetupPage() {
             <div class="form-section">
                 <h3>🔐 班级账号</h3>
                 <div class="input-group">
+                    <div class="input-icon">👤</div>
                     <input type="text" id="class_username" placeholder="班级登录用户名" value="2314" required>
                 </div>
                 <div class="input-group">
+                    <div class="input-icon">🔒</div>
                     <input type="password" id="class_password" placeholder="班级登录密码" value="hzwy2314" required>
                 </div>
             </div>
             
             <div class="form-section">
-                <h3>⚡ 管理员密码</h3>
+                <h3>⚡ 管理员账号</h3>
                 <div class="input-group">
-                    <input type="password" id="admin_password" placeholder="管理员密码" value="2314admin2314admin" required>
+                    <div class="input-icon">👤</div>
+                    <input type="text" value="2314admin" readonly disabled style="background: var(--background);">
+                </div>
+                <div class="input-group">
+                    <div class="input-icon">🔒</div>
+                    <input type="password" id="admin_password" placeholder="管理员密码" required>
                 </div>
             </div>
             
-            <button type="submit" id="submitBtn">🚀 初始化系统</button>
+            <button type="submit">🚀 初始化系统</button>
         </form>
         
-        <div id="message"></div>
+        <div id="message" style="margin-top: 1rem; text-align: center; color: var(--danger); font-weight: 500;"></div>
     </div>
 
     <script>
@@ -1459,7 +1525,7 @@ function renderSetupPage() {
                 admin_password: document.getElementById('admin_password').value
             };
 
-            const submitBtn = document.getElementById('submitBtn');
+            const submitBtn = e.target.querySelector('button');
             const originalText = submitBtn.textContent;
             submitBtn.textContent = '初始化中...';
             submitBtn.disabled = true;
@@ -1499,7 +1565,7 @@ function renderSetupPage() {
 }
 
 // 渲染登录页面
-function renderLoginPage(ipSession) {
+function renderLoginPage() {
   const html = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -1513,179 +1579,170 @@ function renderLoginPage(ipSession) {
             font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
         }
         
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --background: #f8fafc;
+            --surface: #ffffff;
+            --text: #1e293b;
+            --text-light: #64748b;
+            --border: #e2e8f0;
+            --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+        }
+        
         body { 
-            background: #e0f7fa;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+            min-height: 100vh; 
+            display: flex; 
+            align-items: center; 
             justify-content: center;
             padding: 1rem;
+        }
+        
+        .login-container {
+            background: var(--surface); 
+            padding: 3rem; 
+            border-radius: 24px;
+            box-shadow: var(--shadow); 
+            width: 100%; 
+            max-width: 440px;
+            transform: translateY(0); 
+            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
             position: relative;
             overflow: hidden;
         }
         
-        body::after {
+        .login-container::before {
             content: '';
             position: absolute;
             top: 0;
             left: 0;
-            width: 100%;
-            height: 100%;
-            background-image: url('https://tc.ilqx.dpdns.org/api/bing/wallpaper');
-            background-size: cover;
-            background-position: center;
-            filter: blur(8px);
-            z-index: -2;
+            right: 0;
+            height: 4px;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
         }
         
-        body::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(45deg, rgba(79, 195, 247, 0.2), rgba(176, 196, 222, 0.2));
-            z-index: -1;
-        }
-        
-        .login-container {
-            background: rgba(255, 255, 255, 0.3);
-            padding: 3rem;
-            border-radius: 15px;
-            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
-            backdrop-filter: blur(5px);
-            border: 1px solid rgba(79, 195, 247, 0.3);
-            width: 100%;
-            max-width: 440px;
-            transform: scale(0.5);
-            opacity: 0.5;
-            filter: blur(10px);
-            transition: transform 1s ease-out, opacity 1s ease-out, filter 1s ease-out;
-            position: relative;
-        }
-        
-        .login-container.loaded {
-            transform: scale(1);
-            opacity: 1;
-            filter: blur(0);
-        }
-        
-        .login-container:hover {
-            transform: scale(1.03);
-            box-shadow: 0 12px 40px rgba(79, 195, 247, 0.5), 0 0 20px rgba(176, 196, 222, 0.3);
+        .login-container:hover { 
+            transform: translateY(-8px); 
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
         }
         
         h1 { 
-            text-align: center;
-            margin-bottom: 2rem;
-            color: #0277bd;
-            text-shadow: 0 0 5px rgba(79, 195, 247, 0.3);
+            text-align: center; 
+            margin-bottom: 2rem; 
+            color: var(--text); 
+            font-weight: 700;
+            font-size: 2rem;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
         }
         
         .input-group { 
-            margin-bottom: 1.5rem;
+            margin-bottom: 1.5rem; 
+            position: relative;
         }
         
         input { 
-            width: 100%;
-            padding: 1rem;
-            background-color: rgba(255, 255, 255, 0.5);
-            border: 1px solid rgba(79, 195, 247, 0.5);
-            border-radius: 25px;
-            font-size: 1rem;
-            color: #333333;
-            text-align: center;
-            outline: none;
+            width: 100%; 
+            padding: 1rem 1rem 1rem 3rem; 
+            border: 2px solid var(--border); 
+            border-radius: 12px; 
+            font-size: 1rem; 
             transition: all 0.3s ease;
+            background: var(--surface);
+            color: var(--text);
         }
         
-        input:focus {
-            background-color: rgba(255, 255, 255, 0.7);
-            border-color: #0277bd;
-            box-shadow: 0 0 10px rgba(79, 195, 247, 0.3);
+        input:focus { 
+            outline: none; 
+            border-color: var(--primary); 
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1); 
+            transform: translateY(-2px);
+        }
+        
+        .input-icon {
+            position: absolute;
+            left: 1rem;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-light);
+            transition: color 0.3s ease;
+        }
+        
+        input:focus + .input-icon {
+            color: var(--primary);
         }
         
         button { 
-            width: 100%;
-            padding: 1rem;
-            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
-            border: none;
-            border-radius: 25px;
-            color: #333333;
-            font-weight: bold;
-            cursor: pointer;
+            width: 100%; 
+            padding: 1rem; 
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark)); 
+            color: white; 
+            border: none; 
+            border-radius: 12px; 
+            font-size: 1rem; 
+            font-weight: 600;
+            cursor: pointer; 
             transition: all 0.3s ease;
-            text-transform: uppercase;
-            letter-spacing: 1px;
+            position: relative;
+            overflow: hidden;
         }
         
-        button:hover {
-            background: linear-gradient(45deg, #29b6f6, #4fc3f7);
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(79, 195, 247, 0.4);
+        button::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.5s;
         }
         
-        button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
+        button:hover::before {
+            left: 100%;
+        }
+        
+        button:hover { 
+            transform: translateY(-2px); 
+            box-shadow: 0 10px 25px -5px rgba(99, 102, 241, 0.4);
+        }
+        
+        button:active {
+            transform: translateY(0);
         }
         
         .role-select { 
-            display: flex;
-            gap: 0.75rem;
-            margin-bottom: 2rem;
-            background: rgba(255, 255, 255, 0.2);
+            display: flex; 
+            gap: 0.75rem; 
+            margin-bottom: 2rem; 
+            background: var(--background);
             padding: 0.5rem;
             border-radius: 12px;
         }
         
         .role-btn { 
-            flex: 1;
-            padding: 0.8rem;
-            background: transparent;
-            border: 2px solid transparent;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: all 0.3s ease;
+            flex: 1; 
+            padding: 0.8rem; 
+            border: 2px solid transparent; 
+            background: transparent; 
+            border-radius: 8px; 
+            cursor: pointer; 
+            transition: all 0.3s ease; 
             text-align: center;
             font-weight: 500;
-            color: #333333;
+            color: var(--text-light);
         }
         
         .role-btn.active { 
-            background: rgba(255, 255, 255, 0.3);
-            border-color: #0277bd;
-            color: #0277bd;
-            box-shadow: 0 4px 12px rgba(79, 195, 247, 0.15);
-        }
-        
-        .login-info {
-            margin-top: 1.5rem;
-            padding: 1rem;
-            background: rgba(255, 255, 255, 0.2);
-            border-radius: 12px;
-            font-size: 0.875rem;
-            color: #333333;
-            opacity: 0.9;
-            text-align: center;
-        }
-        
-        #message {
-            margin-top: 1rem;
-            text-align: center;
-            color: #ef4444;
-            font-weight: 500;
-        }
-        
-        .ip-info {
-            margin-top: 1rem;
-            padding: 0.5rem;
-            background: rgba(255, 255, 255, 0.2);
-            border-radius: 8px;
-            font-size: 0.75rem;
-            color: #333333;
-            text-align: center;
+            background: var(--surface); 
+            border-color: var(--primary);
+            color: var(--primary);
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.15);
         }
         
         @media (max-width: 480px) {
@@ -1696,49 +1753,37 @@ function renderLoginPage(ipSession) {
             h1 {
                 font-size: 1.75rem;
             }
-            
-            .role-select {
-                flex-direction: column;
-            }
         }
     </style>
 </head>
 <body>
-    <div class="login-container loaded">
+    <div class="login-container">
         <h1>班级评分系统</h1>
         <div class="role-select">
             <div class="role-btn active" data-role="class">班级登录</div>
+            <div class="role-btn" data-role="admin">班主任登录</div>
             <div class="role-btn" data-role="visitor">游客登录</div>
         </div>
         <form id="loginForm">
             <div class="input-group">
+                <div class="input-icon">👤</div>
                 <input type="text" id="username" placeholder="用户名" required>
             </div>
             <div class="input-group">
+                <div class="input-icon">🔒</div>
                 <input type="password" id="password" placeholder="密码" required>
             </div>
-            <button type="submit" id="loginBtn">登录系统</button>
+            <button type="submit">登录系统</button>
         </form>
         
-        <div class="login-info">
-            <p>By 2314 刘沁熙 基于Cloudflare Worker搭建 Cloudflare CDN提供加速服务</p>
-        </div>
-        
-        ${ipSession ? `
-        <div class="ip-info">
-            检测到已有登录会话: ${ipSession.username} (${ipSession.role})
-            <br>
-            <button onclick="useExistingSession()" style="margin-top: 0.5rem; padding: 0.5rem 1rem; font-size: 0.75rem;">使用现有会话</button>
-        </div>
-        ` : ''}
-        
-        <div id="message"></div>
+        <div id="message" style="margin-top: 1rem; text-align: center; color: var(--danger); font-weight: 500;"></div>
     </div>
 
     <script>
         let currentRole = 'class';
         const roleCredentials = {
-            class: { username: '2314', password: 'hzwy2314' }
+            class: { username: '2314', password: '' },
+            admin: { username: '2314admin', password: '' }
         };
 
         document.querySelectorAll('.role-btn').forEach(btn => {
@@ -1752,20 +1797,42 @@ function renderLoginPage(ipSession) {
                 } else {
                     const creds = roleCredentials[currentRole];
                     document.getElementById('username').value = creds.username;
-                    document.getElementById('password').value = creds.password;
+                    document.getElementById('password').value = '';
                 }
             });
         });
+
+        // 检查IP会话
+        async function checkIPSession() {
+            try {
+                const response = await fetch('/api/check-ip');
+                const result = await response.json();
+                
+                if (result.success && result.hasSession) {
+                    // 有IP会话，自动跳转
+                    if (result.session.role === 'class') {
+                        window.location.href = '/class';
+                    } else if (result.session.role === 'admin') {
+                        window.location.href = '/admin';
+                    }
+                }
+            } catch (error) {
+                console.log('检查IP会话失败:', error);
+            }
+        }
+
+        // 页面加载时检查IP会话
+        checkIPSession();
 
         document.getElementById('loginForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             const username = document.getElementById('username').value;
             const password = document.getElementById('password').value;
 
-            const loginBtn = document.getElementById('loginBtn');
-            const originalText = loginBtn.textContent;
-            loginBtn.textContent = '登录中...';
-            loginBtn.disabled = true;
+            const submitBtn = e.target.querySelector('button');
+            const originalText = submitBtn.textContent;
+            submitBtn.textContent = '登录中...';
+            submitBtn.disabled = true;
 
             try {
                 const response = await fetch('/api/login', {
@@ -1777,7 +1844,7 @@ function renderLoginPage(ipSession) {
                 const result = await response.json();
                 
                 if (result.success) {
-                    loginBtn.textContent = '登录成功!';
+                    submitBtn.textContent = '登录成功!';
                     setTimeout(() => {
                         if (result.role === 'class') {
                             window.location.href = '/class';
@@ -1787,29 +1854,14 @@ function renderLoginPage(ipSession) {
                     }, 500);
                 } else {
                     document.getElementById('message').textContent = result.error;
-                    loginBtn.textContent = originalText;
-                    loginBtn.disabled = false;
+                    submitBtn.textContent = originalText;
+                    submitBtn.disabled = false;
                 }
             } catch (error) {
                 document.getElementById('message').textContent = '网络错误，请重试';
-                loginBtn.textContent = originalText;
-                loginBtn.disabled = false;
+                submitBtn.textContent = originalText;
+                submitBtn.disabled = false;
             }
-        });
-
-        function useExistingSession() {
-            window.location.href = '/class';
-        }
-
-        // 设置默认用户名密码
-        document.getElementById('username').value = '2314';
-        document.getElementById('password').value = 'hzwy2314';
-        
-        // 加载动画
-        document.addEventListener('DOMContentLoaded', function() {
-            setTimeout(function() {
-                document.querySelector('.login-container').classList.add('loaded');
-            }, 100);
         });
     </script>
 </body>
@@ -1820,49 +1872,20 @@ function renderLoginPage(ipSession) {
   });
 }
 
-// 获取IP信息
-async function getIPInfo() {
-  try {
-    const response = await fetch('https://ip.ilqx.dpdns.org/geo');
-    if (response.ok) {
-      return await response.json();
-    }
-  } catch (error) {
-    console.error('获取IP信息失败:', error);
-  }
-  return null;
-}
-
-// 获取必应壁纸
-async function getBingWallpaper() {
-  try {
-    const response = await fetch('https://tc.ilqx.dpdns.org/api/bing/wallpaper');
-    if (response.ok) {
-      const data = await response.json();
-      if (data.status && data.data && data.data.length > 0) {
-        return `https://www.bing.com${data.data[0].url}`;
-      }
-    }
-  } catch (error) {
-    console.error('获取必应壁纸失败:', error);
-  }
-  return 'https://www.loliapi.com/acg/';
-}
-
 // 渲染班级页面
-async function renderClassPage(db, request, clientIP, ipSession) {
+async function renderClassPage(db, request, ipSession) {
   try {
-    if (!ipSession || ipSession.role !== 'class') {
+    // 检查IP会话或需要登录
+    if (!ipSession.authenticated || ipSession.role !== 'class') {
       return Response.redirect(new URL('/login', request.url));
     }
 
-    const [studentsData, scoreCategories, tasks, settings, ipInfo, wallpaper] = await Promise.all([
+    const [studentsData, scoreCategories, tasks, settings, rankingData] = await Promise.all([
       handleGetStudents(db).then(r => r.json()),
       db.prepare('SELECT * FROM score_categories ORDER BY type, id').all(),
-      db.prepare('SELECT * FROM tasks ORDER BY created_at DESC LIMIT 5').all(),
+      db.prepare('SELECT * FROM tasks ORDER BY created_at DESC LIMIT 10').all(),
       db.prepare('SELECT key, value FROM settings WHERE key IN (?, ?, ?)').bind('site_title', 'class_name', 'current_month').all(),
-      getIPInfo(),
-      getBingWallpaper()
+      handleGetRanking(db).then(r => r.json())
     ]);
 
     if (!studentsData.success) {
@@ -1875,7 +1898,6 @@ async function renderClassPage(db, request, clientIP, ipSession) {
     });
 
     const currentMonth = settingMap.current_month || new Date().toISOString().slice(0, 7);
-    const userAgent = request.headers.get('User-Agent') || 'unknown';
 
     // 完整的班级页面HTML
     const html = `
@@ -1891,235 +1913,274 @@ async function renderClassPage(db, request, clientIP, ipSession) {
             font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
         }
         
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --background: #f8fafc;
+            --surface: #ffffff;
+            --text: #1e293b;
+            --text-light: #64748b;
+            --border: #e2e8f0;
+            --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+            --shadow-lg: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+        }
+        
         body { 
-            background: #e0f7fa;
+            background: var(--background); 
+            color: var(--text);
             min-height: 100vh;
-            position: relative;
             overflow-x: hidden;
         }
         
-        body::after {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-image: url('${wallpaper}');
-            background-size: cover;
-            background-position: center;
-            filter: blur(8px);
-            z-index: -2;
-        }
-        
-        body::before {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(45deg, rgba(79, 195, 247, 0.2), rgba(176, 196, 222, 0.2));
-            z-index: -1;
-        }
-        
         .header { 
-            background: rgba(255, 255, 255, 0.3);
-            padding: 1rem 2rem;
-            backdrop-filter: blur(10px);
-            border-bottom: 1px solid rgba(79, 195, 247, 0.3);
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); 
+            color: white; 
+            padding: 1.5rem 2rem; 
+            box-shadow: var(--shadow);
             position: sticky;
             top: 0;
-            z-index: 1000;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 1rem;
+            z-index: 100;
+            backdrop-filter: blur(10px);
+        }
+        
+        .header-content { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+            max-width: 1400px;
+            margin: 0 auto;
         }
         
         .class-info h1 { 
-            color: #0277bd;
-            margin-bottom: 0.5rem;
-            text-shadow: 0 0 5px rgba(79, 195, 247, 0.3);
+            font-weight: 700; 
+            margin-bottom: 0.5rem; 
+            font-size: 1.75rem;
         }
         
         .date { 
-            color: #333333;
-            opacity: 0.9;
+            font-size: 0.9rem; 
+            opacity: 0.9; 
             display: flex;
             align-items: center;
             gap: 0.5rem;
-            font-size: 0.9rem;
         }
         
         .header-actions {
             display: flex;
             gap: 1rem;
             align-items: center;
-            flex-wrap: wrap;
         }
         
         .btn {
             padding: 0.75rem 1.5rem;
-            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
             border: none;
-            border-radius: 25px;
-            color: #333333;
-            font-weight: bold;
+            border-radius: 12px;
+            font-weight: 600;
             cursor: pointer;
             transition: all 0.3s ease;
-            text-decoration: none;
             display: flex;
             align-items: center;
             gap: 0.5rem;
-            white-space: nowrap;
+            text-decoration: none;
         }
         
-        .btn:hover {
-            background: linear-gradient(45deg, #29b6f6, #4fc3f7);
+        .btn-primary {
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border: 1px solid rgba(255,255,255,0.3);
+        }
+        
+        .btn-primary:hover {
+            background: rgba(255,255,255,0.3);
             transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(79, 195, 247, 0.4);
+            box-shadow: 0 8px 20px rgba(255,255,255,0.2);
         }
         
         .btn-danger {
-            background: linear-gradient(45deg, #ef4444, #f87171);
+            background: var(--danger);
+            color: white;
         }
         
         .btn-danger:hover {
-            background: linear-gradient(45deg, #dc2626, #ef4444);
-        }
-        
-        .btn-success {
-            background: linear-gradient(45deg, #10b981, #34d399);
-        }
-        
-        .btn-success:hover {
-            background: linear-gradient(45deg, #0da271, #10b981);
+            background: #dc2626;
+            transform: translateY(-2px);
         }
         
         .announcement {
-            background: rgba(255, 255, 255, 0.3);
-            margin: 1.5rem 2rem;
-            padding: 1.5rem;
-            border-radius: 15px;
-            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
-            backdrop-filter: blur(5px);
-            border: 1px solid rgba(79, 195, 247, 0.3);
-            border-left: 6px solid #0277bd;
+            background: var(--surface); 
+            margin: 1.5rem 2rem; 
+            padding: 1.5rem; 
+            border-radius: 16px;
+            box-shadow: var(--shadow); 
+            border-left: 6px solid var(--primary);
             animation: slideInUp 0.5s ease;
+            position: relative;
+            overflow: hidden;
         }
         
-        .announcement:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 12px 40px rgba(79, 195, 247, 0.5), 0 0 20px rgba(176, 196, 222, 0.3);
+        .announcement::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(99, 102, 241, 0.05), transparent);
+            transform: translateX(-100%);
+            transition: transform 0.6s ease;
+        }
+        
+        .announcement:hover::before {
+            transform: translateX(100%);
         }
         
         .main-content { 
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: 2rem;
-            padding: 0 2rem 2rem;
-            max-width: 1400px;
+            display: grid; 
+            grid-template-columns: 1fr; 
+            gap: 2rem; 
+            padding: 0 2rem 2rem; 
+            max-width: 1400px; 
             margin: 0 auto;
         }
         
         .score-section { 
-            background: rgba(255, 255, 255, 0.3);
-            border-radius: 15px;
+            background: var(--surface); 
+            border-radius: 20px; 
             padding: 2rem;
-            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
-            backdrop-filter: blur(5px);
-            border: 1px solid rgba(79, 195, 247, 0.3);
+            box-shadow: var(--shadow); 
             transition: all 0.3s ease;
             animation: fadeIn 0.6s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .score-section::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
         }
         
         .score-section:hover { 
-            transform: translateY(-8px);
-            box-shadow: 0 25px 50px -12px rgba(79, 195, 247, 0.5);
+            transform: translateY(-8px); 
+            box-shadow: var(--shadow-lg);
         }
         
         .section-title { 
-            font-size: 1.5rem;
-            margin-bottom: 1.5rem;
+            font-size: 1.5rem; 
+            margin-bottom: 1.5rem; 
             padding-bottom: 1rem;
-            border-bottom: 2px solid rgba(79, 195, 247, 0.3);
-            color: #0277bd;
-            display: flex;
+            border-bottom: 2px solid var(--border); 
+            color: var(--text); 
+            display: flex; 
             justify-content: space-between;
             align-items: center;
-            flex-wrap: wrap;
-            gap: 1rem;
+            font-weight: 700;
         }
         
         .student-table { 
-            width: 100%;
-            border-collapse: separate;
+            width: 100%; 
+            border-collapse: separate; 
             border-spacing: 0;
         }
         
         .student-table th, .student-table td { 
-            padding: 1rem;
-            text-align: left;
-            border-bottom: 1px solid rgba(79, 195, 247, 0.3);
+            padding: 1rem; 
+            text-align: left; 
+            border-bottom: 1px solid var(--border);
             transition: all 0.2s ease;
         }
         
         .student-table th { 
-            background: rgba(255, 255, 255, 0.2);
-            font-weight: 600;
-            color: #333333;
+            background: var(--background); 
+            font-weight: 600; 
+            color: var(--text-light);
             position: sticky;
             top: 0;
             backdrop-filter: blur(10px);
         }
         
         .student-table tr:hover td { 
-            background: rgba(255, 255, 255, 0.2);
+            background: var(--background); 
             transform: scale(1.02);
         }
         
         .student-table .score-cell { 
-            cursor: pointer;
+            cursor: pointer; 
+            position: relative;
             font-weight: 600;
             transition: all 0.3s ease;
         }
         
         .student-table .score-cell:hover { 
-            background: rgba(79, 195, 247, 0.1) !important;
+            background: rgba(99, 102, 241, 0.1) !important; 
             transform: scale(1.05);
         }
         
         .add-score { 
-            color: #10b981;
+            color: var(--secondary); 
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .add-score::before {
+            content: '+';
+            margin-right: 2px;
         }
         
         .minus-score { 
-            color: #ef4444;
+            color: var(--danger);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .minus-score::before {
+            content: '-';
+            margin-right: 2px;
         }
         
         .total-score { 
-            color: #0277bd;
+            color: var(--primary); 
             font-weight: 700;
             font-size: 1.1em;
         }
         
-        .rank-btn {
-            padding: 0.5rem 1rem;
-            background: linear-gradient(45deg, #f59e0b, #fbbf24);
-            border: none;
-            border-radius: 20px;
-            color: #333333;
-            font-weight: bold;
-            cursor: pointer;
+        .rank-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 2rem;
+            height: 2rem;
+            border-radius: 50%;
+            background: var(--primary);
+            color: white;
+            font-weight: 700;
+            font-size: 0.875rem;
             transition: all 0.3s ease;
+            cursor: pointer;
         }
         
-        .rank-btn:hover {
-            background: linear-gradient(45deg, #d97706, #f59e0b);
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(245, 158, 11, 0.4);
+        .rank-badge:hover {
+            transform: scale(1.1) rotate(5deg);
+        }
+        
+        .rank-1 { 
+            background: linear-gradient(135deg, #f59e0b, #d97706);
+            box-shadow: 0 4px 12px rgba(245, 158, 11, 0.3);
+        }
+        .rank-2 { 
+            background: linear-gradient(135deg, #6b7280, #4b5563);
+            box-shadow: 0 4px 12px rgba(107, 114, 128, 0.3);
+        }
+        .rank-3 { 
+            background: linear-gradient(135deg, #92400e, #78350f);
+            box-shadow: 0 4px 12px rgba(146, 64, 14, 0.3);
         }
         
         /* 模态框样式 */
@@ -2130,8 +2191,8 @@ async function renderClassPage(db, request, clientIP, ipSession) {
             left: 0;
             width: 100%;
             height: 100%;
-            background: rgba(0, 0, 0, 0.5);
-            z-index: 2000;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
             align-items: center;
             justify-content: center;
             animation: fadeIn 0.3s ease;
@@ -2140,26 +2201,17 @@ async function renderClassPage(db, request, clientIP, ipSession) {
         }
         
         .modal-content {
-            background: rgba(255, 255, 255, 0.3);
+            background: var(--surface);
             padding: 2.5rem;
-            border-radius: 15px;
+            border-radius: 24px;
             width: 100%;
-            max-width: 500px;
+            max-width: 600px;
             animation: slideUp 0.4s cubic-bezier(0.4, 0, 0.2, 1);
-            box-shadow: 0 25px 50px -12px rgba(79, 195, 247, 0.5);
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(79, 195, 247, 0.3);
+            box-shadow: var(--shadow-lg);
+            border: 1px solid var(--border);
             position: relative;
-            transform: scale(0.5);
-            opacity: 0.5;
-            filter: blur(10px);
-            transition: transform 0.5s ease-out, opacity 0.5s ease-out, filter 0.5s ease-out;
-        }
-        
-        .modal-content.loaded {
-            transform: scale(1);
-            opacity: 1;
-            filter: blur(0);
+            max-height: 90vh;
+            overflow-y: auto;
         }
         
         .modal-close {
@@ -2170,7 +2222,7 @@ async function renderClassPage(db, request, clientIP, ipSession) {
             border: none;
             font-size: 1.5rem;
             cursor: pointer;
-            color: #333333;
+            color: var(--text-light);
             transition: color 0.3s ease;
             width: 40px;
             height: 40px;
@@ -2181,7 +2233,7 @@ async function renderClassPage(db, request, clientIP, ipSession) {
         }
         
         .modal-close:hover {
-            color: #ef4444;
+            color: var(--danger);
             background: rgba(239, 68, 68, 0.1);
         }
         
@@ -2201,82 +2253,99 @@ async function renderClassPage(db, request, clientIP, ipSession) {
         }
         
         .input-group { 
-            margin-bottom: 1.5rem;
+            margin-bottom: 1.5rem; 
         }
         
         .input-group label {
             display: block;
             margin-bottom: 0.5rem;
             font-weight: 600;
-            color: #333333;
+            color: var(--text);
         }
         
         select, input[type="text"], input[type="number"], textarea {
             width: 100%;
             padding: 1rem;
-            background-color: rgba(255, 255, 255, 0.5);
-            border: 1px solid rgba(79, 195, 247, 0.5);
-            border-radius: 25px;
+            border: 2px solid var(--border);
+            border-radius: 12px;
             font-size: 1rem;
-            color: #333333;
-            outline: none;
             transition: all 0.3s ease;
+            background: var(--surface);
+            color: var(--text);
         }
         
         select:focus, input:focus, textarea:focus {
-            background-color: rgba(255, 255, 255, 0.7);
-            border-color: #0277bd;
-            box-shadow: 0 0 10px rgba(79, 195, 247, 0.3);
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+            transform: translateY(-2px);
         }
         
         .score-buttons { 
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 0.75rem;
-            margin: 1rem 0;
+            display: grid; 
+            grid-template-columns: repeat(3, 1fr); 
+            gap: 0.75rem; 
+            margin: 1rem 0; 
         }
         
         .score-btn { 
-            padding: 1.5rem;
-            background: rgba(255, 255, 255, 0.5);
-            border: 2px solid rgba(79, 195, 247, 0.5);
-            border-radius: 15px;
-            cursor: pointer;
-            transition: all 0.3s ease;
+            padding: 1.5rem; 
+            border: 2px solid var(--border); 
+            background: var(--surface); 
+            border-radius: 16px;
+            cursor: pointer; 
+            transition: all 0.3s ease; 
             text-align: center;
             font-weight: 700;
-            color: #333333;
+            color: var(--text);
             font-size: 1.2rem;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .score-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(99, 102, 241, 0.1), transparent);
+            transition: left 0.5s;
+        }
+        
+        .score-btn:hover::before {
+            left: 100%;
         }
         
         .score-btn:hover { 
-            border-color: #0277bd;
-            background: rgba(79, 195, 247, 0.1);
+            border-color: var(--primary); 
+            background: rgba(99, 102, 241, 0.05);
             transform: translateY(-4px) scale(1.05);
-            box-shadow: 0 8px 20px rgba(79, 195, 247, 0.2);
+            box-shadow: 0 8px 20px rgba(99, 102, 241, 0.2);
         }
         
         .score-btn.selected { 
-            border-color: #0277bd;
-            background: #0277bd;
+            border-color: var(--primary); 
+            background: var(--primary); 
             color: white;
-            box-shadow: 0 8px 25px rgba(79, 195, 247, 0.4);
+            box-shadow: 0 8px 25px rgba(99, 102, 241, 0.4);
             transform: translateY(-2px) scale(1.02);
         }
         
         .action-buttons { 
-            display: flex;
-            gap: 1rem;
-            margin-top: 2rem;
+            display: flex; 
+            gap: 1rem; 
+            margin-top: 2rem; 
         }
         
         .action-btn { 
-            flex: 1;
-            padding: 1rem;
-            border: none;
-            border-radius: 25px;
-            cursor: pointer;
-            transition: all 0.3s ease;
+            flex: 1; 
+            padding: 1rem; 
+            border: none; 
+            border-radius: 12px; 
+            cursor: pointer; 
+            transition: all 0.3s ease; 
             font-weight: 600;
             display: flex;
             align-items: center;
@@ -2285,96 +2354,35 @@ async function renderClassPage(db, request, clientIP, ipSession) {
         }
         
         .submit-btn { 
-            background: linear-gradient(45deg, #10b981, #34d399);
-            color: white;
+            background: var(--secondary); 
+            color: white; 
         }
         
         .submit-btn:hover { 
-            background: linear-gradient(45deg, #0da271, #10b981);
+            background: #0da271;
             transform: translateY(-2px);
             box-shadow: 0 8px 20px rgba(16, 185, 129, 0.3);
         }
         
         .revoke-btn { 
-            background: linear-gradient(45deg, #ef4444, #f87171);
-            color: white;
+            background: var(--danger); 
+            color: white; 
         }
         
         .revoke-btn:hover { 
-            background: linear-gradient(45deg, #dc2626, #ef4444);
+            background: #dc2626;
             transform: translateY(-2px);
             box-shadow: 0 8px 20px rgba(239, 68, 68, 0.3);
         }
         
         .cancel-btn { 
-            background: linear-gradient(45deg, #6b7280, #9ca3af);
-            color: white;
+            background: var(--text-light); 
+            color: white; 
         }
         
         .cancel-btn:hover { 
-            background: linear-gradient(45deg, #4b5563, #6b7280);
+            background: #475569;
             transform: translateY(-2px);
-        }
-        
-        /* 批量选择样式 */
-        .batch-select {
-            margin-bottom: 1rem;
-            padding: 1rem;
-            background: rgba(255, 255, 255, 0.2);
-            border-radius: 15px;
-        }
-        
-        .batch-actions {
-            display: flex;
-            gap: 0.5rem;
-            margin-top: 0.5rem;
-        }
-        
-        .batch-btn {
-            padding: 0.5rem 1rem;
-            background: rgba(79, 195, 247, 0.2);
-            border: 1px solid rgba(79, 195, 247, 0.5);
-            border-radius: 20px;
-            color: #0277bd;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            font-size: 0.875rem;
-        }
-        
-        .batch-btn:hover {
-            background: rgba(79, 195, 247, 0.3);
-            transform: translateY(-2px);
-        }
-        
-        .batch-btn.active {
-            background: #0277bd;
-            color: white;
-        }
-        
-        .student-checkbox {
-            margin-right: 0.5rem;
-            transform: scale(1.2);
-        }
-        
-        /* 详细记录样式 */
-        .details-modal {
-            max-width: 800px;
-        }
-        
-        .details-table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 1rem;
-        }
-        
-        .details-table th, .details-table td {
-            padding: 0.75rem;
-            border-bottom: 1px solid rgba(79, 195, 247, 0.3);
-            text-align: left;
-        }
-        
-        .details-table th {
-            background: rgba(255, 255, 255, 0.2);
         }
         
         /* 通知样式 */
@@ -2386,34 +2394,24 @@ async function renderClassPage(db, request, clientIP, ipSession) {
             border-radius: 12px;
             color: white;
             font-weight: 600;
-            z-index: 3000;
+            z-index: 10000;
             animation: slideInRight 0.3s ease;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
-            backdrop-filter: blur(10px);
+            box-shadow: var(--shadow);
             display: flex;
             align-items: center;
             gap: 0.5rem;
-            max-width: 400px;
         }
         
         .notification.success {
-            background: linear-gradient(45deg, rgba(16, 185, 129, 0.8), rgba(52, 211, 153, 0.8));
-            border: 1px solid rgba(16, 185, 129, 0.3);
+            background: var(--secondary);
         }
         
         .notification.error {
-            background: linear-gradient(45deg, rgba(239, 68, 68, 0.8), rgba(248, 113, 113, 0.8));
-            border: 1px solid rgba(239, 68, 68, 0.3);
+            background: var(--danger);
         }
         
         .notification.info {
-            background: linear-gradient(45deg, rgba(79, 195, 247, 0.8), rgba(129, 212, 250, 0.8));
-            border: 1px solid rgba(79, 195, 247, 0.3);
-        }
-        
-        .notification.warning {
-            background: linear-gradient(45deg, rgba(245, 158, 11, 0.8), rgba(251, 191, 36, 0.8));
-            border: 1px solid rgba(245, 158, 11, 0.3);
+            background: var(--primary);
         }
         
         @keyframes slideInRight {
@@ -2426,78 +2424,104 @@ async function renderClassPage(db, request, clientIP, ipSession) {
             to { transform: translateX(100%); opacity: 0; }
         }
         
-        /* IP信息弹窗 */
-        .ip-notification {
-            position: fixed;
-            top: 2rem;
-            left: 2rem;
-            padding: 1rem 1.5rem;
+        /* 多选学生样式 */
+        .student-selector {
+            margin-bottom: 1.5rem;
+            max-height: 300px;
+            overflow-y: auto;
+            border: 2px solid var(--border);
             border-radius: 12px;
-            background: linear-gradient(45deg, rgba(79, 195, 247, 0.8), rgba(129, 212, 250, 0.8));
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(79, 195, 247, 0.3);
-            color: #333333;
-            font-weight: 600;
-            z-index: 3000;
-            animation: slideInLeft 0.3s ease;
-            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3);
-            max-width: 300px;
+            padding: 1rem;
         }
         
-        @keyframes slideInLeft {
-            from { transform: translateX(-100%); opacity: 0; }
-            to { transform: translateX(0); opacity: 1; }
+        .student-option {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background 0.2s ease;
         }
         
-        .ip-details {
-            font-size: 0.875rem;
-            font-weight: normal;
-            margin-top: 0.5rem;
-            opacity: 0.9;
+        .student-option:hover {
+            background: var(--background);
         }
         
-        /* 底部信息栏 */
-        .footer-info {
+        .student-option.selected {
+            background: rgba(99, 102, 241, 0.1);
+            border-left: 3px solid var(--primary);
+        }
+        
+        .student-checkbox {
+            width: 1.2rem;
+            height: 1.2rem;
+            border-radius: 4px;
+            border: 2px solid var(--border);
+            cursor: pointer;
+        }
+        
+        /* IP信息弹窗 */
+        .ip-info-modal {
             position: fixed;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            background: rgba(255, 255, 255, 0.3);
-            padding: 0.5rem 1rem;
-            backdrop-filter: blur(10px);
-            border-top: 1px solid rgba(79, 195, 247, 0.3);
-            font-size: 0.75rem;
-            color: #333333;
+            top: 1rem;
+            right: 1rem;
+            background: var(--surface);
+            padding: 1.5rem;
+            border-radius: 16px;
+            box-shadow: var(--shadow-lg);
+            z-index: 9999;
+            max-width: 400px;
+            animation: slideInRight 0.3s ease;
+            border: 1px solid var(--border);
+        }
+        
+        .ip-info-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            flex-wrap: wrap;
-            gap: 0.5rem;
-            z-index: 1000;
+            margin-bottom: 1rem;
         }
         
-        .footer-left, .footer-right {
+        .ip-info-close {
+            background: none;
+            border: none;
+            font-size: 1.2rem;
+            cursor: pointer;
+            color: var(--text-light);
+        }
+        
+        .ip-info-item {
+            margin-bottom: 0.75rem;
             display: flex;
-            gap: 1rem;
-            align-items: center;
+            justify-content: space-between;
         }
         
-        .footer-separator {
-            color: rgba(79, 195, 247, 0.5);
+        .ip-info-label {
+            font-weight: 600;
+            color: var(--text-light);
+        }
+        
+        .ip-info-value {
+            color: var(--text);
+            text-align: right;
         }
         
         /* 响应式设计 */
         @media (max-width: 768px) {
             .main-content { 
-                grid-template-columns: 1fr;
-                padding: 0 1rem 1rem;
+                padding: 0 1rem 1rem; 
                 gap: 1.5rem;
             }
             
             .header { 
-                padding: 1rem;
-                flex-direction: column;
-                text-align: center;
+                padding: 1rem; 
+            }
+            
+            .header-content { 
+                flex-direction: column; 
+                gap: 1rem; 
+                text-align: center; 
             }
             
             .header-actions {
@@ -2517,145 +2541,161 @@ async function renderClassPage(db, request, clientIP, ipSession) {
                 grid-template-columns: repeat(2, 1fr);
             }
             
-            .action-buttons {
-                flex-direction: column;
-            }
-            
             .modal-content {
                 padding: 1.5rem;
             }
             
-            .ip-notification {
+            .ip-info-modal {
                 left: 1rem;
                 right: 1rem;
                 max-width: none;
             }
-            
-            .footer-info {
-                flex-direction: column;
-                text-align: center;
-                padding: 0.5rem;
-            }
-            
-            .footer-left, .footer-right {
-                justify-content: center;
-                flex-wrap: wrap;
-            }
         }
         
         @media (max-width: 480px) {
-            .score-buttons {
-                grid-template-columns: 1fr;
+            .action-buttons {
+                flex-direction: column;
             }
             
-            .student-table {
-                font-size: 0.9rem;
+            .btn {
+                padding: 0.5rem 1rem;
+                font-size: 0.875rem;
             }
-            
-            .student-table th, .student-table td {
-                padding: 0.75rem 0.5rem;
-            }
+        }
+        
+        /* 排名按钮样式 */
+        .ranking-btn {
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .ranking-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(99, 102, 241, 0.3);
+        }
+        
+        /* 详细信息模态框 */
+        .detail-modal {
+            max-width: 800px;
+        }
+        
+        .log-item {
+            padding: 1rem;
+            border-left: 4px solid var(--primary);
+            background: var(--background);
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }
+        
+        .log-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.5rem;
+        }
+        
+        .log-time {
+            color: var(--text-light);
+            font-size: 0.875rem;
+        }
+        
+        .log-score {
+            font-weight: 700;
+            color: var(--primary);
+        }
+        
+        .log-note {
+            color: var(--text);
+            margin-top: 0.5rem;
         }
     </style>
 </head>
 <body>
-    <!-- IP信息弹窗 -->
-    <div class="ip-notification" id="ipNotification">
-        <div>🌐 IP信息加载中...</div>
-        <div class="ip-details" id="ipDetails"></div>
-        <div class="ip-details" id="latencyInfo"></div>
-    </div>
-
     <div class="header">
-        <div class="class-info">
-            <h1>${settingMap.site_title || '2314班综合评分系统'}</h1>
-            <div class="date">
-                <span>📅</span>
-                <span id="currentDate"></span>
+        <div class="header-content">
+            <div class="class-info">
+                <h1>${settingMap.site_title || '2314班综合评分系统'}</h1>
+                <div class="date">
+                    <span>📅</span>
+                    <span id="currentDate"></span>
+                </div>
             </div>
-        </div>
-        <div class="header-actions">
-            <button class="btn" onclick="showRankings()">
-                <span>🏆</span>
-                查看排名
-            </button>
-            <button class="btn" onclick="createSnapshot()">
-                <span>💾</span>
-                保存快照
-            </button>
-            <button class="btn" onclick="showSnapshots()">
-                <span>📊</span>
-                历史数据
-            </button>
-            <button class="btn btn-danger" onclick="logout()">
-                <span>🚪</span>
-                退出登录
-            </button>
+            <div class="header-actions">
+                <button class="btn btn-primary" onclick="showRankingModal()">
+                    <span>🏆</span>
+                    查看排名
+                </button>
+                <button class="btn btn-primary" onclick="createSnapshot()">
+                    <span>📸</span>
+                    保存快照
+                </button>
+                <button class="btn btn-primary" onclick="showSnapshots()">
+                    <span>📊</span>
+                    历史数据
+                </button>
+                <button class="btn btn-primary" onclick="showIPInfo()">
+                    <span>🌐</span>
+                    连接信息
+                </button>
+                <button class="btn btn-primary" onclick="logout()">
+                    <span>🚪</span>
+                    退出登录
+                </button>
+            </div>
         </div>
     </div>
 
     <div class="announcement">
-        <strong>📢 班级公告：</strong> 
-        <span id="announcementText">欢迎使用班级综合评分系统！请遵守纪律，积极表现。</span>
-        <button onclick="editAnnouncement()" style="margin-left: 1rem; background: none; border: none; color: #0277bd; cursor: pointer; padding: 0.25rem 0.5rem; border-radius: 6px; transition: background 0.2s ease;">编辑</button>
+        <strong>📢 系统信息：</strong> 
+        <span>By 2314 刘沁熙 基于cloudflare worker搭建 cloudflare cdn提供加速服务</span>
     </div>
 
     <div class="main-content">
-        <!-- 批量操作区域 -->
-        <div class="score-section">
-            <div class="section-title">
-                <span>🎯 批量操作</span>
-                <span id="selectedCount">已选择 0 名学生</span>
-            </div>
-            <div class="batch-select">
-                <div class="batch-actions">
-                    <button class="batch-btn" onclick="selectAllStudents()">全选</button>
-                    <button class="batch-btn" onclick="deselectAllStudents()">取消全选</button>
-                    <button class="batch-btn" onclick="invertSelection()">反选</button>
-                </div>
-            </div>
-            <div class="batch-actions" style="margin-top: 1rem;">
-                <button class="btn btn-success" onclick="startBatchScoreProcess('add')" id="batchAddBtn" disabled>
-                    <span>➕</span>
-                    批量加分
-                </button>
-                <button class="btn btn-danger" onclick="startBatchScoreProcess('minus')" id="batchMinusBtn" disabled>
-                    <span>➖</span>
-                    批量扣分
-                </button>
-            </div>
-        </div>
-
-        <!-- 详细评分表格 -->
+        <!-- 学生综合评分表格 -->
         <div class="score-section">
             <div class="section-title">
                 <span>📊 学生综合评分表</span>
-                <span style="font-size: 0.9rem; color: #333333; opacity: 0.9;">点击分数单元格进行评分操作</span>
+                <div style="display: flex; gap: 1rem;">
+                    <button class="ranking-btn" onclick="showRankingModal()">
+                        🏆 查看总分排名
+                    </button>
+                    <button class="btn btn-primary" onclick="showBatchScoreModal()">
+                        📝 批量评分
+                    </button>
+                </div>
             </div>
             <div style="overflow-x: auto;">
                 <table class="student-table">
                     <thead>
                         <tr>
-                            <th width="50">
-                                <input type="checkbox" id="selectAll" class="student-checkbox" onchange="toggleSelectAll(this)">
-                            </th>
+                            <th width="80">选择</th>
                             <th width="120">姓名</th>
-                            <th width="120" class="score-cell" onclick="startScoreProcess(null, 'add', '全体学生')">加分总分</th>
-                            <th width="120" class="score-cell" onclick="startScoreProcess(null, 'minus', '全体学生')">扣分总分</th>
-                            <th width="120">最终得分</th>
-                            <th width="150">操作</th>
+                            <th width="120" class="score-cell">加分</th>
+                            <th width="120" class="score-cell">扣分</th>
+                            <th width="120">总分</th>
+                            <th width="100">操作</th>
                         </tr>
                     </thead>
                     <tbody id="studentsBody">
                         ${studentsData.students.map((student, index) => `
-                            <tr data-id="${student.id}">
+                            <tr>
                                 <td>
-                                    <input type="checkbox" class="student-checkbox student-select" data-id="${student.id}" onchange="updateSelectedCount()">
+                                    <input type="checkbox" class="student-checkbox" data-id="${student.id}" data-name="${student.name}" onchange="updateSelectedStudents()">
                                 </td>
                                 <td>
                                     <div style="display: flex; align-items: center; gap: 0.5rem;">
                                         <span>${student.name}</span>
-                                        ${index < 3 ? `<span class="rank-btn" style="width: 1.5rem; height: 1.5rem; font-size: 0.75rem; padding: 0;">${index + 1}</span>` : ''}
+                                        <div class="rank-badge" onclick="showRankingModal()" style="cursor: pointer;">
+                                            ${rankingData.ranking.findIndex(s => s.id === student.id) + 1}
+                                        </div>
                                     </div>
                                 </td>
                                 <td class="score-cell add-score" onclick="startScoreProcess(${student.id}, 'add', '${student.name}')">
@@ -2668,8 +2708,7 @@ async function renderClassPage(db, request, clientIP, ipSession) {
                                     ${student.total_score > 0 ? '+' : ''}${student.total_score}
                                 </td>
                                 <td>
-                                    <button class="btn" style="padding: 0.5rem 1rem; font-size: 0.875rem;" onclick="showStudentDetails(${student.id}, '${student.name}')">
-                                        <span>📋</span>
+                                    <button class="btn-primary" style="padding: 0.5rem 1rem; font-size: 0.875rem;" onclick="showStudentDetail(${student.id}, '${student.name}')">
                                         详细
                                     </button>
                                 </td>
@@ -2681,44 +2720,59 @@ async function renderClassPage(db, request, clientIP, ipSession) {
         </div>
     </div>
 
-    <!-- 评分弹窗 -->
+    <!-- 单个学生评分弹窗 -->
     <div class="modal-overlay" id="scoreModal">
         <div class="modal-content">
             <button class="modal-close" onclick="closeScoreModal()">×</button>
             
-            <div class="step-indicator" style="display: flex; justify-content: center; margin-bottom: 2rem; gap: 0.5rem;">
-                <div class="step-dot active" style="width: 12px; height: 12px; border-radius: 50%; background: #0277bd;"></div>
+            <div class="step-indicator">
+                <div class="step-dot active" id="step1Dot"></div>
+                <div class="step-dot" id="step2Dot"></div>
             </div>
             
+            <!-- 第一步：选择分数 -->
             <div class="step-container active" id="step1">
-                <div class="step-title" style="text-align: center; margin-bottom: 1.5rem; font-size: 1.3rem; font-weight: 700; color: #0277bd;">
+                <div class="step-title">
                     为 <span class="student-highlight" id="step1StudentName"></span> 
                     <span id="step1ActionType"></span>
                 </div>
-                
-                <div class="input-group">
-                    <label>分值：</label>
-                    <div class="score-buttons" id="scoreButtons">
-                        <div class="score-btn" data-score="1">1分</div>
-                        <div class="score-btn" data-score="2">2分</div>
-                        <div class="score-btn" data-score="3">3分</div>
-                        <div class="score-btn" data-score="4">4分</div>
-                        <div class="score-btn" data-score="5">5分</div>
-                        <div class="score-btn" data-score="custom">自定义</div>
-                    </div>
-                    <input type="number" id="customScore" style="width: 100%; padding: 1rem; margin-top: 0.5rem; display: none;" placeholder="输入自定义分值" min="1" max="100">
+                <div class="score-buttons" id="scoreButtons">
+                    <div class="score-btn" data-score="1">1分</div>
+                    <div class="score-btn" data-score="2">2分</div>
+                    <div class="score-btn" data-score="3">3分</div>
+                    <div class="score-btn" data-score="4">4分</div>
+                    <div class="score-btn" data-score="5">5分</div>
+                    <div class="score-btn" data-score="custom">自定义</div>
+                </div>
+                <input type="number" id="customScore" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px; margin-top: 0.5rem; display: none;" placeholder="输入自定义分值" min="1" max="100">
+                <div class="action-buttons">
+                    <button class="cancel-btn" onclick="closeScoreModal()">
+                        <span>❌</span>
+                        取消
+                    </button>
+                    <button class="submit-btn" onclick="goToStep2()">
+                        <span>➡️</span>
+                        下一步
+                    </button>
+                </div>
+            </div>
+            
+            <!-- 第二步：选择原因和教师 -->
+            <div class="step-container" id="step2">
+                <div class="step-title">
+                    选择评分项目
                 </div>
                 
                 <div class="input-group">
                     <label>评分项目：</label>
-                    <select id="categorySelect" style="width: 100%;">
+                    <select id="categorySelect" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;">
                         <!-- 动态填充 -->
                     </select>
                 </div>
                 
                 <div class="input-group">
                     <label>操作教师：</label>
-                    <select id="operatorSelect" style="width: 100%;">
+                    <select id="operatorSelect" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;">
                         <option value="班主任">班主任</option>
                         <option value="语文老师">语文老师</option>
                         <option value="数学老师">数学老师</option>
@@ -2732,14 +2786,17 @@ async function renderClassPage(db, request, clientIP, ipSession) {
                 
                 <div class="input-group">
                     <label>备注说明：</label>
-                    <textarea id="scoreNote" rows="3" placeholder="请输入备注信息（其他项必填）"></textarea>
-                    <div id="noteHistory" style="margin-top: 0.5rem; font-size: 0.875rem; color: #666;"></div>
+                    <textarea id="scoreNote" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;" placeholder="请输入备注信息" rows="3"></textarea>
+                    <div id="noteHistory" style="margin-top: 0.5rem; display: none;">
+                        <label>历史备注：</label>
+                        <div id="noteHistoryList" style="max-height: 100px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem;"></div>
+                    </div>
                 </div>
                 
                 <div class="action-buttons">
-                    <button class="cancel-btn" onclick="closeScoreModal()">
-                        <span>❌</span>
-                        取消
+                    <button class="cancel-btn" onclick="goToStep1()">
+                        <span>⬅️</span>
+                        上一步
                     </button>
                     <button class="submit-btn" onclick="submitScore()" id="submitScoreBtn">
                         <span>✅</span>
@@ -2755,36 +2812,31 @@ async function renderClassPage(db, request, clientIP, ipSession) {
         <div class="modal-content">
             <button class="modal-close" onclick="closeBatchScoreModal()">×</button>
             
-            <div class="step-title" style="text-align: center; margin-bottom: 1.5rem; font-size: 1.3rem; font-weight: 700; color: #0277bd;">
-                批量<span id="batchActionType"></span>
-                <div style="font-size: 1rem; color: #333; margin-top: 0.5rem;">
-                    共 <span id="batchStudentCount">0</span> 名学生
-                </div>
-            </div>
+            <div class="step-title">批量评分</div>
             
             <div class="input-group">
-                <label>分值：</label>
-                <div class="score-buttons" id="batchScoreButtons">
-                    <div class="score-btn" data-score="1">1分</div>
-                    <div class="score-btn" data-score="2">2分</div>
-                    <div class="score-btn" data-score="3">3分</div>
-                    <div class="score-btn" data-score="4">4分</div>
-                    <div class="score-btn" data-score="5">5分</div>
-                    <div class="score-btn" data-score="custom">自定义</div>
-                </div>
-                <input type="number" id="batchCustomScore" style="width: 100%; padding: 1rem; margin-top: 0.5rem; display: none;" placeholder="输入自定义分值" min="1" max="100">
+                <label>选择评分类型：</label>
+                <select id="batchScoreType" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;" onchange="loadBatchCategories()">
+                    <option value="add">加分</option>
+                    <option value="minus">扣分</option>
+                </select>
             </div>
             
             <div class="input-group">
                 <label>评分项目：</label>
-                <select id="batchCategorySelect" style="width: 100%;">
+                <select id="batchCategorySelect" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;">
                     <!-- 动态填充 -->
                 </select>
             </div>
             
             <div class="input-group">
+                <label>分值：</label>
+                <input type="number" id="batchScoreValue" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;" value="1" min="1" max="100">
+            </div>
+            
+            <div class="input-group">
                 <label>操作教师：</label>
-                <select id="batchOperatorSelect" style="width: 100%;">
+                <select id="batchOperatorSelect" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;">
                     <option value="班主任">班主任</option>
                     <option value="语文老师">语文老师</option>
                     <option value="数学老师">数学老师</option>
@@ -2798,7 +2850,7 @@ async function renderClassPage(db, request, clientIP, ipSession) {
             
             <div class="input-group">
                 <label>备注说明：</label>
-                <textarea id="batchScoreNote" rows="3" placeholder="请输入备注信息（其他项必填）"></textarea>
+                <textarea id="batchScoreNote" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;" placeholder="请输入备注信息" rows="3"></textarea>
             </div>
             
             <div class="action-buttons">
@@ -2806,7 +2858,7 @@ async function renderClassPage(db, request, clientIP, ipSession) {
                     <span>❌</span>
                     取消
                 </button>
-                <button class="submit-btn" onclick="submitBatchScore()" id="submitBatchScoreBtn">
+                <button class="submit-btn" onclick="submitBatchScore()">
                     <span>✅</span>
                     提交批量评分
                 </button>
@@ -2814,25 +2866,52 @@ async function renderClassPage(db, request, clientIP, ipSession) {
         </div>
     </div>
 
-    <!-- 详细记录弹窗 -->
-    <div class="modal-overlay" id="detailsModal">
-        <div class="modal-content details-modal">
-            <button class="modal-close" onclick="closeDetailsModal()">×</button>
+    <!-- 学生详细信息弹窗 -->
+    <div class="modal-overlay" id="studentDetailModal">
+        <div class="modal-content detail-modal">
+            <button class="modal-close" onclick="closeStudentDetailModal()">×</button>
             
-            <div class="step-title" style="text-align: center; margin-bottom: 1.5rem; font-size: 1.3rem; font-weight: 700; color: #0277bd;">
-                <span id="detailsStudentName"></span> 的详细记录
-            </div>
+            <div class="step-title" id="detailTitle"></div>
             
-            <div id="detailsContent">
+            <div id="studentDetailContent">
                 <!-- 动态填充 -->
             </div>
+        </div>
+    </div>
+
+    <!-- 排名弹窗 -->
+    <div class="modal-overlay" id="rankingModal">
+        <div class="modal-content">
+            <button class="modal-close" onclick="closeRankingModal()">×</button>
             
-            <div class="action-buttons" style="margin-top: 2rem;">
-                <button class="cancel-btn" onclick="closeDetailsModal()">
-                    <span>❌</span>
-                    关闭
-                </button>
-            </div>
+            <div class="step-title">🏆 学生总分排名</div>
+            
+            <table class="student-table">
+                <thead>
+                    <tr>
+                        <th width="80">排名</th>
+                        <th>姓名</th>
+                        <th width="120">加分</th>
+                        <th width="120">扣分</th>
+                        <th width="120">总分</th>
+                    </tr>
+                </thead>
+                <tbody id="rankingBody">
+                    ${rankingData.ranking.map((student, index) => `
+                        <tr>
+                            <td>
+                                <div class="rank-badge ${index < 3 ? \`rank-\${index + 1}\` : ''}">
+                                    ${index + 1}
+                                </div>
+                            </td>
+                            <td>${student.name}</td>
+                            <td class="add-score">${student.add_score}</td>
+                            <td class="minus-score">${student.minus_score}</td>
+                            <td class="total-score">${student.total_score > 0 ? '+' : ''}${student.total_score}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
         </div>
     </div>
 
@@ -2841,20 +2920,11 @@ async function renderClassPage(db, request, clientIP, ipSession) {
         <div class="modal-content">
             <button class="modal-close" onclick="closeSnapshotModal()">×</button>
             
-            <div class="step-title" style="text-align: center; margin-bottom: 1.5rem; font-size: 1.3rem; font-weight: 700; color: #0277bd;">
-                保存快照
-            </div>
+            <div class="step-title">📸 保存快照</div>
             
             <div class="input-group">
                 <label>快照标题：</label>
-                <input type="text" id="snapshotTitle" placeholder="请输入快照标题（如：期中考核）" style="width: 100%;">
-            </div>
-            
-            <div class="input-group">
-                <label>快照时间：</label>
-                <div id="snapshotTime" style="padding: 1rem; background: rgba(255, 255, 255, 0.2); border-radius: 12px; text-align: center;">
-                    ${new Date().toLocaleString('zh-CN')}
-                </div>
+                <input type="text" id="snapshotTitle" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;" placeholder="输入快照标题（如：期中考核）">
             </div>
             
             <div class="action-buttons">
@@ -2870,33 +2940,42 @@ async function renderClassPage(db, request, clientIP, ipSession) {
         </div>
     </div>
 
-    <!-- 底部信息栏 -->
-    <div class="footer-info">
-        <div class="footer-left">
-            <span>By 2314 刘沁熙</span>
-            <span class="footer-separator">|</span>
-            <span>基于Cloudflare Worker搭建</span>
-            <span class="footer-separator">|</span>
-            <span>Cloudflare CDN提供加速服务</span>
+    <!-- IP信息弹窗 -->
+    <div class="ip-info-modal" id="ipInfoModal" style="display: none;">
+        <div class="ip-info-header">
+            <h3 style="margin: 0;">🌐 连接信息</h3>
+            <button class="ip-info-close" onclick="closeIPInfo()">×</button>
         </div>
-        <div class="footer-right">
-            <span id="connectionInfo">连接状态: 加载中...</span>
-            <span class="footer-separator">|</span>
-            <span id="userAgentInfo">UA: ${userAgent.substring(0, 30)}...</span>
+        <div id="ipInfoContent">
+            <div class="ip-info-item">
+                <span class="ip-info-label">IP地址：</span>
+                <span class="ip-info-value" id="ipAddress">加载中...</span>
+            </div>
+            <div class="ip-info-item">
+                <span class="ip-info-label">延迟：</span>
+                <span class="ip-info-value" id="latency">测试中...</span>
+            </div>
+            <div class="ip-info-item">
+                <span class="ip-info-label">位置：</span>
+                <span class="ip-info-value" id="location">加载中...</span>
+            </div>
+            <div class="ip-info-item">
+                <span class="ip-info-label">运营商：</span>
+                <span class="ip-info-value" id="isp">加载中...</span>
+            </div>
         </div>
     </div>
 
     <script>
-        // 全局变量
         let currentStudentId = null;
         let currentScoreType = 'add';
         let currentStudentName = '';
         let selectedScore = 1;
-        let batchScoreType = 'add';
-        let selectedStudents = new Set();
+        let selectedStudents = [];
+        let currentStep = 1;
         let noteHistory = {};
-        let ipInfo = ${JSON.stringify(ipInfo || {})};
-        let connectionStartTime = Date.now();
+        let latency = 0;
+        let ipInfo = null;
 
         // 设置当前日期
         document.getElementById('currentDate').textContent = new Date().toLocaleDateString('zh-CN', {
@@ -2906,65 +2985,65 @@ async function renderClassPage(db, request, clientIP, ipSession) {
             weekday: 'long'
         });
 
-        // 显示IP信息
-        function showIPInfo() {
-            const ipNotification = document.getElementById('ipNotification');
-            const ipDetails = document.getElementById('ipDetails');
-            const latencyInfo = document.getElementById('latencyInfo');
-            
-            if (ipInfo && ipInfo.ip) {
-                let details = '';
-                if (ipInfo.flag) details += ${ipInfo.flag} ;
-                if (ipInfo.countryRegion) details += \` \${ipInfo.countryRegion}\`;
-                if (ipInfo.city) details += \` \${ipInfo.city}\`;
-                if (details) details += ' | ';
-                details += \`IP: \${ipInfo.ip}\`;
-                
-                ipDetails.textContent = details;
-            } else {
-                ipDetails.textContent = 'IP信息获取失败';
-            }
-            
-            // 计算延迟
-            const latency = Date.now() - connectionStartTime;
-            latencyInfo.textContent = \`延迟: \${latency}ms | 时间: \${new Date().toLocaleTimeString('zh-CN')}\`;
-            
-            // 5秒后自动隐藏
+        // 页面加载时获取IP信息和测试延迟
+        window.addEventListener('load', async () => {
+            await fetchIPInfo();
+            await testLatency();
             setTimeout(() => {
-                ipNotification.style.animation = 'slideOutLeft 0.3s ease';
-                setTimeout(() => {
-                    ipNotification.style.display = 'none';
-                }, 300);
+                showIPInfo();
+            }, 1000);
+        });
+
+        // 获取IP信息
+        async function fetchIPInfo() {
+            try {
+                const startTime = Date.now();
+                const response = await fetch('https://ip.ilqx.dpdns.org/geo');
+                latency = Date.now() - startTime;
+                
+                if (response.ok) {
+                    ipInfo = await response.json();
+                    updateIPInfoDisplay();
+                }
+            } catch (error) {
+                console.error('获取IP信息失败:', error);
+            }
+        }
+
+        // 测试延迟
+        async function testLatency() {
+            try {
+                const startTime = Date.now();
+                await fetch('/api/health', { cache: 'no-store' });
+                latency = Date.now() - startTime;
+                updateIPInfoDisplay();
+            } catch (error) {
+                console.error('测试延迟失败:', error);
+            }
+        }
+
+        // 更新IP信息显示
+        function updateIPInfoDisplay() {
+            if (ipInfo) {
+                document.getElementById('ipAddress').textContent = ipInfo.ip || '未知';
+                document.getElementById('location').textContent = \`\${ipInfo.flag || ''} \${ipInfo.countryRegion || ipInfo.country || '未知'}\${ipInfo.city ? ' ' + ipInfo.city : ''}\`;
+                document.getElementById('isp').textContent = ipInfo.asOrganization || '未知';
+            }
+            document.getElementById('latency').textContent = \`\${latency}ms\`;
+        }
+
+        // 显示IP信息弹窗
+        function showIPInfo() {
+            const modal = document.getElementById('ipInfoModal');
+            modal.style.display = 'block';
+            setTimeout(() => {
+                modal.style.display = 'none';
             }, 5000);
         }
 
-        // 显示通知
-        function showNotification(message, type = 'info') {
-            // 移除现有通知
-            const existingNotification = document.querySelector('.notification');
-            if (existingNotification) {
-                existingNotification.remove();
-            }
-
-            // 创建通知元素
-            const notification = document.createElement('div');
-            notification.className = \`notification \${type}\`;
-            notification.innerHTML = \`
-                <span>\${type === 'success' ? '✅' : type === 'error' ? '❌' : type === 'warning' ? '⚠️' : 'ℹ️'}</span>
-                <span>\${message}</span>
-            \`;
-            
-            document.body.appendChild(notification);
-            
-            // 3秒后自动移除
-            setTimeout(() => {
-                notification.style.animation = 'slideOutRight 0.3s ease';
-                setTimeout(() => {
-                    if (notification.parentNode) {
-                        notification.parentNode.removeChild(notification);
-                    }
-                }, 300);
-            }, 3000);
+        // 关闭IP信息弹窗
+        function closeIPInfo() {
+            document.getElementById('ipInfoModal').style.display = 'none';
         }
 
         // 开始评分流程
@@ -2972,67 +3051,57 @@ async function renderClassPage(db, request, clientIP, ipSession) {
             currentStudentId = studentId;
             currentScoreType = type;
             currentStudentName = studentName;
-            selectedScore = 1;
+            currentStep = 1;
             
-            // 更新界面
-            document.getElementById('step1StudentName').textContent = studentName || '选中学生';
+            // 更新第一步界面
+            document.getElementById('step1StudentName').textContent = studentName;
             document.getElementById('step1ActionType').textContent = type === 'add' ? '加分' : '扣分';
             
             // 重置选择
+            selectedScore = 1;
             updateScoreButtons();
             document.getElementById('customScore').style.display = 'none';
             document.getElementById('customScore').value = '';
             document.getElementById('scoreNote').value = '';
-            document.getElementById('noteHistory').innerHTML = '';
+            
+            // 显示第一步
+            showStep(1);
+            
+            // 显示模态框
+            document.getElementById('scoreModal').style.display = 'flex';
             
             // 加载评分项目
             loadScoreCategories();
             
-            // 显示模态框
-            const modal = document.getElementById('scoreModal');
-            const modalContent = modal.querySelector('.modal-content');
-            modal.style.display = 'flex';
-            
-            // 重置动画
-            modalContent.classList.remove('loaded');
-            setTimeout(() => {
-                modalContent.classList.add('loaded');
-            }, 10);
+            // 加载备注历史
+            loadNoteHistory();
         }
 
-        // 开始批量评分流程
-        function startBatchScoreProcess(type) {
-            if (selectedStudents.size === 0) {
-                showNotification('请先选择学生', 'warning');
+        // 显示步骤
+        function showStep(step) {
+            currentStep = step;
+            
+            // 更新步骤指示器
+            document.getElementById('step1Dot').classList.toggle('active', step === 1);
+            document.getElementById('step2Dot').classList.toggle('active', step === 2);
+            
+            // 显示对应步骤内容
+            document.getElementById('step1').classList.toggle('active', step === 1);
+            document.getElementById('step2').classList.toggle('active', step === 2);
+        }
+
+        // 前往第二步
+        function goToStep2() {
+            if (selectedScore <= 0) {
+                showNotification('请选择有效的分值', 'error');
                 return;
             }
-            
-            batchScoreType = type;
-            selectedScore = 1;
-            
-            // 更新界面
-            document.getElementById('batchActionType').textContent = type === 'add' ? '加分' : '扣分';
-            document.getElementById('batchStudentCount').textContent = selectedStudents.size;
-            
-            // 重置选择
-            updateBatchScoreButtons();
-            document.getElementById('batchCustomScore').style.display = 'none';
-            document.getElementById('batchCustomScore').value = '';
-            document.getElementById('batchScoreNote').value = '';
-            
-            // 加载评分项目
-            loadBatchScoreCategories();
-            
-            // 显示模态框
-            const modal = document.getElementById('batchScoreModal');
-            const modalContent = modal.querySelector('.modal-content');
-            modal.style.display = 'flex';
-            
-            // 重置动画
-            modalContent.classList.remove('loaded');
-            setTimeout(() => {
-                modalContent.classList.add('loaded');
-            }, 10);
+            showStep(2);
+        }
+
+        // 返回第一步
+        function goToStep1() {
+            showStep(1);
         }
 
         // 关闭评分弹窗
@@ -3040,14 +3109,9 @@ async function renderClassPage(db, request, clientIP, ipSession) {
             document.getElementById('scoreModal').style.display = 'none';
         }
 
-        // 关闭批量评分弹窗
-        function closeBatchScoreModal() {
-            document.getElementById('batchScoreModal').style.display = 'none';
-        }
-
         // 更新分数按钮状态
         function updateScoreButtons() {
-            document.querySelectorAll('#scoreButtons .score-btn').forEach(btn => {
+            document.querySelectorAll('.score-btn').forEach(btn => {
                 btn.classList.remove('selected');
                 if (btn.dataset.score === 'custom' && document.getElementById('customScore').style.display === 'block') {
                     btn.classList.add('selected');
@@ -3057,22 +3121,9 @@ async function renderClassPage(db, request, clientIP, ipSession) {
             });
         }
 
-        // 更新批量分数按钮状态
-        function updateBatchScoreButtons() {
-            document.querySelectorAll('#batchScoreButtons .score-btn').forEach(btn => {
-                btn.classList.remove('selected');
-                if (btn.dataset.score === 'custom' && document.getElementById('batchCustomScore').style.display === 'block') {
-                    btn.classList.add('selected');
-                } else if (parseInt(btn.dataset.score) === selectedScore) {
-                    btn.classList.add('selected');
-                }
-            });
-        }
-
         // 分数按钮事件处理
         document.addEventListener('DOMContentLoaded', function() {
-            // 单个评分按钮
-            document.querySelectorAll('#scoreButtons .score-btn').forEach(btn => {
+            document.querySelectorAll('.score-btn').forEach(btn => {
                 btn.addEventListener('click', function() {
                     if (this.dataset.score === 'custom') {
                         document.getElementById('customScore').style.display = 'block';
@@ -3090,25 +3141,6 @@ async function renderClassPage(db, request, clientIP, ipSession) {
                 updateScoreButtons();
             });
 
-            // 批量评分按钮
-            document.querySelectorAll('#batchScoreButtons .score-btn').forEach(btn => {
-                btn.addEventListener('click', function() {
-                    if (this.dataset.score === 'custom') {
-                        document.getElementById('batchCustomScore').style.display = 'block';
-                        document.getElementById('batchCustomScore').focus();
-                    } else {
-                        document.getElementById('batchCustomScore').style.display = 'none';
-                        selectedScore = parseInt(this.dataset.score);
-                        updateBatchScoreButtons();
-                    }
-                });
-            });
-
-            document.getElementById('batchCustomScore').addEventListener('input', function() {
-                selectedScore = parseInt(this.value) || 0;
-                updateBatchScoreButtons();
-            });
-
             // 点击弹窗外部关闭
             document.getElementById('scoreModal').addEventListener('click', function(e) {
                 if (e.target === this) closeScoreModal();
@@ -3118,8 +3150,12 @@ async function renderClassPage(db, request, clientIP, ipSession) {
                 if (e.target === this) closeBatchScoreModal();
             });
             
-            document.getElementById('detailsModal').addEventListener('click', function(e) {
-                if (e.target === this) closeDetailsModal();
+            document.getElementById('studentDetailModal').addEventListener('click', function(e) {
+                if (e.target === this) closeStudentDetailModal();
+            });
+            
+            document.getElementById('rankingModal').addEventListener('click', function(e) {
+                if (e.target === this) closeRankingModal();
             });
             
             document.getElementById('snapshotModal').addEventListener('click', function(e) {
@@ -3139,75 +3175,79 @@ async function renderClassPage(db, request, clientIP, ipSession) {
                 const option = document.createElement('option');
                 option.value = cat.id;
                 option.textContent = cat.name;
+                option.dataset.requiresNote = cat.requires_note;
                 categorySelect.appendChild(option);
             });
             
-            // 监听类别变化，加载备注历史
+            // 监听项目选择变化
             categorySelect.addEventListener('change', function() {
-                loadNoteHistory(this.value);
-            });
-            
-            // 初始加载
-            loadNoteHistory(categorySelect.value);
-        }
-
-        // 加载批量评分项目
-        function loadBatchScoreCategories() {
-            const categorySelect = document.getElementById('batchCategorySelect');
-            categorySelect.innerHTML = '';
-            
-            const categories = ${JSON.stringify((scoreCategories.results || []))};
-            const filteredCategories = categories.filter(cat => cat.type === batchScoreType);
-            
-            filteredCategories.forEach(cat => {
-                const option = document.createElement('option');
-                option.value = cat.id;
-                option.textContent = cat.name;
-                categorySelect.appendChild(option);
+                const selectedOption = this.options[this.selectedIndex];
+                const requiresNote = selectedOption.dataset.requiresNote === '1';
+                
+                if (requiresNote) {
+                    loadNoteHistory();
+                }
             });
         }
 
         // 加载备注历史
-        async function loadNoteHistory(categoryId) {
-            const categories = ${JSON.stringify((scoreCategories.results || []))};
-            const category = categories.find(cat => cat.id == categoryId);
+        async function loadNoteHistory() {
+            const categorySelect = document.getElementById('categorySelect');
+            const selectedOption = categorySelect.options[categorySelect.selectedIndex];
+            const requiresNote = selectedOption.dataset.requiresNote === '1';
             
-            if (!category || (category.name !== '其他加分项' && category.name !== '其他扣分项')) {
-                document.getElementById('noteHistory').innerHTML = '';
+            if (!requiresNote) {
+                document.getElementById('noteHistory').style.display = 'none';
                 return;
             }
             
             try {
-                const response = await fetch('/api/logs');
+                const response = await fetch(\`/api/student-logs?studentId=\${currentStudentId}\`);
                 const result = await response.json();
                 
-                if (result.success && result.logs) {
-                    const notes = result.logs
-                        .filter(log => log.category_name === category.name && log.note)
-                        .map(log => log.note)
-                        .filter((note, index, self) => self.indexOf(note) === index)
-                        .slice(0, 5);
+                if (result.success && result.logs.length > 0) {
+                    const categoryName = selectedOption.textContent;
+                    const categoryLogs = result.logs.filter(log => log.category_name === categoryName);
                     
-                    if (notes.length > 0) {
-                        let html = '<strong>历史备注：</strong><br>';
-                        notes.forEach(note => {
-                            html += \`<span style="cursor: pointer; color: #0277bd; margin-right: 0.5rem;" onclick="document.getElementById('scoreNote').value = '\${note}';">\${note}</span>\`;
+                    if (categoryLogs.length > 0) {
+                        const noteHistoryList = document.getElementById('noteHistoryList');
+                        noteHistoryList.innerHTML = '';
+                        
+                        categoryLogs.slice(0, 5).forEach(log => {
+                            const div = document.createElement('div');
+                            div.style.padding = '0.5rem';
+                            div.style.borderBottom = '1px solid var(--border)';
+                            div.style.cursor = 'pointer';
+                            div.textContent = log.note || '无备注';
+                            div.title = \`\${new Date(log.created_at).toLocaleString()} - \${log.operator}\`;
+                            div.onclick = () => {
+                                document.getElementById('scoreNote').value = log.note || '';
+                            };
+                            noteHistoryList.appendChild(div);
                         });
-                        document.getElementById('noteHistory').innerHTML = html;
+                        
+                        document.getElementById('noteHistory').style.display = 'block';
                     } else {
-                        document.getElementById('noteHistory').innerHTML = '<em>暂无历史备注</em>';
+                        document.getElementById('noteHistory').style.display = 'none';
                     }
+                } else {
+                    document.getElementById('noteHistory').style.display = 'none';
                 }
             } catch (error) {
                 console.error('加载备注历史失败:', error);
+                document.getElementById('noteHistory').style.display = 'none';
             }
         }
 
         // 提交分数
         async function submitScore() {
-            const categoryId = document.getElementById('categorySelect').value;
+            const categorySelect = document.getElementById('categorySelect');
+            const selectedOption = categorySelect.options[categorySelect.selectedIndex];
+            const requiresNote = selectedOption.dataset.requiresNote === '1';
+            
+            const categoryId = categorySelect.value;
             const operator = document.getElementById('operatorSelect').value;
-            const note = document.getElementById('scoreNote').value.trim();
+            const note = document.getElementById('scoreNote').value;
             
             let score = selectedScore;
             if (document.getElementById('customScore').style.display === 'block') {
@@ -3219,19 +3259,21 @@ async function renderClassPage(db, request, clientIP, ipSession) {
                 return;
             }
 
-            // 检查是否为其他项且无备注
-            const categories = ${JSON.stringify((scoreCategories.results || []))};
-            const category = categories.find(cat => cat.id == categoryId);
-            if ((category.name === '其他加分项' || category.name === '其他扣分项') && !note) {
-                showNotification('其他项必须填写备注', 'error');
+            // 检查是否需要备注
+            if (requiresNote && (!note || note.trim() === '')) {
+                showNotification('该项目必须填写备注', 'error');
                 return;
             }
 
+            // 禁用提交按钮，防止重复提交
             const submitBtn = document.getElementById('submitScoreBtn');
             submitBtn.disabled = true;
             submitBtn.textContent = '提交中...';
 
             try {
+                const ip = '${request.headers.get("CF-Connecting-IP") || "unknown"}';
+                const userAgent = navigator.userAgent;
+                
                 const response = await fetch('/api/score', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -3240,15 +3282,18 @@ async function renderClassPage(db, request, clientIP, ipSession) {
                         categoryId: categoryId,
                         score: score,
                         operator: operator,
-                        note: note
+                        note: note,
+                        ip: ip,
+                        userAgent: userAgent
                     })
                 });
 
                 const result = await response.json();
 
                 if (result.success) {
-                    showNotification('评分提交成功！', 'success');
+                    // 立即关闭弹窗，防止重复点击
                     closeScoreModal();
+                    showNotification('评分提交成功！', 'success');
                     setTimeout(() => location.reload(), 1000);
                 } else {
                     showNotification(result.error || '提交失败', 'error');
@@ -3262,219 +3307,159 @@ async function renderClassPage(db, request, clientIP, ipSession) {
             }
         }
 
-        // 提交批量分数
-        async function submitBatchScore() {
-            const categoryId = document.getElementById('batchCategorySelect').value;
-            const operator = document.getElementById('batchOperatorSelect').value;
-            const note = document.getElementById('batchScoreNote').value.trim();
-            
-            let score = selectedScore;
-            if (document.getElementById('batchCustomScore').style.display === 'block') {
-                score = parseInt(document.getElementById('batchCustomScore').value) || 1;
-            }
+        // 更新已选学生
+        function updateSelectedStudents() {
+            selectedStudents = [];
+            document.querySelectorAll('.student-checkbox:checked').forEach(checkbox => {
+                selectedStudents.push({
+                    id: parseInt(checkbox.dataset.id),
+                    name: checkbox.dataset.name
+                });
+            });
+        }
 
+        // 显示批量评分弹窗
+        function showBatchScoreModal() {
+            if (selectedStudents.length === 0) {
+                showNotification('请先选择学生', 'error');
+                return;
+            }
+            
+            document.getElementById('batchScoreModal').style.display = 'flex';
+            loadBatchCategories();
+        }
+
+        // 关闭批量评分弹窗
+        function closeBatchScoreModal() {
+            document.getElementById('batchScoreModal').style.display = 'none';
+        }
+
+        // 加载批量评分项目
+        function loadBatchCategories() {
+            const batchScoreType = document.getElementById('batchScoreType').value;
+            const batchCategorySelect = document.getElementById('batchCategorySelect');
+            batchCategorySelect.innerHTML = '';
+            
+            const categories = ${JSON.stringify((scoreCategories.results || []))};
+            const filteredCategories = categories.filter(cat => cat.type === batchScoreType);
+            
+            filteredCategories.forEach(cat => {
+                const option = document.createElement('option');
+                option.value = cat.id;
+                option.textContent = cat.name;
+                option.dataset.requiresNote = cat.requires_note;
+                batchCategorySelect.appendChild(option);
+            });
+        }
+
+        // 提交批量评分
+        async function submitBatchScore() {
+            const batchCategorySelect = document.getElementById('batchCategorySelect');
+            const selectedOption = batchCategorySelect.options[batchCategorySelect.selectedIndex];
+            const requiresNote = selectedOption.dataset.requiresNote === '1';
+            
+            const categoryId = batchCategorySelect.value;
+            const score = parseInt(document.getElementById('batchScoreValue').value) || 1;
+            const operator = document.getElementById('batchOperatorSelect').value;
+            const note = document.getElementById('batchScoreNote').value;
+            
             if (score <= 0) {
                 showNotification('分值必须大于0', 'error');
                 return;
             }
-
-            // 检查是否为其他项且无备注
-            const categories = ${JSON.stringify((scoreCategories.results || []))};
-            const category = categories.find(cat => cat.id == categoryId);
-            if ((category.name === '其他加分项' || category.name === '其他扣分项') && !note) {
-                showNotification('其他项必须填写备注', 'error');
+            
+            // 检查是否需要备注
+            if (requiresNote && (!note || note.trim() === '')) {
+                showNotification('该项目必须填写备注', 'error');
                 return;
             }
 
-            const submitBtn = document.getElementById('submitBatchScoreBtn');
-            submitBtn.disabled = true;
-            submitBtn.textContent = '提交中...';
-
             try {
-                const response = await fetch('/api/score-batch', {
+                const ip = '${request.headers.get("CF-Connecting-IP") || "unknown"}';
+                const userAgent = navigator.userAgent;
+                
+                const response = await fetch('/api/batch-score', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        studentIds: Array.from(selectedStudents),
+                        studentIds: selectedStudents.map(s => s.id),
                         categoryId: categoryId,
                         score: score,
                         operator: operator,
-                        note: note
+                        note: note,
+                        ip: ip,
+                        userAgent: userAgent
                     })
                 });
 
                 const result = await response.json();
 
                 if (result.success) {
-                    showNotification(result.message || '批量评分成功！', 'success');
                     closeBatchScoreModal();
+                    showNotification(\`批量评分成功！共\${selectedStudents.length}名学生\`, 'success');
                     setTimeout(() => location.reload(), 1000);
                 } else {
                     showNotification(result.error || '提交失败', 'error');
-                    submitBtn.disabled = false;
-                    submitBtn.innerHTML = '<span>✅</span> 提交批量评分';
                 }
             } catch (error) {
                 showNotification('网络错误，请重试', 'error');
-                submitBtn.disabled = false;
-                submitBtn.innerHTML = '<span>✅</span> 提交批量评分';
             }
         }
 
-        // 学生选择功能
-        function toggleSelectAll(checkbox) {
-            const studentCheckboxes = document.querySelectorAll('.student-select');
-            studentCheckboxes.forEach(cb => {
-                cb.checked = checkbox.checked;
-                if (checkbox.checked) {
-                    selectedStudents.add(parseInt(cb.dataset.id));
-                } else {
-                    selectedStudents.delete(parseInt(cb.dataset.id));
-                }
-            });
-            updateSelectedCount();
-        }
-
-        function selectAllStudents() {
-            const checkboxes = document.querySelectorAll('.student-select');
-            checkboxes.forEach(cb => {
-                cb.checked = true;
-                selectedStudents.add(parseInt(cb.dataset.id));
-            });
-            document.getElementById('selectAll').checked = true;
-            updateSelectedCount();
-        }
-
-        function deselectAllStudents() {
-            const checkboxes = document.querySelectorAll('.student-select');
-            checkboxes.forEach(cb => {
-                cb.checked = false;
-                selectedStudents.delete(parseInt(cb.dataset.id));
-            });
-            document.getElementById('selectAll').checked = false;
-            updateSelectedCount();
-        }
-
-        function invertSelection() {
-            const checkboxes = document.querySelectorAll('.student-select');
-            checkboxes.forEach(cb => {
-                cb.checked = !cb.checked;
-                if (cb.checked) {
-                    selectedStudents.add(parseInt(cb.dataset.id));
-                } else {
-                    selectedStudents.delete(parseInt(cb.dataset.id));
-                }
-            });
-            updateSelectedCount();
-        }
-
-        function updateSelectedCount() {
-            const checkboxes = document.querySelectorAll('.student-select');
-            selectedStudents.clear();
-            checkboxes.forEach(cb => {
-                if (cb.checked) {
-                    selectedStudents.add(parseInt(cb.dataset.id));
-                }
-            });
+        // 显示学生详细信息
+        async function showStudentDetail(studentId, studentName) {
+            currentStudentId = studentId;
             
-            const count = selectedStudents.size;
-            document.getElementById('selectedCount').textContent = \`已选择 \${count} 名学生\`;
-            
-            const batchAddBtn = document.getElementById('batchAddBtn');
-            const batchMinusBtn = document.getElementById('batchMinusBtn');
-            batchAddBtn.disabled = count === 0;
-            batchMinusBtn.disabled = count === 0;
-            
-            // 更新全选复选框状态
-            const allChecked = count === checkboxes.length;
-            const someChecked = count > 0 && count < checkboxes.length;
-            document.getElementById('selectAll').checked = allChecked;
-            document.getElementById('selectAll').indeterminate = someChecked;
-        }
-
-        // 显示学生详细记录
-        async function showStudentDetails(studentId, studentName) {
-            document.getElementById('detailsStudentName').textContent = studentName;
+            document.getElementById('detailTitle').textContent = \`\${studentName} - 详细记录\`;
             
             try {
-                const response = await fetch(\`/api/logs?studentId=\${studentId}\`);
+                const response = await fetch(\`/api/student-logs?studentId=\${studentId}\`);
                 const result = await response.json();
                 
-                let html = '';
-                if (result.success && result.logs && result.logs.length > 0) {
-                    html += \`
-                        <div style="overflow-x: auto;">
-                            <table class="details-table">
-                                <thead>
-                                    <tr>
-                                        <th>时间</th>
-                                        <th>操作类型</th>
-                                        <th>分数变化</th>
-                                        <th>操作教师</th>
-                                        <th>项目</th>
-                                        <th>备注</th>
-                                        <th>操作</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                    \`;
-                    
+                let content = '<div style="margin-bottom: 1rem;"><strong>操作记录：</strong></div>';
+                
+                if (result.success && result.logs.length > 0) {
                     result.logs.forEach(log => {
-                        const actionType = log.action_type === 'add' ? '加分' : log.action_type === 'minus' ? '扣分' : '撤销';
-                        const scoreChange = log.score_change > 0 ? \`+\${log.score_change}\` : log.score_change;
-                        const scoreColor = log.score_change > 0 ? '#10b981' : log.score_change < 0 ? '#ef4444' : '#6b7280';
+                        const scoreClass = log.category_type === 'add' ? 'add-score' : 'minus-score';
+                        const scorePrefix = log.category_type === 'add' ? '+' : '-';
                         
-                        html += \`
-                            <tr>
-                                <td>\${new Date(log.created_at).toLocaleString('zh-CN')}</td>
-                                <td>
-                                    <span style="padding: 0.25rem 0.5rem; border-radius: 12px; font-size: 0.75rem; background: \${log.action_type === 'add' ? '#10b981' : log.action_type === 'minus' ? '#ef4444' : '#f59e0b'}; color: white;">
-                                        \${actionType}
-                                    </span>
-                                </td>
-                                <td style="color: \${scoreColor}; font-weight: 600;">\${scoreChange}</td>
-                                <td>\${log.operator}</td>
-                                <td>\${log.category_name}</td>
-                                <td>\${log.note || '-'}</td>
-                                <td>
-                                    \${log.action_type !== 'revoke' ? \`
-                                    <button class="btn" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;" onclick="revokeRecord(\${log.id})">
-                                        撤销
+                        content += \`
+                            <div class="log-item">
+                                <div class="log-header">
+                                    <div>
+                                        <strong>\${log.category_name}</strong>
+                                        <span style="margin-left: 1rem; font-size: 0.875rem; color: var(--text-light);">\${new Date(log.created_at).toLocaleString()}</span>
+                                    </div>
+                                    <div class="log-score \${scoreClass}">\${scorePrefix}\${log.score}分</div>
+                                </div>
+                                <div class="log-details">
+                                    <div>操作教师: \${log.operator}</div>
+                                    <div class="log-note">备注: \${log.note || '无'}</div>
+                                    <button onclick="revokeScore(\${log.id})" style="margin-top: 0.5rem; padding: 0.25rem 0.5rem; background: var(--danger); color: white; border: none; border-radius: 4px; cursor: pointer;">
+                                        撤销此操作
                                     </button>
-                                    \` : '已撤销'}
-                                </td>
-                            </tr>
+                                </div>
+                            </div>
                         \`;
                     });
-                    
-                    html += \`
-                                </tbody>
-                            </table>
-                        </div>
-                    \`;
                 } else {
-                    html = '<p style="text-align: center; color: #666;">暂无记录</p>';
+                    content += '<div style="text-align: center; padding: 2rem; color: var(--text-light);">暂无记录</div>';
                 }
                 
-                document.getElementById('detailsContent').innerHTML = html;
-                
-                // 显示模态框
-                const modal = document.getElementById('detailsModal');
-                const modalContent = modal.querySelector('.modal-content');
-                modal.style.display = 'flex';
-                
-                // 重置动画
-                modalContent.classList.remove('loaded');
-                setTimeout(() => {
-                    modalContent.classList.add('loaded');
-                }, 10);
+                document.getElementById('studentDetailContent').innerHTML = content;
+                document.getElementById('studentDetailModal').style.display = 'flex';
             } catch (error) {
                 showNotification('加载详细记录失败', 'error');
             }
         }
 
-        // 撤销记录
-        async function revokeRecord(recordId) {
+        // 关闭学生详细信息弹窗
+        function closeStudentDetailModal() {
+            document.getElementById('studentDetailModal').style.display = 'none';
+        }
+
+        // 撤销评分
+        async function revokeScore(recordId) {
             if (!confirm('确定要撤销这条记录吗？')) return;
             
             try {
@@ -3488,7 +3473,7 @@ async function renderClassPage(db, request, clientIP, ipSession) {
 
                 if (result.success) {
                     showNotification('撤销成功！', 'success');
-                    closeDetailsModal();
+                    closeStudentDetailModal();
                     setTimeout(() => location.reload(), 1000);
                 } else {
                     showNotification(result.error || '撤销失败', 'error');
@@ -3498,40 +3483,19 @@ async function renderClassPage(db, request, clientIP, ipSession) {
             }
         }
 
-        // 关闭详细记录弹窗
-        function closeDetailsModal() {
-            document.getElementById('detailsModal').style.display = 'none';
+        // 显示排名弹窗
+        function showRankingModal() {
+            document.getElementById('rankingModal').style.display = 'flex';
         }
 
-        // 显示排名
-        function showRankings() {
-            const students = ${JSON.stringify(studentsData.students || [])};
-            let message = '🏆 学生总分排名：\\n\\n';
-            
-            students.forEach((student, index) => {
-                const rank = index + 1;
-                const medal = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : \`\${rank}.\`;
-                message += \`\${medal} \${student.name}: \${student.total_score > 0 ? '+' : ''}\${student.total_score}\\n\`;
-            });
-            
-            alert(message);
+        // 关闭排名弹窗
+        function closeRankingModal() {
+            document.getElementById('rankingModal').style.display = 'none';
         }
 
-        // 创建快照
+        // 显示快照弹窗
         function createSnapshot() {
-            // 显示快照模态框
-            const modal = document.getElementById('snapshotModal');
-            const modalContent = modal.querySelector('.modal-content');
-            modal.style.display = 'flex';
-            
-            // 重置动画
-            modalContent.classList.remove('loaded');
-            setTimeout(() => {
-                modalContent.classList.add('loaded');
-            }, 10);
-            
-            // 更新时间
-            document.getElementById('snapshotTime').textContent = new Date().toLocaleString('zh-CN');
+            document.getElementById('snapshotModal').style.display = 'flex';
         }
 
         // 关闭快照弹窗
@@ -3558,8 +3522,8 @@ async function renderClassPage(db, request, clientIP, ipSession) {
                 const result = await response.json();
 
                 if (result.success) {
-                    showNotification('快照保存成功！', 'success');
                     closeSnapshotModal();
+                    showNotification('快照保存成功！', 'success');
                 } else {
                     showNotification(result.error || '保存失败', 'error');
                 }
@@ -3568,31 +3532,38 @@ async function renderClassPage(db, request, clientIP, ipSession) {
             }
         }
 
-        // 显示快照列表
-        async function showSnapshots() {
-            try {
-                const response = await fetch('/api/snapshots');
-                const result = await response.json();
-                
-                if (!result.success || !result.snapshots || result.snapshots.length === 0) {
-                    showNotification('暂无历史快照', 'info');
-                    return;
-                }
-                
-                window.open('/snapshots', '_blank');
-            } catch (error) {
-                showNotification('获取快照列表失败', 'error');
-            }
+        // 显示历史快照页面
+        function showSnapshots() {
+            window.open('/snapshots', '_blank');
         }
 
-        // 编辑公告
-        function editAnnouncement() {
-            const currentText = document.getElementById('announcementText').textContent;
-            const newText = prompt('编辑班级公告:', currentText);
-            if (newText !== null) {
-                document.getElementById('announcementText').textContent = newText;
-                showNotification('公告更新成功！', 'success');
+        // 显示通知
+        function showNotification(message, type = 'info') {
+            // 移除现有通知
+            const existingNotification = document.querySelector('.notification');
+            if (existingNotification) {
+                existingNotification.remove();
             }
+
+            // 创建通知元素
+            const notification = document.createElement('div');
+            notification.className = \`notification \${type}\`;
+            notification.innerHTML = \`
+                <span>\${type === 'success' ? '✅' : type === 'error' ? '❌' : 'ℹ️'}</span>
+                <span>\${message}</span>
+            \`;
+            
+            document.body.appendChild(notification);
+            
+            // 3秒后自动移除
+            setTimeout(() => {
+                notification.style.animation = 'slideOutRight 0.3s ease';
+                setTimeout(() => {
+                    if (notification.parentNode) {
+                        notification.parentNode.removeChild(notification);
+                    }
+                }, 300);
+            }, 3000);
         }
 
         // 退出登录
@@ -3604,31 +3575,6 @@ async function renderClassPage(db, request, clientIP, ipSession) {
                 window.location.href = '/login';
             }
         }
-
-        // 初始化
-        document.addEventListener('DOMContentLoaded', function() {
-            // 显示IP信息
-            setTimeout(showIPInfo, 500);
-            
-            // 更新连接状态
-            const connectionInfo = document.getElementById('connectionInfo');
-            const latency = Date.now() - connectionStartTime;
-            connectionInfo.textContent = \`连接状态: 良好 | 延迟: \${latency}ms\`;
-            
-            // 更新UA信息
-            const userAgentInfo = document.getElementById('userAgentInfo');
-            const ua = '${userAgent}';
-            userAgentInfo.textContent = \`UA: \${ua.length > 30 ? ua.substring(0, 30) + '...' : ua}\`;
-            
-            // 加载动画
-            setTimeout(function() {
-                document.querySelectorAll('.modal-content').forEach(modal => {
-                    if (modal.parentElement.style.display === 'flex') {
-                        modal.classList.add('loaded');
-                    }
-                });
-            }, 100);
-        });
     </script>
 </body>
 </html>
@@ -3642,20 +3588,19 @@ async function renderClassPage(db, request, clientIP, ipSession) {
   }
 }
 
-// 渲染管理员页面（简化版，与班级页面类似但功能更多）
-async function renderAdminPage(db, request, clientIP, ipSession) {
+// 渲染管理员页面
+async function renderAdminPage(db, request, ipSession) {
   try {
-    if (!ipSession || ipSession.role !== 'admin') {
+    // 检查IP会话或需要登录
+    if (!ipSession.authenticated || ipSession.role !== 'admin') {
       return Response.redirect(new URL('/login', request.url));
     }
 
-    const [studentsData, scoreCategories, tasks, settings, ipInfo, wallpaper] = await Promise.all([
+    const [studentsData, logs, settings, snapshots] = await Promise.all([
       handleGetStudents(db).then(r => r.json()),
-      db.prepare('SELECT * FROM score_categories ORDER BY type, id').all(),
-      db.prepare('SELECT * FROM tasks ORDER BY created_at DESC LIMIT 10').all(),
+      db.prepare('SELECT ol.*, s.name as student_name FROM operation_logs ol JOIN students s ON ol.student_id = s.id ORDER BY ol.created_at DESC LIMIT 50').all(),
       db.prepare('SELECT key, value FROM settings').all(),
-      getIPInfo(),
-      getBingWallpaper()
+      db.prepare('SELECT DISTINCT title, snapshot_date FROM monthly_snapshots ORDER BY snapshot_date DESC LIMIT 10').all()
     ]);
 
     if (!studentsData.success) {
@@ -3667,10 +3612,7 @@ async function renderAdminPage(db, request, clientIP, ipSession) {
       settingMap[row.key] = row.value;
     });
 
-    const currentMonth = settingMap.current_month || new Date().toISOString().slice(0, 7);
-    const userAgent = request.headers.get('User-Agent') || 'unknown';
-
-    // 管理员页面HTML（简化版，主要展示管理功能）
+    // 完整的管理员页面HTML
     const html = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -3684,96 +3626,76 @@ async function renderAdminPage(db, request, clientIP, ipSession) {
             font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
         }
         
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --background: #f8fafc;
+            --surface: #ffffff;
+            --text: #1e293b;
+            --text-light: #64748b;
+            --border: #e2e8f0;
+            --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+        }
+        
         body { 
-            background: #e0f7fa;
+            background: var(--background); 
+            color: var(--text);
             min-height: 100vh;
-            position: relative;
-            overflow-x: hidden;
-        }
-        
-        body::after {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-image: url('${wallpaper}');
-            background-size: cover;
-            background-position: center;
-            filter: blur(8px);
-            z-index: -2;
-        }
-        
-        body::before {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(45deg, rgba(79, 195, 247, 0.2), rgba(176, 196, 222, 0.2));
-            z-index: -1;
         }
         
         .header { 
-            background: rgba(255, 255, 255, 0.3);
-            padding: 1rem 2rem;
-            backdrop-filter: blur(10px);
-            border-bottom: 1px solid rgba(79, 195, 247, 0.3);
-            position: sticky;
-            top: 0;
-            z-index: 1000;
-            display: flex;
-            justify-content: space-between;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); 
+            color: white; 
+            padding: 1.5rem 2rem; 
+            box-shadow: var(--shadow);
+        }
+        
+        .header-content { 
+            display: flex; 
+            justify-content: space-between; 
             align-items: center;
-            flex-wrap: wrap;
-            gap: 1rem;
+            max-width: 1400px;
+            margin: 0 auto;
         }
         
         .class-info h1 { 
-            color: #0277bd;
-            margin-bottom: 0.5rem;
-            text-shadow: 0 0 5px rgba(79, 195, 247, 0.3);
+            font-weight: 700; 
+            margin-bottom: 0.5rem; 
         }
         
         .admin-badge {
-            background: linear-gradient(45deg, #ef4444, #f87171);
+            background: rgba(255,255,255,0.2);
             padding: 0.25rem 0.75rem;
             border-radius: 20px;
             font-size: 0.875rem;
-            color: white;
             margin-left: 1rem;
         }
         
         .btn {
             padding: 0.75rem 1.5rem;
-            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
             border: none;
-            border-radius: 25px;
-            color: #333333;
-            font-weight: bold;
+            border-radius: 12px;
+            font-weight: 600;
             cursor: pointer;
             transition: all 0.3s ease;
             text-decoration: none;
-            display: flex;
+            display: inline-flex;
             align-items: center;
             gap: 0.5rem;
-            white-space: nowrap;
         }
         
-        .btn:hover {
-            background: linear-gradient(45deg, #29b6f6, #4fc3f7);
+        .btn-primary {
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border: 1px solid rgba(255,255,255,0.3);
+        }
+        
+        .btn-primary:hover {
+            background: rgba(255,255,255,0.3);
             transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(79, 195, 247, 0.4);
-        }
-        
-        .btn-danger {
-            background: linear-gradient(45deg, #ef4444, #f87171);
-        }
-        
-        .btn-danger:hover {
-            background: linear-gradient(45deg, #dc2626, #ef4444);
         }
         
         .main-content {
@@ -3781,31 +3703,45 @@ async function renderAdminPage(db, request, clientIP, ipSession) {
             margin: 0 auto;
             padding: 2rem;
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            grid-template-columns: 1fr 1fr;
             gap: 2rem;
         }
         
         .card {
-            background: rgba(255, 255, 255, 0.3);
-            border-radius: 15px;
+            background: var(--surface);
+            border-radius: 20px;
             padding: 2rem;
-            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
-            backdrop-filter: blur(5px);
-            border: 1px solid rgba(79, 195, 247, 0.3);
+            box-shadow: var(--shadow);
             transition: all 0.3s ease;
             animation: fadeIn 0.6s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
         }
         
         .card:hover {
             transform: translateY(-8px);
-            box-shadow: 0 25px 50px -12px rgba(79, 195, 247, 0.5);
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+        }
+        
+        .card-full {
+            grid-column: 1 / -1;
         }
         
         .card-title {
             font-size: 1.5rem;
             font-weight: 700;
             margin-bottom: 1.5rem;
-            color: #0277bd;
+            color: var(--text);
             display: flex;
             align-items: center;
             gap: 0.75rem;
@@ -3813,36 +3749,35 @@ async function renderAdminPage(db, request, clientIP, ipSession) {
         
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(2, 1fr);
+            grid-template-columns: repeat(3, 1fr);
             gap: 1rem;
             margin-bottom: 2rem;
         }
         
         .stat-card {
-            background: rgba(255, 255, 255, 0.2);
+            background: var(--background);
             padding: 1.5rem;
-            border-radius: 12px;
+            border-radius: 16px;
             text-align: center;
-            border-left: 4px solid #0277bd;
+            border-left: 4px solid var(--primary);
             transition: all 0.3s ease;
         }
         
         .stat-card:hover {
             transform: translateY(-4px);
-            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3);
+            box-shadow: var(--shadow);
         }
         
         .stat-number {
             font-size: 2rem;
             font-weight: 700;
-            color: #0277bd;
+            color: var(--primary);
             margin-bottom: 0.5rem;
         }
         
         .stat-label {
-            color: #333333;
+            color: var(--text-light);
             font-size: 0.875rem;
-            opacity: 0.9;
         }
         
         .table-container {
@@ -3858,26 +3793,58 @@ async function renderAdminPage(db, request, clientIP, ipSession) {
         .data-table th, .data-table td {
             padding: 1rem;
             text-align: left;
-            border-bottom: 1px solid rgba(79, 195, 247, 0.3);
+            border-bottom: 1px solid var(--border);
             transition: all 0.2s ease;
         }
         
         .data-table th {
-            background: rgba(255, 255, 255, 0.2);
+            background: var(--background);
             font-weight: 600;
-            color: #333333;
+            color: var(--text-light);
             position: sticky;
             top: 0;
-            backdrop-filter: blur(10px);
         }
         
         .data-table tr:hover td {
-            background: rgba(255, 255, 255, 0.2);
+            background: var(--background);
             transform: scale(1.02);
         }
         
-        .positive { color: #10b981; font-weight: 600; }
-        .negative { color: #ef4444; font-weight: 600; }
+        .positive { color: var(--secondary); font-weight: 600; }
+        .negative { color: var(--danger); font-weight: 600; }
+        
+        .log-item {
+            padding: 1rem;
+            border-left: 4px solid var(--primary);
+            background: var(--background);
+            border-radius: 8px;
+            margin-bottom: 1rem;
+            transition: all 0.2s ease;
+        }
+        
+        .log-item:hover {
+            transform: translateX(8px);
+        }
+        
+        .log-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.5rem;
+        }
+        
+        .log-student {
+            font-weight: 600;
+            color: var(--text);
+        }
+        
+        .log-score {
+            font-weight: 700;
+        }
+        
+        .log-details {
+            color: var(--text-light);
+            font-size: 0.875rem;
+        }
         
         .settings-form {
             display: grid;
@@ -3892,49 +3859,46 @@ async function renderAdminPage(db, request, clientIP, ipSession) {
         
         .form-group label {
             font-weight: 600;
-            color: #333333;
+            color: var(--text);
         }
         
         .form-group input {
             padding: 1rem;
-            background-color: rgba(255, 255, 255, 0.5);
-            border: 1px solid rgba(79, 195, 247, 0.5);
-            border-radius: 25px;
+            border: 2px solid var(--border);
+            border-radius: 12px;
             font-size: 1rem;
-            color: #333333;
-            outline: none;
             transition: all 0.3s ease;
         }
         
         .form-group input:focus {
-            background-color: rgba(255, 255, 255, 0.7);
-            border-color: #0277bd;
-            box-shadow: 0 0 10px rgba(79, 195, 247, 0.3);
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+        
+        .btn-success {
+            background: var(--secondary);
+            color: white;
+        }
+        
+        .btn-success:hover {
+            background: #0da271;
+            transform: translateY(-2px);
+        }
+        
+        .btn-danger {
+            background: var(--danger);
+            color: white;
+        }
+        
+        .btn-danger:hover {
+            background: #dc2626;
+            transform: translateY(-2px);
         }
         
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(20px); }
             to { opacity: 1; transform: translateY(0); }
-        }
-        
-        /* 底部信息栏 */
-        .footer-info {
-            position: fixed;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            background: rgba(255, 255, 255, 0.3);
-            padding: 0.5rem 1rem;
-            backdrop-filter: blur(10px);
-            border-top: 1px solid rgba(79, 195, 247, 0.3);
-            font-size: 0.75rem;
-            color: #333333;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 0.5rem;
-            z-index: 1000;
         }
         
         @media (max-width: 768px) {
@@ -3944,35 +3908,122 @@ async function renderAdminPage(db, request, clientIP, ipSession) {
                 gap: 1.5rem;
             }
             
-            .header {
-                padding: 1rem;
-                flex-direction: column;
-                text-align: center;
-            }
-            
             .stats-grid {
                 grid-template-columns: 1fr;
             }
+            
+            .header {
+                padding: 1rem;
+            }
+            
+            .header-content {
+                flex-direction: column;
+                gap: 1rem;
+                text-align: center;
+            }
+        }
+        
+        /* 快照样式 */
+        .snapshot-item {
+            padding: 1rem;
+            border: 2px solid var(--border);
+            border-radius: 12px;
+            margin-bottom: 1rem;
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+        
+        .snapshot-item:hover {
+            border-color: var(--primary);
+            transform: translateX(8px);
+        }
+        
+        .snapshot-title {
+            font-weight: 600;
+            color: var(--text);
+            margin-bottom: 0.5rem;
+        }
+        
+        .snapshot-date {
+            color: var(--text-light);
+            font-size: 0.875rem;
+        }
+        
+        /* 模态框 */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+        }
+        
+        .modal-content {
+            background: var(--surface);
+            padding: 2.5rem;
+            border-radius: 24px;
+            width: 100%;
+            max-width: 500px;
+            box-shadow: var(--shadow);
+        }
+        
+        .modal-close {
+            position: absolute;
+            top: 1rem;
+            right: 1rem;
+            background: none;
+            border: none;
+            font-size: 1.5rem;
+            cursor: pointer;
+            color: var(--text-light);
+        }
+        
+        .danger-modal .modal-content {
+            border-top: 6px solid var(--danger);
+        }
+        
+        .danger-title {
+            color: var(--danger);
+            text-align: center;
+            margin-bottom: 1.5rem;
+        }
+        
+        .confirm-input {
+            width: 100%;
+            padding: 1rem;
+            border: 2px solid var(--border);
+            border-radius: 12px;
+            margin-bottom: 1.5rem;
+            text-align: center;
+            font-weight: 600;
         }
     </style>
 </head>
 <body>
     <div class="header">
-        <div class="class-info">
-            <h1>${settingMap.site_title || '2314班综合评分系统'}
-                <span class="admin-badge">管理员模式</span>
-            </h1>
-            <div>系统管理面板</div>
-        </div>
-        <div class="header-actions">
-            <a href="/class" class="btn">📊 班级视图</a>
-            <button class="btn btn-danger" onclick="logout()">🚪 退出登录</button>
+        <div class="header-content">
+            <div class="class-info">
+                <h1>${settingMap.site_title || '2314班综合评分系统'}
+                    <span class="admin-badge">管理员模式</span>
+                </h1>
+                <div>系统管理面板</div>
+            </div>
+            <div>
+                <a href="/class" class="btn btn-primary">📊 班级视图</a>
+                <button class="btn btn-primary" onclick="logout()">🚪 退出登录</button>
+            </div>
         </div>
     </div>
 
     <div class="main-content">
         <!-- 统计信息 -->
-        <div class="card">
+        <div class="card card-full">
             <div class="card-title">📈 系统概览</div>
             <div class="stats-grid">
                 <div class="stat-card">
@@ -3986,10 +4037,6 @@ async function renderAdminPage(db, request, clientIP, ipSession) {
                 <div class="stat-card">
                     <div class="stat-number">${studentsData.students.reduce((acc, s) => acc + s.minus_score, 0)}</div>
                     <div class="stat-label">总扣分</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-number">${studentsData.students.reduce((acc, s) => acc + s.total_score, 0)}</div>
-                    <div class="stat-label">总分合计</div>
                 </div>
             </div>
         </div>
@@ -4015,12 +4062,14 @@ async function renderAdminPage(db, request, clientIP, ipSession) {
                     <input type="password" name="class_password" value="${settingMap.class_password || ''}" required>
                 </div>
                 <div class="form-group">
+                    <label>管理员账号</label>
+                    <input type="text" value="2314admin" readonly disabled style="background: var(--background);">
+                </div>
+                <div class="form-group">
                     <label>管理员密码</label>
                     <input type="password" name="admin_password" value="${settingMap.admin_password || ''}" required>
                 </div>
-                <button type="submit" class="btn" style="background: linear-gradient(45deg, #10b981, #34d399); color: white; width: 100%;">
-                    💾 保存设置
-                </button>
+                <button type="submit" class="btn btn-success">💾 保存设置</button>
             </form>
         </div>
 
@@ -4028,21 +4077,37 @@ async function renderAdminPage(db, request, clientIP, ipSession) {
         <div class="card">
             <div class="card-title">🔧 系统管理</div>
             <div style="display: flex; flex-direction: column; gap: 1rem;">
-                <button class="btn" onclick="createSnapshot()">
+                <button class="btn btn-primary" onclick="createSnapshot()">
                     💾 保存快照
                 </button>
-                <button class="btn" onclick="window.open('/snapshots', '_blank')">
-                    📊 查看历史数据
+                <button class="btn btn-primary" onclick="showSnapshots()">
+                    📈 查看历史快照
                 </button>
-                <button class="btn btn-danger" onclick="resetScores()">
+                <button class="btn btn-danger" onclick="showResetConfirm()">
                     🔄 重置当前分数
+                </button>
+                <button class="btn btn-danger" onclick="showClearConfirm()">
+                    🗑️ 清空所有数据
                 </button>
             </div>
         </div>
 
-        <!-- 操作日志 -->
+        <!-- 最近快照 -->
         <div class="card">
-            <div class="card-title">📋 最近操作</div>
+            <div class="card-title">📸 最近快照</div>
+            <div>
+                ${(snapshots.results || []).length > 0 ? (snapshots.results || []).map(snapshot => `
+                    <div class="snapshot-item" onclick="viewSnapshot('${snapshot.title}')">
+                        <div class="snapshot-title">${snapshot.title}</div>
+                        <div class="snapshot-date">${new Date(snapshot.snapshot_date).toLocaleString('zh-CN')}</div>
+                    </div>
+                `).join('') : '<div style="text-align: center; color: var(--text-light); padding: 2rem;">暂无快照</div>'}
+            </div>
+        </div>
+
+        <!-- 操作日志 -->
+        <div class="card card-full">
+            <div class="card-title">📋 最近操作日志</div>
             <div class="table-container">
                 <table class="data-table">
                     <thead>
@@ -4052,19 +4117,69 @@ async function renderAdminPage(db, request, clientIP, ipSession) {
                             <th>操作类型</th>
                             <th>分数变化</th>
                             <th>操作教师</th>
+                            <th>备注</th>
+                            <th>IP地址</th>
                         </tr>
                     </thead>
                     <tbody>
-                        <!-- 动态加载 -->
+                        ${(logs.results || []).map(log => `
+                            <tr>
+                                <td>${new Date(log.created_at).toLocaleString('zh-CN')}</td>
+                                <td>${log.student_name}</td>
+                                <td>
+                                    <span style="padding: 0.25rem 0.75rem; border-radius: 20px; font-size: 0.875rem; background: ${log.action_type === 'add' ? 'var(--secondary)' : log.action_type === 'minus' ? 'var(--danger)' : 'var(--warning)'}; color: white;">
+                                        ${log.action_type === 'add' ? '加分' : log.action_type === 'minus' ? '扣分' : '撤销'}
+                                    </span>
+                                </td>
+                                <td class="${log.score_change > 0 ? 'positive' : 'negative'}">
+                                    ${log.score_change > 0 ? '+' : ''}${log.score_change}
+                                </td>
+                                <td>${log.operator}</td>
+                                <td>${log.note || '-'}</td>
+                                <td>${log.ip_address || '-'}</td>
+                            </tr>
+                        `).join('')}
                     </tbody>
                 </table>
             </div>
         </div>
     </div>
 
-    <div class="footer-info">
-        <div style="flex: 1; text-align: center;">
-            <span>By 2314 刘沁熙 | 基于Cloudflare Worker搭建 | Cloudflare CDN提供加速服务</span>
+    <!-- 重置确认模态框 -->
+    <div class="modal-overlay" id="resetModal">
+        <div class="modal-content danger-modal">
+            <button class="modal-close" onclick="closeResetModal()">×</button>
+            <h2 class="danger-title">⚠️ 重置分数确认</h2>
+            <p style="text-align: center; margin-bottom: 1.5rem; color: var(--text);">
+                确定要重置所有学生的分数吗？此操作不可撤销！
+            </p>
+            <div class="form-group">
+                <label>请输入确认密码：</label>
+                <input type="password" id="resetPassword" class="confirm-input" placeholder="请输入管理员密码确认">
+            </div>
+            <div style="display: flex; gap: 1rem;">
+                <button class="btn cancel-btn" style="flex: 1;" onclick="closeResetModal()">取消</button>
+                <button class="btn btn-danger" style="flex: 1;" onclick="resetScores()">确认重置</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 清空数据确认模态框 -->
+    <div class="modal-overlay" id="clearModal">
+        <div class="modal-content danger-modal">
+            <button class="modal-close" onclick="closeClearModal()">×</button>
+            <h2 class="danger-title">🚨 清空数据确认</h2>
+            <p style="text-align: center; margin-bottom: 1.5rem; color: var(--text);">
+                警告：这将清空所有数据（包括历史记录）！确定要继续吗？
+            </p>
+            <div class="form-group">
+                <label>请输入"确认清空"：</label>
+                <input type="text" id="clearConfirm" class="confirm-input" placeholder="请输入'确认清空'">
+            </div>
+            <div style="display: flex; gap: 1rem;">
+                <button class="btn cancel-btn" style="flex: 1;" onclick="closeClearModal()">取消</button>
+                <button class="btn btn-danger" style="flex: 1;" onclick="clearAllData()">确认清空</button>
+            </div>
         </div>
     </div>
 
@@ -4111,6 +4226,7 @@ async function renderAdminPage(db, request, clientIP, ipSession) {
                 
                 if (result.success) {
                     alert('快照保存成功！');
+                    location.reload();
                 } else {
                     alert('保存失败');
                 }
@@ -4119,26 +4235,98 @@ async function renderAdminPage(db, request, clientIP, ipSession) {
             }
         }
 
+        // 查看快照
+        function viewSnapshot(title) {
+            window.open(\`/snapshot-view?title=\${encodeURIComponent(title)}\`, '_blank');
+        }
+
+        // 显示所有快照
+        function showSnapshots() {
+            window.open('/snapshots', '_blank');
+        }
+
+        // 显示重置确认模态框
+        function showResetConfirm() {
+            document.getElementById('resetModal').style.display = 'flex';
+        }
+
+        // 关闭重置确认模态框
+        function closeResetModal() {
+            document.getElementById('resetModal').style.display = 'none';
+        }
+
+        // 显示清空确认模态框
+        function showClearConfirm() {
+            document.getElementById('clearModal').style.display = 'flex';
+        }
+
+        // 关闭清空确认模态框
+        function closeClearModal() {
+            document.getElementById('clearModal').style.display = 'none';
+        }
+
         // 重置分数
         async function resetScores() {
-            if (!confirm('确定要重置所有学生的分数吗？此操作不可撤销！')) return;
+            const password = document.getElementById('resetPassword').value;
+            
+            // 验证密码
+            const adminPassword = '${settingMap.admin_password || ''}';
+            if (password !== adminPassword) {
+                alert('密码错误！');
+                return;
+            }
+
+            if (!confirm('最后一次确认：确定要重置所有学生的分数吗？此操作不可撤销！')) return;
             
             try {
                 const response = await fetch('/api/reset', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' }
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ confirm: true })
                 });
                 
                 const result = await response.json();
                 
                 if (result.success) {
                     alert('分数重置成功！');
+                    closeResetModal();
                     location.reload();
                 } else {
                     alert('重置失败');
                 }
             } catch (error) {
                 alert('网络错误，请重试');
+            }
+        }
+
+        // 清空所有数据
+        async function clearAllData() {
+            const confirmText = document.getElementById('clearConfirm').value;
+            
+            if (confirmText !== '确认清空') {
+                alert('请输入正确的确认文本！');
+                return;
+            }
+
+            if (!confirm('🚨 这是最后一次警告：此操作将永久删除所有数据！确定要继续吗？')) return;
+            
+            try {
+                // 先重置分数
+                await fetch('/api/reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ confirm: true })
+                });
+                
+                // 清空快照
+                // 清空IP会话
+                // 这里需要扩展API，暂时先重置分数
+                
+                alert('所有数据已清空');
+                closeClearModal();
+                location.reload();
+            } catch (error) {
+                alert('操作失败');
             }
         }
 
@@ -4152,42 +4340,13 @@ async function renderAdminPage(db, request, clientIP, ipSession) {
             }
         }
 
-        // 加载操作日志
-        async function loadLogs() {
-            try {
-                const response = await fetch('/api/logs?limit=10');
-                const result = await response.json();
-                
-                if (result.success && result.logs) {
-                    const tbody = document.querySelector('.data-table tbody');
-                    tbody.innerHTML = '';
-                    
-                    result.logs.forEach(log => {
-                        const row = document.createElement('tr');
-                        row.innerHTML = \`
-                            <td>\${new Date(log.created_at).toLocaleString('zh-CN')}</td>
-                            <td>\${log.student_name || '系统'}</td>
-                            <td>
-                                <span style="padding: 0.25rem 0.5rem; border-radius: 12px; font-size: 0.75rem; background: \${log.action_type === 'add' ? '#10b981' : log.action_type === 'minus' ? '#ef4444' : log.action_type === 'login' ? '#0277bd' : '#f59e0b'}; color: white;">
-                                    \${log.action_type === 'add' ? '加分' : log.action_type === 'minus' ? '扣分' : log.action_type === 'login' ? '登录' : '撤销'}
-                                </span>
-                            </td>
-                            <td class="\${log.score_change > 0 ? 'positive' : 'negative'}">
-                                \${log.score_change > 0 ? '+' : ''}\${log.score_change}
-                            </td>
-                            <td>\${log.operator || '系统'}</td>
-                        \`;
-                        tbody.appendChild(row);
-                    });
-                }
-            } catch (error) {
-                console.error('加载日志失败:', error);
-            }
-        }
-
-        // 页面加载完成
-        document.addEventListener('DOMContentLoaded', function() {
-            loadLogs();
+        // 点击模态框外部关闭
+        document.getElementById('resetModal').addEventListener('click', function(e) {
+            if (e.target === this) closeResetModal();
+        });
+        
+        document.getElementById('clearModal').addEventListener('click', function(e) {
+            if (e.target === this) closeClearModal();
         });
     </script>
 </body>
@@ -4205,17 +4364,29 @@ async function renderAdminPage(db, request, clientIP, ipSession) {
 // 渲染访客页面
 async function renderVisitorPage(db) {
   try {
-    const studentsData = await handleGetStudents(db).then(r => r.json());
+    const rankingData = await handleGetRanking(db).then(r => r.json());
     const settings = await db.prepare(
       'SELECT key, value FROM settings WHERE key IN (?, ?)'
     ).bind('site_title', 'class_name').all();
-    
-    const wallpaper = await getBingWallpaper();
 
     const settingMap = {};
     (settings.results || []).forEach(row => {
       settingMap[row.key] = row.value;
     });
+
+    // 获取必应壁纸
+    let bingWallpaper = null;
+    try {
+      const bingResponse = await fetch('https://tc.ilqx.dpdns.org/api/bing/wallpaper');
+      if (bingResponse.ok) {
+        const bingData = await bingResponse.json();
+        if (bingData.status && bingData.data && bingData.data.length > 0) {
+          bingWallpaper = bingData.data[0];
+        }
+      }
+    } catch (error) {
+      console.error('Failed to fetch Bing wallpaper:', error);
+    }
 
     // 完整的访客页面HTML
     const html = `
@@ -4231,139 +4402,112 @@ async function renderVisitorPage(db) {
             font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
         }
         
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #10b981;
+            --danger: #ef4444;
+            --background: #f8fafc;
+            --surface: #ffffff;
+            --text: #1e293b;
+            --text-light: #64748b;
+            --border: #e2e8f0;
+            --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+        }
+        
         body { 
-            background: #e0f7fa;
+            background: var(--background); 
+            color: var(--text);
             min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            position: relative;
-            overflow-x: hidden;
-        }
-        
-        body::after {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-image: url('${wallpaper}');
-            background-size: cover;
-            background-position: center;
-            filter: blur(8px);
-            z-index: -2;
-        }
-        
-        body::before {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(45deg, rgba(79, 195, 247, 0.2), rgba(176, 196, 222, 0.2));
-            z-index: -1;
         }
         
         .header { 
-            background: rgba(255, 255, 255, 0.3);
-            padding: 2rem 1rem;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); 
+            color: white; 
+            padding: 2rem 1rem; 
             text-align: center;
-            backdrop-filter: blur(10px);
-            border-bottom: 1px solid rgba(79, 195, 247, 0.3);
+            box-shadow: var(--shadow);
         }
         
         .header h1 { 
-            color: #0277bd;
+            font-weight: 700; 
             margin-bottom: 0.5rem;
-            text-shadow: 0 0 5px rgba(79, 195, 247, 0.3);
             font-size: 2rem;
         }
         
         .header .subtitle {
-            color: #333333;
             opacity: 0.9;
             margin-bottom: 1rem;
         }
         
         .login-prompt { 
-            text-align: center;
-            padding: 2rem 1rem;
-            background: rgba(255, 255, 255, 0.3);
+            text-align: center; 
+            padding: 2rem 1rem; 
+            background: var(--surface);
             margin: 1rem;
-            border-radius: 15px;
-            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
-            backdrop-filter: blur(5px);
-            border: 1px solid rgba(79, 195, 247, 0.3);
+            border-radius: 16px;
+            box-shadow: var(--shadow);
             animation: slideInUp 0.5s ease;
         }
         
-        .login-prompt:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 12px 40px rgba(79, 195, 247, 0.5), 0 0 20px rgba(176, 196, 222, 0.3);
-        }
-        
         .login-btn { 
-            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
-            color: #333333;
-            padding: 1rem 2rem;
-            border: none;
-            border-radius: 25px;
-            text-decoration: none;
-            display: inline-block;
-            font-weight: bold;
-            transition: all 0.3s ease;
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark)); 
+            color: white; 
+            padding: 1rem 2rem; 
+            border: none; 
+            border-radius: 12px; 
+            text-decoration: none; 
+            display: inline-block; 
             margin-top: 1rem;
-            box-shadow: 0 4px 12px rgba(79, 195, 247, 0.3);
+            font-weight: 600;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+            cursor: pointer;
         }
         
         .login-btn:hover {
-            background: linear-gradient(45deg, #29b6f6, #4fc3f7);
             transform: translateY(-2px);
-            box-shadow: 0 8px 20px rgba(79, 195, 247, 0.4);
+            box-shadow: 0 8px 20px rgba(99, 102, 241, 0.4);
         }
         
         .ranking-table { 
-            width: 100%;
-            border-collapse: separate;
+            width: 100%; 
+            border-collapse: separate; 
             border-spacing: 0;
-            background: rgba(255, 255, 255, 0.3);
-            border-radius: 15px;
+            background: var(--surface);
+            border-radius: 16px;
             overflow: hidden;
-            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
-            backdrop-filter: blur(5px);
-            border: 1px solid rgba(79, 195, 247, 0.3);
+            box-shadow: var(--shadow);
             margin: 1rem 0;
             animation: fadeIn 0.6s ease;
         }
         
         .ranking-table th, .ranking-table td { 
-            padding: 1.25rem 1rem;
-            text-align: center;
-            border-bottom: 1px solid rgba(79, 195, 247, 0.3);
+            padding: 1.25rem 1rem; 
+            text-align: center; 
+            border-bottom: 1px solid var(--border);
             transition: all 0.2s ease;
         }
         
         .ranking-table th { 
-            background: rgba(255, 255, 255, 0.2);
-            font-weight: 600;
-            color: #333333;
+            background: var(--background); 
+            font-weight: 600; 
+            color: var(--text-light);
         }
         
         .ranking-table tr:last-child td { 
-            border-bottom: none;
+            border-bottom: none; 
         }
         
         .ranking-table tr:hover td {
-            background: rgba(255, 255, 255, 0.2);
+            background: var(--background);
             transform: scale(1.02);
         }
         
         .container { 
-            padding: 1rem;
-            max-width: 600px;
-            margin: 0 auto;
-            flex: 1;
+            padding: 1rem; 
+            max-width: 600px; 
+            margin: 0 auto; 
         }
         
         .section-title {
@@ -4371,8 +4515,7 @@ async function renderVisitorPage(db) {
             font-weight: 700;
             margin: 2rem 0 1rem;
             text-align: center;
-            color: #0277bd;
-            text-shadow: 0 0 5px rgba(79, 195, 247, 0.3);
+            color: var(--text);
         }
         
         .rank-badge {
@@ -4382,45 +4525,27 @@ async function renderVisitorPage(db) {
             width: 2rem;
             height: 2rem;
             border-radius: 50%;
-            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
-            color: #333333;
+            background: var(--primary);
+            color: white;
             font-weight: 700;
             font-size: 0.875rem;
             transition: all 0.3s ease;
-            box-shadow: 0 4px 12px rgba(79, 195, 247, 0.3);
-        }
-        
-        .rank-badge:hover {
-            transform: scale(1.1) rotate(5deg);
         }
         
         .rank-1 { 
-            background: linear-gradient(45deg, #f59e0b, #fbbf24);
+            background: linear-gradient(135deg, #f59e0b, #d97706);
             box-shadow: 0 4px 12px rgba(245, 158, 11, 0.3);
         }
         .rank-2 { 
-            background: linear-gradient(45deg, #6b7280, #9ca3af);
+            background: linear-gradient(135deg, #6b7280, #4b5563);
             box-shadow: 0 4px 12px rgba(107, 114, 128, 0.3);
         }
         .rank-3 { 
-            background: linear-gradient(45deg, #92400e, #b45309);
+            background: linear-gradient(135deg, #92400e, #78350f);
             box-shadow: 0 4px 12px rgba(146, 64, 14, 0.3);
         }
         
-        .positive { color: #10b981; font-weight: 600; }
-        .negative { color: #ef4444; font-weight: 600; }
-        .total { color: #0277bd; font-weight: 700; }
-        
-        .footer {
-            background: rgba(255, 255, 255, 0.3);
-            padding: 1rem;
-            text-align: center;
-            backdrop-filter: blur(10px);
-            border-top: 1px solid rgba(79, 195, 247, 0.3);
-            margin-top: auto;
-            color: #333333;
-            font-size: 0.875rem;
-        }
+        .total { color: var(--primary); font-weight: 700; }
         
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(20px); }
@@ -4445,9 +4570,58 @@ async function renderVisitorPage(db) {
                 padding: 1rem 0.5rem;
             }
         }
+        
+        /* 背景图片样式 */
+        .background-container {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: -1;
+            overflow: hidden;
+        }
+        
+        .background-image {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            filter: brightness(0.7);
+        }
+        
+        .background-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.3);
+        }
+        
+        .background-caption {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            color: white;
+            font-size: 0.75rem;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            max-width: 80%;
+            text-align: right;
+        }
     </style>
 </head>
 <body>
+    <!-- 背景图片 -->
+    <div class="background-container">
+        ${bingWallpaper ? `
+            <img src="https://www.bing.com${bingWallpaper.url}" alt="${bingWallpaper.title || '必应每日壁纸'}" class="background-image">
+            <div class="background-overlay"></div>
+            <div class="background-caption">${bingWallpaper.copyright || ''}</div>
+        ` : ''}
+    </div>
+    
     <div class="header">
         <h1>${settingMap.site_title || '2314班综合评分系统'}</h1>
         <div class="subtitle">${settingMap.class_name || '2314班'} - 访客视图</div>
@@ -4455,8 +4629,11 @@ async function renderVisitorPage(db) {
     
     <div class="container">
         <div class="login-prompt">
-            <p style="font-size: 1.1rem; margin-bottom: 1rem; color: #333333;">查看完整功能请登录系统</p>
-            <a href="/login" class="login-btn">🔐 立即登录</a>
+            <p style="font-size: 1.1rem; margin-bottom: 1rem; color: var(--text);">查看完整功能请登录系统</p>
+            <button class="login-btn" onclick="window.location.href='/login'">🔐 立即登录</button>
+            <p style="margin-top: 1.5rem; font-size: 0.875rem; color: var(--text-light);">
+                By 2314 刘沁熙 基于cloudflare worker搭建 cloudflare cdn提供加速服务
+            </p>
         </div>
         
         <div class="section-title">🏆 学生评分总榜</div>
@@ -4470,10 +4647,10 @@ async function renderVisitorPage(db) {
                 </tr>
             </thead>
             <tbody>
-                ${studentsData.success ? (studentsData.students || []).map((student, index) => `
+                ${rankingData.success ? (rankingData.ranking || []).slice(0, 20).map((student, index) => `
                     <tr>
                         <td>
-                            <div class="rank-badge ${index < 3 ? `rank-${index + 1}` : ''}">
+                            <div class="rank-badge ${index < 3 ? \`rank-\${index + 1}\` : ''}">
                                 ${index + 1}
                             </div>
                         </td>
@@ -4485,10 +4662,6 @@ async function renderVisitorPage(db) {
                 `).join('') : '<tr><td colspan="3" style="text-align: center; padding: 2rem;">加载中...</td></tr>'}
             </tbody>
         </table>
-    </div>
-    
-    <div class="footer">
-        <p>By 2314 刘沁熙 | 基于Cloudflare Worker搭建 | Cloudflare CDN提供加速服务</p>
     </div>
 </body>
 </html>
@@ -4502,466 +4675,175 @@ async function renderVisitorPage(db) {
   }
 }
 
-// 渲染日志页面
-async function renderLogsPage(db, url) {
+// 渲染快照列表页面
+async function renderSnapshotsPage(db, request, ipSession) {
   try {
-    const studentId = url.searchParams.get('studentId');
-    const wallpaper = await getBingWallpaper();
-    
-    let logs;
-    if (studentId) {
-      logs = await db.prepare(`
-        SELECT ol.*, s.name as student_name 
-        FROM operation_logs ol
-        LEFT JOIN students s ON ol.student_id = s.id
-        WHERE ol.student_id = ?
-        ORDER BY ol.created_at DESC
-        LIMIT 100
-      `).bind(studentId).all();
-    } else {
-      logs = await db.prepare(`
-        SELECT ol.*, s.name as student_name 
-        FROM operation_logs ol
-        LEFT JOIN students s ON ol.student_id = s.id
-        WHERE ol.student_id != 0
-        ORDER BY ol.created_at DESC
-        LIMIT 100
-      `).all();
+    // 检查IP会话
+    if (!ipSession.authenticated) {
+      return Response.redirect(new URL('/login', request.url));
     }
 
-    const students = await db.prepare('SELECT id, name FROM students ORDER BY name').all();
-
-    // 完整的日志页面HTML
-    const html = `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>操作日志 - 班级评分系统</title>
-    <style>
-        * { 
-            margin: 0; padding: 0; box-sizing: border-box; 
-            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
-        }
-        
-        body { 
-            background: #e0f7fa;
-            min-height: 100vh;
-            position: relative;
-            overflow-x: hidden;
-        }
-        
-        body::after {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-image: url('${wallpaper}');
-            background-size: cover;
-            background-position: center;
-            filter: blur(8px);
-            z-index: -2;
-        }
-        
-        body::before {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(45deg, rgba(79, 195, 247, 0.2), rgba(176, 196, 222, 0.2));
-            z-index: -1;
-        }
-        
-        .header {
-            background: rgba(255, 255, 255, 0.3);
-            padding: 1rem 2rem;
-            backdrop-filter: blur(10px);
-            border-bottom: 1px solid rgba(79, 195, 247, 0.3);
-        }
-        
-        .header-content {
-            max-width: 1200px;
-            margin: 0 auto;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 1rem;
-        }
-        
-        .back-btn {
-            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
-            color: #333333;
-            padding: 0.75rem 1.5rem;
-            border-radius: 25px;
-            text-decoration: none;
-            font-weight: bold;
-            transition: all 0.3s ease;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-        
-        .back-btn:hover {
-            background: linear-gradient(45deg, #29b6f6, #4fc3f7);
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(79, 195, 247, 0.4);
-        }
-        
-        .container {
-            max-width: 1200px;
-            margin: 2rem auto;
-            padding: 0 1rem;
-        }
-        
-        .filters {
-            background: rgba(255, 255, 255, 0.3);
-            padding: 1.5rem;
-            border-radius: 15px;
-            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
-            backdrop-filter: blur(5px);
-            border: 1px solid rgba(79, 195, 247, 0.3);
-            margin-bottom: 2rem;
-            display: flex;
-            gap: 1rem;
-            align-items: center;
-            flex-wrap: wrap;
-        }
-        
-        select, button {
-            padding: 0.75rem 1rem;
-            background-color: rgba(255, 255, 255, 0.5);
-            border: 1px solid rgba(79, 195, 247, 0.5);
-            border-radius: 25px;
-            font-size: 1rem;
-            color: #333333;
-            outline: none;
-            transition: all 0.3s ease;
-        }
-        
-        button {
-            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
-            border: none;
-            cursor: pointer;
-            font-weight: bold;
-        }
-        
-        button:hover {
-            background: linear-gradient(45deg, #29b6f6, #4fc3f7);
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(79, 195, 247, 0.4);
-        }
-        
-        .log-table {
-            width: 100%;
-            background: rgba(255, 255, 255, 0.3);
-            border-radius: 15px;
-            overflow: hidden;
-            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
-            backdrop-filter: blur(5px);
-            border: 1px solid rgba(79, 195, 247, 0.3);
-        }
-        
-        .log-table th, .log-table td {
-            padding: 1rem;
-            text-align: left;
-            border-bottom: 1px solid rgba(79, 195, 247, 0.3);
-        }
-        
-        .log-table th {
-            background: rgba(255, 255, 255, 0.2);
-            font-weight: 600;
-            color: #333333;
-            position: sticky;
-            top: 0;
-            backdrop-filter: blur(10px);
-        }
-        
-        .log-table tr:hover td {
-            background: rgba(255, 255, 255, 0.2);
-        }
-        
-        .positive { color: #10b981; font-weight: 600; }
-        .negative { color: #ef4444; font-weight: 600; }
-        
-        @media (max-width: 768px) {
-            .header-content {
-                flex-direction: column;
-                text-align: center;
-            }
-            
-            .filters {
-                flex-direction: column;
-            }
-            
-            select, button {
-                width: 100%;
-            }
-            
-            .log-table {
-                font-size: 0.9rem;
-            }
-            
-            .log-table th, .log-table td {
-                padding: 0.75rem 0.5rem;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div class="header-content">
-            <h1 style="color: #0277bd; margin: 0;">操作日志</h1>
-            <a href="/class" class="back-btn">← 返回班级视图</a>
-        </div>
-    </div>
-    
-    <div class="container">
-        <div class="filters">
-            <select id="studentFilter">
-                <option value="">所有学生</option>
-                ${(students.results || []).map(s => `
-                    <option value="${s.id}" ${studentId == s.id ? 'selected' : ''}>${s.name}</option>
-                `).join('')}
-            </select>
-            <button onclick="filterLogs()">筛选</button>
-            <button onclick="clearFilter()">清除筛选</button>
-        </div>
-        
-        <table class="log-table">
-            <thead>
-                <tr>
-                    <th>时间</th>
-                    <th>学生</th>
-                    <th>操作类型</th>
-                    <th>分数变化</th>
-                    <th>操作教师</th>
-                    <th>项目</th>
-                    <th>备注</th>
-                    <th>IP地址</th>
-                </tr>
-            </thead>
-            <tbody>
-                ${(logs.results || []).map(log => `
-                    <tr>
-                        <td>${new Date(log.created_at).toLocaleString('zh-CN')}</td>
-                        <td>${log.student_name || '系统'}</td>
-                        <td>
-                            <span style="padding: 0.25rem 0.5rem; border-radius: 12px; font-size: 0.75rem; background: ${log.action_type === 'add' ? '#10b981' : log.action_type === 'minus' ? '#ef4444' : log.action_type === 'login' ? '#0277bd' : '#f59e0b'}; color: white;">
-                                ${log.action_type === 'add' ? '加分' : log.action_type === 'minus' ? '扣分' : log.action_type === 'login' ? '登录' : '撤销'}
-                            </span>
-                        </td>
-                        <td class="${log.score_change > 0 ? 'positive' : 'negative'}">
-                            ${log.score_change > 0 ? '+' : ''}${log.score_change}
-                        </td>
-                        <td>${log.operator || '系统'}</td>
-                        <td>${log.category_name || '-'}</td>
-                        <td>${log.note || '-'}</td>
-                        <td style="font-size: 0.75rem;">${log.ip_address || '-'}</td>
-                    </tr>
-                `).join('')}
-            </tbody>
-        </table>
-    </div>
-    
-    <script>
-        function filterLogs() {
-            const studentId = document.getElementById('studentFilter').value;
-            let url = '/logs';
-            if (studentId) {
-                url += \`?studentId=\${studentId}\`;
-            }
-            window.location.href = url;
-        }
-        
-        function clearFilter() {
-            window.location.href = '/logs';
-        }
-    </script>
-</body>
-</html>
-    `;
-    
-    return new Response(html, {
-      headers: { 'Content-Type': 'text/html; charset=utf-8' }
-    });
-  } catch (error) {
-    return renderErrorPage('日志页面加载失败: ' + error.message);
-  }
-}
-
-// 渲染快照列表页面
-async function renderSnapshotsPage(db) {
-  try {
     const snapshots = await db.prepare(
-      'SELECT DISTINCT snapshot_time, title, month FROM monthly_snapshots ORDER BY snapshot_time DESC'
+      'SELECT DISTINCT title, snapshot_date FROM monthly_snapshots ORDER BY snapshot_date DESC'
     ).all();
-    
-    const wallpaper = await getBingWallpaper();
 
-    // 快照列表页面HTML
+    const settings = await db.prepare(
+      'SELECT key, value FROM settings WHERE key IN (?, ?)'
+    ).bind('site_title', 'class_name').all();
+
+    const settingMap = {};
+    (settings.results || []).forEach(row => {
+      settingMap[row.key] = row.value;
+    });
+
     const html = `
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>历史快照 - 班级评分系统</title>
+    <title>历史快照 - ${settingMap.site_title || '班级评分系统'}</title>
     <style>
         * { 
             margin: 0; padding: 0; box-sizing: border-box; 
             font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
         }
         
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #10b981;
+            --danger: #ef4444;
+            --background: #f8fafc;
+            --surface: #ffffff;
+            --text: #1e293b;
+            --text-light: #64748b;
+            --border: #e2e8f0;
+            --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+        }
+        
         body { 
-            background: #e0f7fa;
+            background: var(--background); 
+            color: var(--text);
             min-height: 100vh;
-            position: relative;
-            overflow-x: hidden;
         }
         
-        body::after {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-image: url('${wallpaper}');
-            background-size: cover;
-            background-position: center;
-            filter: blur(8px);
-            z-index: -2;
+        .header { 
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); 
+            color: white; 
+            padding: 1.5rem 2rem; 
+            box-shadow: var(--shadow);
         }
         
-        body::before {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(45deg, rgba(79, 195, 247, 0.2), rgba(176, 196, 222, 0.2));
-            z-index: -1;
-        }
-        
-        .header {
-            background: rgba(255, 255, 255, 0.3);
-            padding: 1rem 2rem;
-            backdrop-filter: blur(10px);
-            border-bottom: 1px solid rgba(79, 195, 247, 0.3);
-        }
-        
-        .header-content {
+        .header-content { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center;
             max-width: 1200px;
             margin: 0 auto;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 1rem;
         }
         
-        .back-btn {
-            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
-            color: #333333;
+        .class-info h1 { 
+            font-weight: 700; 
+            margin-bottom: 0.5rem; 
+        }
+        
+        .btn {
             padding: 0.75rem 1.5rem;
-            border-radius: 25px;
-            text-decoration: none;
-            font-weight: bold;
+            border: none;
+            border-radius: 12px;
+            font-weight: 600;
+            cursor: pointer;
             transition: all 0.3s ease;
-            display: flex;
+            text-decoration: none;
+            display: inline-flex;
             align-items: center;
             gap: 0.5rem;
         }
         
-        .back-btn:hover {
-            background: linear-gradient(45deg, #29b6f6, #4fc3f7);
+        .btn-primary {
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border: 1px solid rgba(255,255,255,0.3);
+        }
+        
+        .btn-primary:hover {
+            background: rgba(255,255,255,0.3);
             transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(79, 195, 247, 0.4);
         }
         
         .container {
             max-width: 1200px;
-            margin: 2rem auto;
-            padding: 0 1rem;
-        }
-        
-        .section-title {
-            font-size: 2rem;
-            font-weight: 700;
-            margin-bottom: 2rem;
-            color: #0277bd;
-            text-shadow: 0 0 5px rgba(79, 195, 247, 0.3);
-            text-align: center;
+            margin: 0 auto;
+            padding: 2rem;
         }
         
         .snapshots-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
             gap: 1.5rem;
+            margin-top: 2rem;
         }
         
         .snapshot-card {
-            background: rgba(255, 255, 255, 0.3);
-            border-radius: 15px;
+            background: var(--surface);
+            border-radius: 16px;
             padding: 1.5rem;
-            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
-            backdrop-filter: blur(5px);
-            border: 1px solid rgba(79, 195, 247, 0.3);
+            box-shadow: var(--shadow);
             transition: all 0.3s ease;
             cursor: pointer;
+            border: 2px solid transparent;
         }
         
         .snapshot-card:hover {
             transform: translateY(-8px);
-            box-shadow: 0 25px 50px -12px rgba(79, 195, 247, 0.5);
+            box-shadow: 0 20px 40px -12px rgba(0, 0, 0, 0.25);
+            border-color: var(--primary);
         }
         
         .snapshot-title {
             font-size: 1.25rem;
             font-weight: 700;
+            color: var(--text);
             margin-bottom: 0.5rem;
-            color: #0277bd;
         }
         
-        .snapshot-time {
-            color: #333333;
-            opacity: 0.8;
-            font-size: 0.9rem;
+        .snapshot-date {
+            color: var(--text-light);
+            font-size: 0.875rem;
             margin-bottom: 1rem;
         }
         
-        .snapshot-month {
-            background: rgba(79, 195, 247, 0.2);
-            padding: 0.25rem 0.75rem;
-            border-radius: 12px;
+        .snapshot-info {
+            display: flex;
+            justify-content: space-between;
             font-size: 0.875rem;
-            color: #0277bd;
-            display: inline-block;
+            color: var(--text-light);
         }
         
         .empty-state {
             text-align: center;
-            padding: 3rem;
-            color: #333333;
-            opacity: 0.8;
-            grid-column: 1 / -1;
+            padding: 4rem 2rem;
+            color: var(--text-light);
         }
         
         @media (max-width: 768px) {
-            .header-content {
-                flex-direction: column;
-                text-align: center;
+            .container {
+                padding: 1rem;
             }
             
             .snapshots-grid {
                 grid-template-columns: 1fr;
+            }
+            
+            .header {
+                padding: 1rem;
+            }
+            
+            .header-content {
+                flex-direction: column;
+                gap: 1rem;
+                text-align: center;
             }
         }
     </style>
@@ -4969,34 +4851,46 @@ async function renderSnapshotsPage(db) {
 <body>
     <div class="header">
         <div class="header-content">
-            <h1 style="color: #0277bd; margin: 0;">历史快照</h1>
-            <a href="/class" class="back-btn">← 返回班级视图</a>
+            <div class="class-info">
+                <h1>📊 历史快照</h1>
+                <div>${settingMap.site_title || '班级评分系统'}</div>
+            </div>
+            <div>
+                <a href="/class" class="btn btn-primary">← 返回评分系统</a>
+            </div>
         </div>
     </div>
-    
+
     <div class="container">
-        <div class="section-title">📊 历史数据快照</div>
+        <h2 style="color: var(--text);">历史数据快照</h2>
+        <p style="color: var(--text-light); margin-bottom: 2rem;">点击快照查看详细数据</p>
         
-        <div class="snapshots-grid">
-            ${snapshots.results && snapshots.results.length > 0 ? snapshots.results.map(snapshot => `
-                <div class="snapshot-card" onclick="viewSnapshot('${snapshot.snapshot_time}')">
-                    <div class="snapshot-title">${snapshot.title || '未命名快照'}</div>
-                    <div class="snapshot-time">${new Date(snapshot.snapshot_time).toLocaleString('zh-CN')}</div>
-                    <div class="snapshot-month">${snapshot.month}</div>
-                </div>
-            `).join('') : `
-                <div class="empty-state">
-                    <h3>暂无历史快照</h3>
-                    <p>快照功能可以保存当前时间点的所有学生分数数据</p>
-                    <p>请在班级视图中使用"保存快照"功能创建第一个快照</p>
-                </div>
-            `}
-        </div>
+        ${(snapshots.results || []).length > 0 ? `
+            <div class="snapshots-grid">
+                ${(snapshots.results || []).map(snapshot => `
+                    <div class="snapshot-card" onclick="viewSnapshot('${snapshot.title}')">
+                        <div class="snapshot-title">${snapshot.title}</div>
+                        <div class="snapshot-date">${new Date(snapshot.snapshot_date).toLocaleString('zh-CN')}</div>
+                        <div class="snapshot-info">
+                            <span>点击查看详情</span>
+                            <span>📊</span>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        ` : `
+            <div class="empty-state">
+                <div style="font-size: 3rem; margin-bottom: 1rem;">📭</div>
+                <h3>暂无历史快照</h3>
+                <p>还没有保存过任何快照数据</p>
+                <a href="/class" class="btn" style="background: var(--primary); color: white; margin-top: 1rem;">返回系统保存快照</a>
+            </div>
+        `}
     </div>
-    
+
     <script>
-        function viewSnapshot(snapshotTime) {
-            window.open(\`/snapshot-view?snapshot_time=\${encodeURIComponent(snapshotTime)}\`, '_blank');
+        function viewSnapshot(title) {
+            window.open(\`/snapshot-view?title=\${encodeURIComponent(title)}\`, '_blank');
         }
     </script>
 </body>
@@ -5012,120 +4906,119 @@ async function renderSnapshotsPage(db) {
 }
 
 // 渲染快照查看页面
-async function renderSnapshotViewPage(db, url) {
+async function renderSnapshotViewPage(db, request) {
   try {
-    const snapshotTime = url.searchParams.get('snapshot_time');
+    const url = new URL(request.url);
+    const title = url.searchParams.get('title');
     
-    if (!snapshotTime) {
-      return renderErrorPage('缺少快照时间参数');
+    if (!title) {
+      return Response.redirect(new URL('/snapshots', request.url));
     }
-    
-    const [snapshotData, snapshotInfo] = await Promise.all([
-      handleGetMonthlyData({url: new URL(`http://localhost/api/monthly?snapshot_time=${snapshotTime}`)}, db).then(r => r.json()),
-      db.prepare('SELECT DISTINCT title, month FROM monthly_snapshots WHERE snapshot_time = ?').bind(snapshotTime).first()
+
+    const [snapshotData, settings] = await Promise.all([
+      handleGetMonthlyData(request, db).then(r => r.json()),
+      db.prepare('SELECT key, value FROM settings WHERE key IN (?, ?)').bind('site_title', 'class_name').all()
     ]);
-    
-    const wallpaper = await getBingWallpaper();
-    
+
+    const settingMap = {};
+    (settings.results || []).forEach(row => {
+      settingMap[row.key] = row.value;
+    });
+
     if (!snapshotData.success || !snapshotData.data || snapshotData.data.length === 0) {
       return renderErrorPage('快照数据不存在');
     }
 
-    // 快照查看页面HTML
+    // 按总分排序
+    const sortedData = [...(snapshotData.data || [])].sort((a, b) => b.total_score - a.total_score);
+
     const html = `
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${snapshotInfo?.title || '快照详情'} - 班级评分系统</title>
+    <title>${title} - ${settingMap.site_title || '班级评分系统'}</title>
     <style>
         * { 
             margin: 0; padding: 0; box-sizing: border-box; 
             font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
         }
         
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #10b981;
+            --danger: #ef4444;
+            --background: #f8fafc;
+            --surface: #ffffff;
+            --text: #1e293b;
+            --text-light: #64748b;
+            --border: #e2e8f0;
+            --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+        }
+        
         body { 
-            background: #e0f7fa;
+            background: var(--background); 
+            color: var(--text);
             min-height: 100vh;
-            position: relative;
-            overflow-x: hidden;
         }
         
-        body::after {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-image: url('${wallpaper}');
-            background-size: cover;
-            background-position: center;
-            filter: blur(8px);
-            z-index: -2;
+        .header { 
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); 
+            color: white; 
+            padding: 1.5rem 2rem; 
+            box-shadow: var(--shadow);
         }
         
-        body::before {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(45deg, rgba(79, 195, 247, 0.2), rgba(176, 196, 222, 0.2));
-            z-index: -1;
-        }
-        
-        .header {
-            background: rgba(255, 255, 255, 0.3);
-            padding: 1rem 2rem;
-            backdrop-filter: blur(10px);
-            border-bottom: 1px solid rgba(79, 195, 247, 0.3);
-        }
-        
-        .header-content {
+        .header-content { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center;
             max-width: 1200px;
             margin: 0 auto;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 1rem;
         }
         
-        .back-btn {
-            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
-            color: #333333;
+        .class-info h1 { 
+            font-weight: 700; 
+            margin-bottom: 0.5rem; 
+        }
+        
+        .btn {
             padding: 0.75rem 1.5rem;
-            border-radius: 25px;
-            text-decoration: none;
-            font-weight: bold;
+            border: none;
+            border-radius: 12px;
+            font-weight: 600;
+            cursor: pointer;
             transition: all 0.3s ease;
-            display: flex;
+            text-decoration: none;
+            display: inline-flex;
             align-items: center;
             gap: 0.5rem;
         }
         
-        .back-btn:hover {
-            background: linear-gradient(45deg, #29b6f6, #4fc3f7);
+        .btn-primary {
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border: 1px solid rgba(255,255,255,0.3);
+        }
+        
+        .btn-primary:hover {
+            background: rgba(255,255,255,0.3);
             transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(79, 195, 247, 0.4);
         }
         
         .container {
             max-width: 1200px;
-            margin: 2rem auto;
-            padding: 0 1rem;
+            margin: 0 auto;
+            padding: 2rem;
         }
         
         .snapshot-header {
-            background: rgba(255, 255, 255, 0.3);
-            border-radius: 15px;
+            background: var(--surface);
+            border-radius: 16px;
             padding: 2rem;
-            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
-            backdrop-filter: blur(5px);
-            border: 1px solid rgba(79, 195, 247, 0.3);
+            box-shadow: var(--shadow);
             margin-bottom: 2rem;
             text-align: center;
         }
@@ -5133,48 +5026,40 @@ async function renderSnapshotViewPage(db, url) {
         .snapshot-title {
             font-size: 2rem;
             font-weight: 700;
+            color: var(--text);
             margin-bottom: 0.5rem;
-            color: #0277bd;
-            text-shadow: 0 0 5px rgba(79, 195, 247, 0.3);
         }
         
-        .snapshot-meta {
-            color: #333333;
-            opacity: 0.8;
-            display: flex;
-            justify-content: center;
-            gap: 2rem;
-            flex-wrap: wrap;
-            margin-top: 1rem;
+        .snapshot-date {
+            color: var(--text-light);
+            font-size: 1rem;
         }
         
         .data-table {
             width: 100%;
-            background: rgba(255, 255, 255, 0.3);
-            border-radius: 15px;
+            background: var(--surface);
+            border-radius: 16px;
             overflow: hidden;
-            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
-            backdrop-filter: blur(5px);
-            border: 1px solid rgba(79, 195, 247, 0.3);
+            box-shadow: var(--shadow);
+            margin-top: 2rem;
         }
         
         .data-table th, .data-table td {
-            padding: 1rem;
-            text-align: left;
-            border-bottom: 1px solid rgba(79, 195, 247, 0.3);
+            padding: 1.25rem 1rem;
+            text-align: center;
+            border-bottom: 1px solid var(--border);
         }
         
         .data-table th {
-            background: rgba(255, 255, 255, 0.2);
+            background: var(--background);
             font-weight: 600;
-            color: #333333;
+            color: var(--text-light);
             position: sticky;
             top: 0;
-            backdrop-filter: blur(10px);
         }
         
         .data-table tr:hover td {
-            background: rgba(255, 255, 255, 0.2);
+            background: var(--background);
         }
         
         .rank-badge {
@@ -5184,39 +5069,39 @@ async function renderSnapshotViewPage(db, url) {
             width: 2rem;
             height: 2rem;
             border-radius: 50%;
-            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
-            color: #333333;
+            background: var(--primary);
+            color: white;
             font-weight: 700;
             font-size: 0.875rem;
-            box-shadow: 0 4px 12px rgba(79, 195, 247, 0.3);
         }
         
         .rank-1 { 
-            background: linear-gradient(45deg, #f59e0b, #fbbf24);
-            box-shadow: 0 4px 12px rgba(245, 158, 11, 0.3);
+            background: linear-gradient(135deg, #f59e0b, #d97706);
         }
         .rank-2 { 
-            background: linear-gradient(45deg, #6b7280, #9ca3af);
-            box-shadow: 0 4px 12px rgba(107, 114, 128, 0.3);
+            background: linear-gradient(135deg, #6b7280, #4b5563);
         }
         .rank-3 { 
-            background: linear-gradient(45deg, #92400e, #b45309);
-            box-shadow: 0 4px 12px rgba(146, 64, 14, 0.3);
+            background: linear-gradient(135deg, #92400e, #78350f);
         }
         
-        .add-score { color: #10b981; font-weight: 600; }
-        .minus-score { color: #ef4444; font-weight: 600; }
-        .total-score { color: #0277bd; font-weight: 700; }
+        .add-score { color: var(--secondary); font-weight: 600; }
+        .minus-score { color: var(--danger); font-weight: 600; }
+        .total-score { color: var(--primary); font-weight: 700; }
         
         @media (max-width: 768px) {
-            .header-content {
-                flex-direction: column;
-                text-align: center;
+            .container {
+                padding: 1rem;
             }
             
-            .snapshot-meta {
+            .header {
+                padding: 1rem;
+            }
+            
+            .header-content {
                 flex-direction: column;
-                gap: 0.5rem;
+                gap: 1rem;
+                text-align: center;
             }
             
             .data-table {
@@ -5224,7 +5109,37 @@ async function renderSnapshotViewPage(db, url) {
             }
             
             .data-table th, .data-table td {
-                padding: 0.75rem 0.5rem;
+                padding: 1rem 0.5rem;
+            }
+        }
+        
+        .print-btn {
+            background: var(--secondary);
+            color: white;
+            margin-left: 1rem;
+        }
+        
+        .print-btn:hover {
+            background: #0da271;
+        }
+        
+        @media print {
+            .header, .btn {
+                display: none;
+            }
+            
+            .container {
+                padding: 0;
+            }
+            
+            .snapshot-header {
+                box-shadow: none;
+                border: 1px solid var(--border);
+            }
+            
+            .data-table {
+                box-shadow: none;
+                border: 1px solid var(--border);
             }
         }
     </style>
@@ -5232,50 +5147,64 @@ async function renderSnapshotViewPage(db, url) {
 <body>
     <div class="header">
         <div class="header-content">
-            <h1 style="color: #0277bd; margin: 0;">快照详情</h1>
-            <a href="/snapshots" class="back-btn">← 返回快照列表</a>
+            <div class="class-info">
+                <h1>📊 快照详情</h1>
+                <div>${settingMap.site_title || '班级评分系统'}</div>
+            </div>
+            <div>
+                <a href="/snapshots" class="btn btn-primary">← 返回快照列表</a>
+                <button class="btn print-btn" onclick="window.print()">
+                    🖨️ 打印
+                </button>
+            </div>
         </div>
     </div>
-    
+
     <div class="container">
         <div class="snapshot-header">
-            <div class="snapshot-title">${snapshotInfo?.title || '历史快照'}</div>
-            <div class="snapshot-meta">
-                <span>📅 时间: ${new Date(snapshotTime).toLocaleString('zh-CN')}</span>
-                <span>📊 月份: ${snapshotInfo?.month || '未知'}</span>
-                <span>👥 学生数: ${snapshotData.data.length}</span>
+            <div class="snapshot-title">${title}</div>
+            <div class="snapshot-date">
+                快照时间: ${snapshotData.data && snapshotData.data[0] ? new Date(snapshotData.data[0].snapshot_date).toLocaleString('zh-CN') : '未知时间'}
             </div>
         </div>
         
-        <div style="overflow-x: auto;">
-            <table class="data-table">
-                <thead>
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th width="80">排名</th>
+                    <th>姓名</th>
+                    <th width="120">加分</th>
+                    <th width="120">扣分</th>
+                    <th width="120">总分</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${sortedData.map((item, index) => `
                     <tr>
-                        <th width="80">排名</th>
-                        <th>姓名</th>
-                        <th width="120">加分</th>
-                        <th width="120">扣分</th>
-                        <th width="120">总分</th>
+                        <td>
+                            <div class="rank-badge ${index < 3 ? \`rank-\${index + 1}\` : ''}">
+                                ${index + 1}
+                            </div>
+                        </td>
+                        <td>${item.student_name}</td>
+                        <td class="add-score">${item.add_score}</td>
+                        <td class="minus-score">${item.minus_score}</td>
+                        <td class="total-score">${item.total_score > 0 ? '+' : ''}${item.total_score}</td>
                     </tr>
-                </thead>
-                <tbody>
-                    ${snapshotData.data.map((student, index) => `
-                        <tr>
-                            <td>
-                                <div class="rank-badge ${index < 3 ? `rank-${index + 1}` : ''}">
-                                    ${index + 1}
-                                </div>
-                            </td>
-                            <td>${student.student_name}</td>
-                            <td class="add-score">${student.add_score}</td>
-                            <td class="minus-score">${student.minus_score}</td>
-                            <td class="total-score">${student.total_score > 0 ? '+' : ''}${student.total_score}</td>
-                        </tr>
-                    `).join('')}
-                </tbody>
-            </table>
-        </div>
+                `).join('')}
+            </tbody>
+        </table>
     </div>
+
+    <script>
+        // 页面加载时自动滚动到表格
+        window.addEventListener('load', () => {
+            const table = document.querySelector('.data-table');
+            if (table) {
+                table.scrollIntoView({ behavior: 'smooth' });
+            }
+        });
+    </script>
 </body>
 </html>
     `;
