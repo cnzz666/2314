@@ -5964,7 +5964,7 @@ async function renderVisitorPage(db, clientIP, userAgent) {
                 ${studentsData.success ? (studentsData.students || []).map((student, index) => `
                     <tr>
                         <td>
-                            <div class="rank-badge ${index < 3 ? \`rank-\${index + 1}\` : ''}">
+                    '<div class="rank-badge ' + (index < 3 ? 'rank-' + (index + 1) : '') + '">'
                                 ${index + 1}
                             </div>
                         </td>
