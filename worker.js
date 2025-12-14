@@ -1,9 +1,11 @@
-﻿// cloudflare-worker.js - 重构版班级评分系统
+﻿// cloudflare-worker.js - 现代化班级评分系统
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
-
+    const clientIP = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || '未知IP';
+    const userAgent = request.headers.get('User-Agent') || '未知浏览器';
+    
     try {
       // 检查数据库连接
       if (!env.DB) {
@@ -26,11 +28,11 @@ export default {
 
       // API路由
       if (path.startsWith('/api/')) {
-        return await handleAPI(request, env, url);
+        return await handleAPI(request, env, url, clientIP);
       }
 
       // 页面路由
-      return await handlePages(request, env, url);
+      return await handlePages(request, env, url, clientIP, userAgent);
     } catch (error) {
       console.error('Global Error:', error);
       return new Response(JSON.stringify({ 
@@ -90,7 +92,6 @@ async function createAllTables(db) {
       CREATE TABLE IF NOT EXISTS students (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE,
-        last_scored DATETIME DEFAULT CURRENT_TIMESTAMP,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `).run();
@@ -102,7 +103,6 @@ async function createAllTables(db) {
         name TEXT,
         type TEXT,
         weight INTEGER DEFAULT 1,
-        requires_note BOOLEAN DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `).run();
@@ -116,8 +116,6 @@ async function createAllTables(db) {
         score INTEGER,
         operator TEXT,
         note TEXT,
-        ip_address TEXT,
-        user_agent TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (student_id) REFERENCES students (id),
         FOREIGN KEY (category_id) REFERENCES score_categories (id)
@@ -132,7 +130,6 @@ async function createAllTables(db) {
         content TEXT,
         deadline DATETIME,
         created_by TEXT,
-        ip_address TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `).run();
@@ -150,13 +147,9 @@ async function createAllTables(db) {
     await db.prepare(`
       CREATE TABLE IF NOT EXISTS monthly_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        snapshot_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-        title TEXT,
         month TEXT,
-        student_name TEXT,
-        add_score INTEGER,
-        minus_score INTEGER,
-        total_score INTEGER,
+        title TEXT,
+        snapshot_data TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `).run();
@@ -166,6 +159,7 @@ async function createAllTables(db) {
       CREATE TABLE IF NOT EXISTS operation_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         student_id INTEGER,
+        student_name TEXT,
         action_type TEXT,
         score_change INTEGER,
         operator TEXT,
@@ -180,11 +174,11 @@ async function createAllTables(db) {
     // 创建IP会话表
     await db.prepare(`
       CREATE TABLE IF NOT EXISTS ip_sessions (
-        ip TEXT PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ip_address TEXT UNIQUE,
         username TEXT,
         role TEXT,
         last_login DATETIME DEFAULT CURRENT_TIMESTAMP,
-        expires DATETIME,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `).run();
@@ -213,39 +207,39 @@ async function createAllTables(db) {
     // 初始化评分类别
     const scoreCategories = [
       // 加分项
-      ['作业完成质量优秀', 'add', 1, 0],
-      ['天天练达标', 'add', 1, 0],
-      ['准时上课', 'add', 1, 0],
-      ['卫生完成优秀', 'add', 1, 0],
-      ['行为习惯良好', 'add', 1, 0],
-      ['早操出勤', 'add', 1, 0],
-      ['上课专注', 'add', 1, 0],
-      ['任务完成优秀', 'add', 1, 0],
-      ['课堂表现积极', 'add', 1, 0],
-      ['帮助同学', 'add', 1, 0],
+      ['作业完成质量优秀', 'add', 1],
+      ['天天练达标', 'add', 1],
+      ['准时上课', 'add', 1],
+      ['卫生完成优秀', 'add', 1],
+      ['行为习惯良好', 'add', 1],
+      ['早操出勤', 'add', 1],
+      ['上课专注', 'add', 1],
+      ['任务完成优秀', 'add', 1],
+      ['课堂表现积极', 'add', 1],
+      ['帮助同学', 'add', 1],
       
       // 减分项
-      ['上课违纪', 'minus', 1, 0],
-      ['作业完成质量差', 'minus', 1, 0],
-      ['天天练未达标', 'minus', 1, 0],
-      ['迟到', 'minus', 1, 0],
-      ['卫生未完成', 'minus', 1, 0],
-      ['行为习惯差', 'minus', 1, 0],
-      ['早操缺勤', 'minus', 1, 0],
-      ['上课不专注', 'minus', 1, 0],
-      ['未交/拖延作业', 'minus', 1, 0],
-      ['破坏课堂纪律', 'minus', 1, 0],
+      ['上课违纪', 'minus', 1],
+      ['作业完成质量差', 'minus', 1],
+      ['天天练未达标', 'minus', 1],
+      ['迟到', 'minus', 1],
+      ['卫生未完成', 'minus', 1],
+      ['行为习惯差', 'minus', 1],
+      ['早操缺勤', 'minus', 1],
+      ['上课不专注', 'minus', 1],
+      ['未交/拖延作业', 'minus', 1],
+      ['破坏课堂纪律', 'minus', 1],
       
-      // 其他项（需要备注）
-      ['其他加分项', 'add', 1, 1],
-      ['其他扣分项', 'minus', 1, 1]
+      // 其他项
+      ['其他（加分）', 'add', 1],
+      ['其他（扣分）', 'minus', 1]
     ];
 
-    for (const [name, type, weight, requiresNote] of scoreCategories) {
+    for (const [name, type, weight] of scoreCategories) {
       try {
         await db.prepare(
-          'INSERT OR IGNORE INTO score_categories (name, type, weight, requires_note) VALUES (?, ?, ?, ?)'
-        ).bind(name, type, weight, requiresNote).run();
+          'INSERT OR IGNORE INTO score_categories (name, type, weight) VALUES (?, ?, ?)'
+        ).bind(name, type, weight).run();
       } catch (e) {
         console.warn(`Failed to insert category ${name}:`, e.message);
       }
@@ -259,7 +253,7 @@ async function createAllTables(db) {
 }
 
 // API处理
-async function handleAPI(request, env, url) {
+async function handleAPI(request, env, url, clientIP) {
   const path = url.pathname;
 
   try {
@@ -269,17 +263,17 @@ async function handleAPI(request, env, url) {
     }
 
     if (path === '/api/login') {
-      return await handleLogin(request, env);
+      return await handleLogin(request, env, clientIP);
     } else if (path === '/api/logout') {
-      return await handleLogout(request, env.DB);
+      return await handleLogout(request, env.DB, clientIP);
     } else if (path === '/api/students') {
       return await handleGetStudents(env.DB);
     } else if (path === '/api/score') {
-      return await handleAddScore(request, env.DB);
+      return await handleAddScore(request, env.DB, clientIP);
     } else if (path === '/api/batch-score') {
-      return await handleBatchScore(request, env.DB);
+      return await handleBatchScore(request, env.DB, clientIP);
     } else if (path === '/api/revoke') {
-      return await handleRevokeScore(request, env.DB);
+      return await handleRevokeScore(request, env.DB, clientIP);
     } else if (path === '/api/tasks') {
       if (request.method === 'GET') {
         return await handleGetTasks(env.DB);
@@ -290,30 +284,36 @@ async function handleAPI(request, env, url) {
       }
     } else if (path === '/api/snapshot') {
       return await handleSnapshot(request, env.DB);
+    } else if (path === '/api/snapshots') {
+      return await handleGetSnapshots(env.DB);
+    } else if (path === '/api/snapshot-detail') {
+      return await handleGetSnapshotDetail(request, env.DB);
     } else if (path === '/api/reset') {
-      return await handleReset(request, env.DB);
+      return await handleReset(request, env.DB, clientIP);
     } else if (path === '/api/settings') {
       if (request.method === 'GET') {
         return await handleGetSettings(env.DB);
       } else if (request.method === 'POST') {
         return await handleUpdateSettings(request, env.DB);
       }
-    } else if (path === '/api/logs') {
-      return await handleGetLogs(request, env.DB);
     } else if (path === '/api/student-logs') {
       return await handleGetStudentLogs(request, env.DB);
     } else if (path === '/api/monthly') {
       return await handleGetMonthlyData(request, env.DB);
-    } else if (path === '/api/snapshots') {
-      return await handleGetSnapshots(request, env.DB);
     } else if (path === '/api/setup') {
       return await handleSetup(request, env.DB);
     } else if (path === '/api/health') {
       return await handleHealthCheck(env.DB);
-    } else if (path === '/api/check-ip') {
-      return await handleCheckIP(request, env.DB);
-    } else if (path === '/api/ranking') {
-      return await handleGetRanking(env.DB);
+    } else if (path === '/api/ip-info') {
+      return await handleIPInfo();
+    } else if (path === '/api/wallpaper') {
+      return await handleWallpaper();
+    } else if (path === '/api/check-session') {
+      return await handleCheckSession(request, env.DB, clientIP);
+    } else if (path === '/api/recent-students') {
+      return await handleGetRecentStudents(env.DB);
+    } else if (path === '/api/verify-admin') {
+      return await handleVerifyAdmin(request, env.DB);
     }
 
     return new Response(JSON.stringify({ error: 'API路径不存在' }), {
@@ -354,32 +354,111 @@ async function handleHealthCheck(db) {
   }
 }
 
-// 检查IP会话
-async function handleCheckIP(request, db) {
+// 获取IP信息
+async function handleIPInfo() {
   try {
-    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-    const userAgent = request.headers.get('User-Agent') || '';
+    const response = await fetch('https://ip.ilqx.dpdns.org/geo');
+    if (!response.ok) {
+      throw new Error('IP信息获取失败');
+    }
+    const data = await response.json();
     
-    // 检查是否有有效的IP会话
-    const session = await db.prepare(
-      'SELECT * FROM ip_sessions WHERE ip = ? AND expires > ?'
-    ).bind(ip, new Date().toISOString()).first();
+    // 转换为中文显示
+    const chineseData = {
+      ip: data.ip || '未知',
+      flag: data.flag || '🌐',
+      country: data.country === 'CN' ? '中国' : data.country,
+      countryRegion: data.countryRegion || '未知地区',
+      city: data.city || '未知城市',
+      region: data.region === 'SEA' ? '东南亚' : data.region,
+      latitude: data.latitude || '未知',
+      longitude: data.longitude || '未知',
+      asOrganization: data.asOrganization || '未知组织'
+    };
     
-    return new Response(JSON.stringify({ 
+    return new Response(JSON.stringify({
       success: true,
-      hasSession: !!session,
-      ip: ip,
-      session: session
+      data: chineseData
     }), {
       headers: { 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    console.error('Check IP error:', error);
-    return new Response(JSON.stringify({ 
-      success: false, 
-      error: '检查IP失败: ' + error.message 
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
     }), {
-      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// 获取壁纸
+async function handleWallpaper() {
+  try {
+    const response = await fetch('https://tc.ilqx.dpdns.org/api/bing/wallpaper');
+    if (!response.ok) {
+      throw new Error('壁纸获取失败');
+    }
+    const data = await response.json();
+    
+    return new Response(JSON.stringify({
+      success: true,
+      data: data.data
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// 检查会话
+async function handleCheckSession(request, db, clientIP) {
+  try {
+    const session = await validateSession(request, db);
+    if (session) {
+      return new Response(JSON.stringify({
+        success: true,
+        session
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    
+    // 检查IP会话
+    const ipSession = await db.prepare(
+      'SELECT * FROM ip_sessions WHERE ip_address = ?'
+    ).bind(clientIP).first();
+    
+    if (ipSession) {
+      return new Response(JSON.stringify({
+        success: true,
+        session: {
+          username: ipSession.username,
+          role: ipSession.role
+        },
+        fromIP: true
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    
+    return new Response(JSON.stringify({
+      success: false,
+      error: '未登录'
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
       headers: { 'Content-Type': 'application/json' }
     });
   }
@@ -388,10 +467,10 @@ async function handleCheckIP(request, db) {
 // 初始化设置处理
 async function handleSetup(request, db) {
   try {
-    const { admin_password, class_username, class_password, site_title, class_name } = await request.json();
+    const { admin_username, admin_password, class_username, class_password, site_title, class_name } = await request.json();
     
     // 验证必需字段
-    if (!class_username || !class_password) {
+    if (!admin_username || !admin_password || !class_username || !class_password) {
       return new Response(JSON.stringify({ 
         success: false, 
         error: '请填写所有必需字段' 
@@ -404,7 +483,7 @@ async function handleSetup(request, db) {
     const settings = [
       ['class_username', class_username],
       ['class_password', class_password],
-      ['admin_username', '2314admin'],
+      ['admin_username', admin_username],
       ['admin_password', admin_password],
       ['site_title', site_title || '2314班综合评分系统'],
       ['class_name', class_name || '2314班'],
@@ -435,11 +514,9 @@ async function handleSetup(request, db) {
 }
 
 // 登录处理
-async function handleLogin(request, env) {
+async function handleLogin(request, env, clientIP) {
   try {
     const { username, password } = await request.json();
-    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-    const userAgent = request.headers.get('User-Agent') || '';
     
     const settings = await env.DB.prepare(
       'SELECT key, value FROM settings WHERE key IN (?, ?, ?, ?)'
@@ -453,30 +530,38 @@ async function handleLogin(request, env) {
     let role = '';
     if (username === settingMap.class_username && password === settingMap.class_password) {
       role = 'class';
-    } else if (username === '2314admin' && password === settingMap.admin_password) {
+    } else if (username === settingMap.admin_username && password === settingMap.admin_password) {
       role = 'admin';
     }
 
     if (role) {
-      // 创建IP会话（30天有效期）
-      const expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+      const sessionId = generateSessionId();
+      const expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30天
+      const cookie = `session=${sessionId}; Path=/; HttpOnly; Expires=${expires.toUTCString()}; SameSite=Lax; Secure`;
       
+      // 存储会话信息
       await env.DB.prepare(
-        'INSERT OR REPLACE INTO ip_sessions (ip, username, role, expires) VALUES (?, ?, ?, ?)'
-      ).bind(ip, username, role, expires.toISOString()).run();
+        'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)'
+      ).bind(`session_${sessionId}`, JSON.stringify({ 
+        username, 
+        role, 
+        expires: expires.getTime() 
+      })).run();
       
-      // 记录登录日志
+      // 存储IP会话
       await env.DB.prepare(
-        'INSERT INTO operation_logs (student_id, action_type, score_change, operator, category_name, note, ip_address, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-      ).bind(0, 'login', 0, username, '系统登录', `IP: ${ip}, UA: ${userAgent.substring(0, 100)}`, ip, userAgent).run();
+        'INSERT OR REPLACE INTO ip_sessions (ip_address, username, role) VALUES (?, ?, ?)'
+      ).bind(clientIP, username, role).run();
       
       return new Response(JSON.stringify({ 
         success: true, 
         role,
-        message: '登录成功',
-        ip: ip
+        message: '登录成功'
       }), {
-        headers: { 'Content-Type': 'application/json' }
+        headers: {
+          'Content-Type': 'application/json',
+          'Set-Cookie': cookie
+        }
       });
     }
 
@@ -498,33 +583,37 @@ async function handleLogin(request, env) {
 }
 
 // 登出处理
-async function handleLogout(request, db) {
+async function handleLogout(request, db, clientIP) {
   try {
-    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+    const cookie = 'session=; Path=/; HttpOnly; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax; Secure';
     
-    // 删除IP会话
-    await db.prepare('DELETE FROM ip_sessions WHERE ip = ?').bind(ip).run();
+    // 清除IP会话
+    await db.prepare('DELETE FROM ip_sessions WHERE ip_address = ?').bind(clientIP).run();
     
     return new Response(JSON.stringify({ 
       success: true,
       message: '登出成功'
     }), {
-      headers: { 'Content-Type': 'application/json' }
+      headers: {
+        'Content-Type': 'application/json',
+        'Set-Cookie': cookie
+      }
     });
   } catch (error) {
-    console.error('Logout error:', error);
     return new Response(JSON.stringify({ 
-      success: false,
-      error: '登出失败: ' + error.message 
+      success: true,
+      message: '登出成功'
     }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' }
+      headers: {
+        'Content-Type': 'application/json',
+        'Set-Cookie': 'session=; Path=/; HttpOnly; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax; Secure'
+      }
     });
   }
 }
 
-// 获取排名数据
-async function handleGetRanking(db) {
+// 获取学生数据
+async function handleGetStudents(db) {
   try {
     const students = await db.prepare(`
       SELECT s.id, s.name, 
@@ -538,45 +627,11 @@ async function handleGetRanking(db) {
       ORDER BY total_score DESC
     `).all();
 
-    return new Response(JSON.stringify({
-      success: true,
-      ranking: students.results || []
-    }), {
-      headers: { 
-        'Content-Type': 'application/json',
-        'Cache-Control': 'no-cache'
-      }
-    });
-  } catch (error) {
-    console.error('Get ranking error:', error);
-    return new Response(JSON.stringify({ 
-      success: false,
-      error: '获取排名数据失败: ' + error.message 
-    }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-}
-
-// 获取学生数据（按最近评分时间排序）
-async function handleGetStudents(db) {
-  try {
-    const students = await db.prepare(`
-      SELECT s.id, s.name, s.last_scored,
-             COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE 0 END), 0) as add_score,
-             COALESCE(SUM(CASE WHEN sc.type = 'minus' THEN sr.score ELSE 0 END), 0) as minus_score,
-             COALESCE(SUM(CASE WHEN sc.type = 'add' THEN sr.score ELSE -sr.score END), 0) as total_score
-      FROM students s
-      LEFT JOIN score_records sr ON s.id = sr.student_id
-      LEFT JOIN score_categories sc ON sr.category_id = sc.id
-      GROUP BY s.id, s.name, s.last_scored
-      ORDER BY s.last_scored DESC, s.name ASC
-    `).all();
+    const studentsArray = students.results || [];
 
     return new Response(JSON.stringify({
       success: true,
-      students: students.results || []
+      students: studentsArray
     }), {
       headers: { 
         'Content-Type': 'application/json',
@@ -595,10 +650,41 @@ async function handleGetStudents(db) {
   }
 }
 
-// 添加分数
-async function handleAddScore(request, db) {
+// 获取最近评分的学生
+async function handleGetRecentStudents(db) {
   try {
-    const { studentId, categoryId, score, operator, note, ip, userAgent } = await request.json();
+    const recentStudents = await db.prepare(`
+      SELECT DISTINCT s.id, s.name
+      FROM score_records sr
+      JOIN students s ON sr.student_id = s.id
+      ORDER BY sr.created_at DESC
+      LIMIT 10
+    `).all();
+
+    return new Response(JSON.stringify({
+      success: true,
+      students: recentStudents.results || []
+    }), {
+      headers: { 
+        'Content-Type': 'application/json'
+      }
+    });
+  } catch (error) {
+    console.error('Get recent students error:', error);
+    return new Response(JSON.stringify({ 
+      success: false,
+      error: '获取最近学生失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// 添加分数
+async function handleAddScore(request, db, clientIP) {
+  try {
+    const { studentId, categoryId, score, operator, note, userAgent } = await request.json();
     
     // 验证必需字段
     if (!studentId || !categoryId || !score || !operator) {
@@ -610,9 +696,9 @@ async function handleAddScore(request, db) {
       });
     }
 
-    // 获取类别信息
+    // 检查是否为"其他"类别，如果是则需要备注
     const category = await db.prepare(
-      'SELECT name, type, requires_note FROM score_categories WHERE id = ?'
+      'SELECT name, type FROM score_categories WHERE id = ?'
     ).bind(categoryId).first();
     
     if (!category) {
@@ -624,30 +710,38 @@ async function handleAddScore(request, db) {
       });
     }
 
-    // 如果类别需要备注但备注为空
-    if (category.requires_note && (!note || note.trim() === '')) {
+    if ((category.name.includes('其他') || category.name.includes('自定义')) && (!note || note.trim() === '')) {
       return new Response(JSON.stringify({ 
         success: false, 
-        error: '该项目必须填写备注' 
+        error: '自定义评分必须填写备注' 
       }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
-    // 更新学生最后评分时间
-    await db.prepare(
-      'UPDATE students SET last_scored = CURRENT_TIMESTAMP WHERE id = ?'
-    ).bind(studentId).run();
+    // 获取学生姓名
+    const student = await db.prepare(
+      'SELECT name FROM students WHERE id = ?'
+    ).bind(studentId).first();
+
+    if (!student) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '学生不存在' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
     // 插入评分记录
     await db.prepare(
-      'INSERT INTO score_records (student_id, category_id, score, operator, note, ip_address, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).bind(studentId, categoryId, score, operator, note, ip, userAgent).run();
+      'INSERT INTO score_records (student_id, category_id, score, operator, note) VALUES (?, ?, ?, ?, ?)'
+    ).bind(studentId, categoryId, score, operator, note).run();
 
     // 记录操作日志
     await db.prepare(
-      'INSERT INTO operation_logs (student_id, action_type, score_change, operator, category_name, note, ip_address, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-    ).bind(studentId, category.type, category.type === 'add' ? score : -score, operator, category.name, note, ip, userAgent).run();
+      'INSERT INTO operation_logs (student_id, student_name, action_type, score_change, operator, category_name, note, ip_address, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(studentId, student.name, category.type, category.type === 'add' ? score : -score, operator, category.name, note, clientIP, userAgent || '未知').run();
 
     return new Response(JSON.stringify({ 
       success: true,
@@ -667,24 +761,23 @@ async function handleAddScore(request, db) {
   }
 }
 
-// 批量评分
-async function handleBatchScore(request, db) {
+// 批量添加分数
+async function handleBatchScore(request, db, clientIP) {
   try {
-    const { studentIds, categoryId, score, operator, note, ip, userAgent } = await request.json();
+    const { studentIds, categoryId, score, operator, note, userAgent } = await request.json();
     
     // 验证必需字段
     if (!studentIds || !Array.isArray(studentIds) || studentIds.length === 0 || !categoryId || !score || !operator) {
       return new Response(JSON.stringify({ 
         success: false, 
-        error: '缺少必需字段或学生列表为空' 
+        error: '缺少必需字段' 
       }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
-    // 获取类别信息
     const category = await db.prepare(
-      'SELECT name, type, requires_note FROM score_categories WHERE id = ?'
+      'SELECT name, type FROM score_categories WHERE id = ?'
     ).bind(categoryId).first();
     
     if (!category) {
@@ -696,32 +789,30 @@ async function handleBatchScore(request, db) {
       });
     }
 
-    // 如果类别需要备注但备注为空
-    if (category.requires_note && (!note || note.trim() === '')) {
+    if ((category.name.includes('其他') || category.name.includes('自定义')) && (!note || note.trim() === '')) {
       return new Response(JSON.stringify({ 
         success: false, 
-        error: '该项目必须填写备注' 
+        error: '自定义评分必须填写备注' 
       }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
-    // 开始事务
+    // 批量插入记录
     for (const studentId of studentIds) {
-      // 更新学生最后评分时间
-      await db.prepare(
-        'UPDATE students SET last_scored = CURRENT_TIMESTAMP WHERE id = ?'
-      ).bind(studentId).run();
+      const student = await db.prepare(
+        'SELECT name FROM students WHERE id = ?'
+      ).bind(studentId).first();
 
-      // 插入评分记录
-      await db.prepare(
-        'INSERT INTO score_records (student_id, category_id, score, operator, note, ip_address, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?)'
-      ).bind(studentId, categoryId, score, operator, note, ip, userAgent).run();
+      if (student) {
+        await db.prepare(
+          'INSERT INTO score_records (student_id, category_id, score, operator, note) VALUES (?, ?, ?, ?, ?)'
+        ).bind(studentId, categoryId, score, operator, note).run();
 
-      // 记录操作日志
-      await db.prepare(
-        'INSERT INTO operation_logs (student_id, action_type, score_change, operator, category_name, note, ip_address, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-      ).bind(studentId, category.type, category.type === 'add' ? score : -score, operator, category.name, note, ip, userAgent).run();
+        await db.prepare(
+          'INSERT INTO operation_logs (student_id, student_name, action_type, score_change, operator, category_name, note, ip_address, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(studentId, student.name, category.type, category.type === 'add' ? score : -score, operator, category.name, note, clientIP, userAgent || '未知').run();
+      }
     }
 
     return new Response(JSON.stringify({ 
@@ -743,9 +834,9 @@ async function handleBatchScore(request, db) {
 }
 
 // 撤销操作
-async function handleRevokeScore(request, db) {
+async function handleRevokeScore(request, db, clientIP) {
   try {
-    const { recordId } = await request.json();
+    const { recordId, userAgent } = await request.json();
     
     if (!recordId) {
       return new Response(JSON.stringify({ 
@@ -756,11 +847,12 @@ async function handleRevokeScore(request, db) {
       });
     }
 
-    // 获取记录信息
+    // 获取要撤销的记录
     const record = await db.prepare(`
-      SELECT sr.id, sr.student_id, sr.score, sc.type, sc.name as category_name, sr.operator, sr.note
+      SELECT sr.id, sr.student_id, sr.score, sc.type, sc.name as category_name, sr.operator, sr.note, s.name as student_name
       FROM score_records sr
       JOIN score_categories sc ON sr.category_id = sc.id
+      JOIN students s ON sr.student_id = s.id
       WHERE sr.id = ?
     `).bind(recordId).first();
 
@@ -778,9 +870,9 @@ async function handleRevokeScore(request, db) {
 
     // 记录撤销日志
     await db.prepare(
-      'INSERT INTO operation_logs (student_id, action_type, score_change, operator, category_name, note) VALUES (?, ?, ?, ?, ?, ?)'
-    ).bind(record.student_id, 'revoke', record.type === 'add' ? -record.score : record.score, 
-           record.operator, `撤销: ${record.category_name}`, `撤销操作，原备注: ${record.note}`).run();
+      'INSERT INTO operation_logs (student_id, student_name, action_type, score_change, operator, category_name, note, ip_address, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(record.student_id, record.student_name, 'revoke', record.type === 'add' ? -record.score : record.score, 
+           record.operator, `撤销: ${record.category_name}`, '撤销操作', clientIP, userAgent || '未知').run();
 
     return new Response(JSON.stringify({ 
       success: true,
@@ -793,46 +885,6 @@ async function handleRevokeScore(request, db) {
     return new Response(JSON.stringify({ 
       success: false, 
       error: '撤销失败: ' + error.message 
-    }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-}
-
-// 获取学生日志
-async function handleGetStudentLogs(request, db) {
-  try {
-    const { studentId } = Object.fromEntries(new URL(request.url).searchParams);
-    
-    if (!studentId) {
-      return new Response(JSON.stringify({ 
-        success: false, 
-        error: '缺少学生ID' 
-      }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    const logs = await db.prepare(`
-      SELECT sr.*, sc.name as category_name, sc.type as category_type
-      FROM score_records sr
-      JOIN score_categories sc ON sr.category_id = sc.id
-      WHERE sr.student_id = ?
-      ORDER BY sr.created_at DESC
-    `).bind(studentId).all();
-
-    return new Response(JSON.stringify({
-      success: true,
-      logs: logs.results || []
-    }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    console.error('Get student logs error:', error);
-    return new Response(JSON.stringify({ 
-      success: false,
-      error: '获取学生日志失败: ' + error.message 
     }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' }
@@ -868,7 +920,7 @@ async function handleGetTasks(db) {
 // 添加任务
 async function handleAddTask(request, db) {
   try {
-    const { title, content, deadline, created_by, ip } = await request.json();
+    const { title, content, deadline, created_by } = await request.json();
     
     if (!title || !content) {
       return new Response(JSON.stringify({ 
@@ -880,8 +932,8 @@ async function handleAddTask(request, db) {
     }
 
     await db.prepare(
-      'INSERT INTO tasks (title, content, deadline, created_by, ip_address) VALUES (?, ?, ?, ?, ?)'
-    ).bind(title, content, deadline, created_by, ip).run();
+      'INSERT INTO tasks (title, content, deadline, created_by) VALUES (?, ?, ?, ?)'
+    ).bind(title, content, deadline, created_by).run();
 
     return new Response(JSON.stringify({ 
       success: true,
@@ -943,13 +995,11 @@ async function handleSnapshot(request, db) {
     if (!title) {
       return new Response(JSON.stringify({ 
         success: false, 
-        error: '缺少快照标题' 
+        error: '请输入快照标题' 
       }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
-
-    const month = new Date().toISOString().slice(0, 7);
 
     // 获取当前所有学生分数
     const students = await db.prepare(`
@@ -963,12 +1013,16 @@ async function handleSnapshot(request, db) {
       GROUP BY s.id, s.name
     `).all();
 
+    const snapshotData = {
+      title,
+      timestamp: new Date().toISOString(),
+      students: students.results || []
+    };
+
     // 保存快照
-    for (const student of (students.results || [])) {
-      await db.prepare(
-        'INSERT INTO monthly_snapshots (snapshot_date, title, month, student_name, add_score, minus_score, total_score) VALUES (?, ?, ?, ?, ?, ?, ?)'
-      ).bind(new Date().toISOString(), title, month, student.name, student.add_score, student.minus_score, student.total_score).run();
-    }
+    await db.prepare(
+      'INSERT INTO monthly_snapshots (month, title, snapshot_data) VALUES (?, ?, ?)'
+    ).bind(new Date().toISOString().slice(0, 7), title, JSON.stringify(snapshotData)).run();
 
     return new Response(JSON.stringify({ 
       success: true,
@@ -989,10 +1043,10 @@ async function handleSnapshot(request, db) {
 }
 
 // 获取快照列表
-async function handleGetSnapshots(request, db) {
+async function handleGetSnapshots(db) {
   try {
     const snapshots = await db.prepare(
-      'SELECT DISTINCT title, snapshot_date FROM monthly_snapshots ORDER BY snapshot_date DESC'
+      'SELECT id, month, title, created_at FROM monthly_snapshots ORDER BY created_at DESC'
     ).all();
 
     return new Response(JSON.stringify({
@@ -1013,15 +1067,74 @@ async function handleGetSnapshots(request, db) {
   }
 }
 
-// 重置分数
-async function handleReset(request, db) {
+// 获取快照详情
+async function handleGetSnapshotDetail(request, db) {
   try {
-    const { confirm } = await request.json();
+    const { id } = Object.fromEntries(new URL(request.url).searchParams);
     
-    if (!confirm) {
+    if (!id) {
+      return new Response(JSON.stringify({ 
+        success: false,
+        error: '缺少快照ID' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    const snapshot = await db.prepare(
+      'SELECT * FROM monthly_snapshots WHERE id = ?'
+    ).bind(id).first();
+
+    if (!snapshot) {
+      return new Response(JSON.stringify({ 
+        success: false,
+        error: '快照不存在' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    return new Response(JSON.stringify({
+      success: true,
+      snapshot
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Get snapshot detail error:', error);
+    return new Response(JSON.stringify({ 
+      success: false,
+      error: '获取快照详情失败: ' + error.message 
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// 重置分数
+async function handleReset(request, db, clientIP) {
+  try {
+    const { adminUsername, adminPassword, confirm } = await request.json();
+    
+    // 验证管理员身份
+    const settings = await db.prepare(
+      'SELECT value FROM settings WHERE key = ?'
+    ).bind('admin_password').first();
+    
+    if (adminUsername !== '2314admin' || adminPassword !== (settings ? settings.value : '')) {
       return new Response(JSON.stringify({ 
         success: false, 
-        error: '需要确认操作' 
+        error: '管理员验证失败' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    
+    if (confirm !== '确认清除所有数据') {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '确认文本不正确' 
       }), {
         headers: { 'Content-Type': 'application/json' }
       });
@@ -1029,6 +1142,11 @@ async function handleReset(request, db) {
 
     await db.prepare('DELETE FROM score_records').run();
     await db.prepare('DELETE FROM operation_logs').run();
+
+    // 记录重置操作
+    await db.prepare(
+      'INSERT INTO operation_logs (student_id, student_name, action_type, score_change, operator, category_name, note, ip_address, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(0, '系统', 'reset', 0, '管理员', '系统重置', '清除所有评分数据', clientIP, '系统操作').run();
 
     return new Response(JSON.stringify({ 
       success: true,
@@ -1104,26 +1222,26 @@ async function handleUpdateSettings(request, db) {
   }
 }
 
-// 获取操作日志
-async function handleGetLogs(request, db) {
+// 获取学生操作日志
+async function handleGetStudentLogs(request, db) {
   try {
     const { studentId } = Object.fromEntries(new URL(request.url).searchParams);
     
-    let query = `
-      SELECT ol.*, s.name as student_name 
-      FROM operation_logs ol
-      JOIN students s ON ol.student_id = s.id
-    `;
-    let params = [];
-
-    if (studentId) {
-      query += ' WHERE ol.student_id = ?';
-      params.push(studentId);
+    if (!studentId) {
+      return new Response(JSON.stringify({ 
+        success: false,
+        error: '缺少学生ID' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
 
-    query += ' ORDER BY ol.created_at DESC LIMIT 100';
-
-    const logs = await db.prepare(query).bind(...params).all();
+    const logs = await db.prepare(`
+      SELECT * FROM operation_logs 
+      WHERE student_id = ? 
+      ORDER BY created_at DESC 
+      LIMIT 100
+    `).bind(studentId).all();
 
     return new Response(JSON.stringify({
       success: true,
@@ -1146,23 +1264,13 @@ async function handleGetLogs(request, db) {
 // 获取月度数据
 async function handleGetMonthlyData(request, db) {
   try {
-    const { title } = Object.fromEntries(new URL(request.url).searchParams);
-    
-    let query = 'SELECT * FROM monthly_snapshots';
-    let params = [];
-    
-    if (title) {
-      query += ' WHERE title = ?';
-      params.push(title);
-    }
-    
-    query += ' ORDER BY total_score DESC';
-
-    const data = await db.prepare(query).bind(...params).all();
+    const months = await db.prepare(
+      'SELECT DISTINCT month FROM monthly_snapshots ORDER BY month DESC'
+    ).all();
 
     return new Response(JSON.stringify({
       success: true,
-      data: data.results || []
+      months: (months.results || []).map(m => m.month)
     }), {
       headers: { 'Content-Type': 'application/json' }
     });
@@ -1178,37 +1286,43 @@ async function handleGetMonthlyData(request, db) {
   }
 }
 
-// 验证IP会话
-async function validateIPSession(request, db) {
+// 验证管理员
+async function handleVerifyAdmin(request, db) {
   try {
-    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+    const { username, password } = await request.json();
     
-    const session = await db.prepare(
-      'SELECT * FROM ip_sessions WHERE ip = ? AND expires > ?'
-    ).bind(ip, new Date().toISOString()).first();
+    const settings = await db.prepare(
+      'SELECT value FROM settings WHERE key = ?'
+    ).bind('admin_password').first();
     
-    if (session) {
-      // 更新最后登录时间
-      await db.prepare(
-        'UPDATE ip_sessions SET last_login = CURRENT_TIMESTAMP WHERE ip = ?'
-      ).bind(ip).run();
-      
-      return {
-        authenticated: true,
-        role: session.role,
-        username: session.username
-      };
+    if (username === '2314admin' && password === (settings ? settings.value : '')) {
+      return new Response(JSON.stringify({ 
+        success: true,
+        message: '验证成功'
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
     
-    return { authenticated: false };
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: '管理员验证失败' 
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
   } catch (error) {
-    console.error('Validate IP session error:', error);
-    return { authenticated: false };
+    console.error('Verify admin error:', error);
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: '验证失败: ' + error.message 
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
 }
 
 // 页面处理
-async function handlePages(request, env, url) {
+async function handlePages(request, env, url, clientIP, userAgent) {
   const path = url.pathname;
   
   try {
@@ -1216,28 +1330,25 @@ async function handlePages(request, env, url) {
       throw new Error('数据库连接不可用');
     }
 
-    // 检查IP会话
-    const ipSession = await validateIPSession(request, env.DB);
-    
     if (path === '/login') {
-      return renderLoginPage();
+      return await renderLoginPage(env.DB, request);
     } else if (path === '/class') {
-      return await renderClassPage(env.DB, request, ipSession);
+      return await renderClassPage(env.DB, request, clientIP, userAgent);
     } else if (path === '/admin') {
-      return await renderAdminPage(env.DB, request, ipSession);
+      return await renderAdminPage(env.DB, request, clientIP, userAgent);
     } else if (path === '/') {
       return await renderVisitorPage(env.DB);
-    } else if (path === '/snapshots') {
-      return await renderSnapshotsPage(env.DB, request, ipSession);
-    } else if (path === '/snapshot-view') {
-      return await renderSnapshotViewPage(env.DB, request);
     } else if (path === '/setup') {
       return renderSetupPage();
     } else if (path === '/health') {
       return await handleHealthCheck(env.DB);
+    } else if (path === '/snapshots') {
+      return await renderSnapshotsPage(env.DB, request);
+    } else if (path === '/snapshot-detail') {
+      return await renderSnapshotDetailPage(env.DB, url);
     }
 
-    return renderLoginPage();
+    return await renderLoginPage(env.DB, request);
   } catch (error) {
     console.error('Page render error:', error);
     return renderErrorPage('页面渲染错误: ' + error.message);
@@ -1249,6 +1360,37 @@ function generateSessionId() {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)))
     .map(b => b.toString(16).padStart(2, '0'))
     .join('') + Date.now().toString(36);
+}
+
+// 验证会话
+async function validateSession(request, db) {
+  try {
+    const cookieHeader = request.headers.get('Cookie');
+    if (!cookieHeader) return null;
+
+    const cookies = Object.fromEntries(
+      cookieHeader.split(';').map(c => c.trim().split('='))
+    );
+    
+    const sessionId = cookies.session;
+    if (!sessionId) return null;
+
+    const sessionData = await db.prepare(
+      'SELECT value FROM settings WHERE key = ?'
+    ).bind(`session_${sessionId}`).first();
+
+    if (!sessionData) return null;
+
+    const session = JSON.parse(sessionData.value);
+    if (session.expires < Date.now()) {
+      await db.prepare('DELETE FROM settings WHERE key = ?').bind(`session_${sessionId}`).run();
+      return null;
+    }
+    return session;
+  } catch (error) {
+    console.error('Session validation error:', error);
+    return null;
+  }
 }
 
 // 渲染错误页面
@@ -1293,239 +1435,199 @@ function renderSetupPage() {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>系统初始化 - 班级评分系统</title>
     <style>
-        * { 
-            margin: 0; padding: 0; box-sizing: border-box; 
-            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
-        }
-        
-        :root {
-            --primary: #6366f1;
-            --primary-dark: #4f46e5;
-            --secondary: #10b981;
-            --danger: #ef4444;
-            --warning: #f59e0b;
-            --background: #f8fafc;
-            --surface: #ffffff;
-            --text: #1e293b;
-            --text-light: #64748b;
-            --border: #e2e8f0;
-            --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+        html, body { 
+            height: 100%; 
+            margin: 0; 
+            overflow: auto; 
+            background-color: #e0f7fa;
+            font-family: 'Roboto', Arial, sans-serif;
         }
         
         body { 
-            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
-            min-height: 100vh; 
             display: flex; 
+            flex-direction: column; 
             align-items: center; 
-            justify-content: center;
-            padding: 1rem;
+            justify-content: center; 
+            min-height: 100vh; 
+            color: #333333;
+            background-image: url('https://www.loliapi.com/acg/');
+            background-size: cover; 
+            background-position: center; 
+            background-repeat: no-repeat;
+            position: relative;
         }
         
         .setup-container {
-            background: var(--surface); 
-            padding: 3rem; 
-            border-radius: 24px;
-            box-shadow: var(--shadow); 
-            width: 100%; 
-            max-width: 500px;
-            transform: translateY(0); 
-            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
-            position: relative;
-            overflow: hidden;
+            text-align: center; 
+            max-width: 90%;
+            padding: 30px; 
+            background-color: rgba(255, 255, 255, 0.3);
+            border-radius: 15px; 
+            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
+            backdrop-filter: blur(5px);
+            border: 1px solid rgba(79, 195, 247, 0.3);
+            transform: scale(0.5);
+            opacity: 0.5;
+            filter: blur(10px);
+            transition: transform 1s ease-out, opacity 1s ease-out, filter 1s ease-out;
         }
         
-        .setup-container::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 4px;
-            background: linear-gradient(90deg, var(--primary), var(--secondary));
+        .setup-container.loaded {
+            transform: scale(1);
+            opacity: 1;
+            filter: blur(0);
         }
         
         h1 { 
-            text-align: center; 
-            margin-bottom: 2rem; 
-            color: var(--text); 
-            font-weight: 700;
-            font-size: 2rem;
-            background: linear-gradient(135deg, var(--primary), var(--secondary));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
+            font-size: 2.5rem; 
+            margin-bottom: 20px; 
+            color: #0277bd;
+            text-shadow: 0 0 5px rgba(79, 195, 247, 0.3);
         }
         
-        .subtitle {
-            text-align: center;
-            color: var(--text-light);
-            margin-bottom: 2rem;
-            line-height: 1.6;
+        .form-group {
+            margin: 15px auto;
+            text-align: left;
+            width: 80%;
+            max-width: 300px;
         }
         
-        .input-group { 
-            margin-bottom: 1.5rem; 
-            position: relative;
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #333;
+            font-weight: bold;
         }
         
         input { 
-            width: 100%; 
-            padding: 1rem 1rem 1rem 3rem; 
-            border: 2px solid var(--border); 
-            border-radius: 12px; 
-            font-size: 1rem; 
+            margin: 5px auto;
+            padding: 12px 20px; 
+            font-size: 16px; 
+            border-radius: 25px; 
+            outline: none; 
+            display: block; 
+            width: 100%;
             transition: all 0.3s ease;
-            background: var(--surface);
-            color: var(--text);
+            background-color: rgba(255, 255, 255, 0.5);
+            border: 1px solid rgba(79, 195, 247, 0.5);
+            color: #333333;
+            text-align: center;
         }
         
         input:focus { 
-            outline: none; 
-            border-color: var(--primary); 
-            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1); 
-            transform: translateY(-2px);
-        }
-        
-        .input-icon {
-            position: absolute;
-            left: 1rem;
-            top: 50%;
-            transform: translateY(-50%);
-            color: var(--text-light);
-            transition: color 0.3s ease;
-        }
-        
-        input:focus + .input-icon {
-            color: var(--primary);
+            background-color: rgba(255, 255, 255, 0.7); 
+            border-color: #0277bd; 
+            box-shadow: 0 0 10px rgba(79, 195, 247, 0.3);
         }
         
         button { 
-            width: 100%; 
-            padding: 1rem; 
-            background: linear-gradient(135deg, var(--primary), var(--primary-dark)); 
-            color: white; 
-            border: none; 
-            border-radius: 12px; 
-            font-size: 1rem; 
-            font-weight: 600;
-            cursor: pointer; 
+            margin: 15px auto; 
+            padding: 12px 20px; 
+            font-size: 16px; 
+            border-radius: 25px; 
+            outline: none; 
+            display: block; 
+            width: 80%;
+            max-width: 300px;
             transition: all 0.3s ease;
-            position: relative;
-            overflow: hidden;
-        }
-        
-        button::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
-            transition: left 0.5s;
-        }
-        
-        button:hover::before {
-            left: 100%;
+            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
+            border: none; 
+            color: #333333; 
+            cursor: pointer; 
+            font-weight: bold; 
+            text-transform: uppercase;
+            letter-spacing: 1px;
         }
         
         button:hover { 
-            transform: translateY(-2px); 
-            box-shadow: 0 10px 25px -5px rgba(99, 102, 241, 0.4);
+            background: linear-gradient(45deg, #29b6f6, #4fc3f7);
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(79, 195, 247, 0.4);
         }
         
-        button:active {
-            transform: translateY(0);
+        #message {
+            margin-top: 20px;
+            color: #d32f2f;
+            font-weight: bold;
         }
         
-        .form-section {
-            margin-bottom: 2rem;
-            padding: 1.5rem;
-            background: var(--background);
-            border-radius: 12px;
-        }
-        
-        .form-section h3 {
-            margin-bottom: 1rem;
-            color: var(--text);
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-        
-        @media (max-width: 480px) {
+        @media (max-width: 768px) {
             .setup-container {
-                padding: 2rem 1.5rem;
+                max-width: 95%;
+                padding: 20px;
             }
             
             h1 {
-                font-size: 1.75rem;
+                font-size: 1.8rem;
+            }
+            
+            input, button {
+                width: 90%;
+                font-size: 14px;
+                padding: 10px;
             }
         }
     </style>
 </head>
 <body>
-    <div class="setup-container">
+    <div class="setup-container" id="setupContainer">
         <h1>系统初始化</h1>
-        <div class="subtitle">
-            欢迎使用班级评分系统！请先完成系统初始化设置。
+        <p>欢迎使用班级评分系统！请先完成系统初始化设置。</p>
+        
+        <div class="form-group">
+            <label>网站标题：</label>
+            <input type="text" id="site_title" placeholder="网站标题" value="2314班综合评分系统" required>
         </div>
         
-        <form id="setupForm">
-            <div class="form-section">
-                <h3>🏫 班级信息</h3>
-                <div class="input-group">
-                    <div class="input-icon">📝</div>
-                    <input type="text" id="site_title" placeholder="网站标题" value="2314班综合评分系统" required>
-                </div>
-                <div class="input-group">
-                    <div class="input-icon">👨‍🏫</div>
-                    <input type="text" id="class_name" placeholder="班级名称" value="2314班" required>
-                </div>
-            </div>
-            
-            <div class="form-section">
-                <h3>🔐 班级账号</h3>
-                <div class="input-group">
-                    <div class="input-icon">👤</div>
-                    <input type="text" id="class_username" placeholder="班级登录用户名" value="2314" required>
-                </div>
-                <div class="input-group">
-                    <div class="input-icon">🔒</div>
-                    <input type="password" id="class_password" placeholder="班级登录密码" value="hzwy2314" required>
-                </div>
-            </div>
-            
-            <div class="form-section">
-                <h3>⚡ 管理员账号</h3>
-                <div class="input-group">
-                    <div class="input-icon">👤</div>
-                    <input type="text" value="2314admin" readonly disabled style="background: var(--background);">
-                </div>
-                <div class="input-group">
-                    <div class="input-icon">🔒</div>
-                    <input type="password" id="admin_password" placeholder="管理员密码" required>
-                </div>
-            </div>
-            
-            <button type="submit">🚀 初始化系统</button>
-        </form>
+        <div class="form-group">
+            <label>班级名称：</label>
+            <input type="text" id="class_name" placeholder="班级名称" value="2314班" required>
+        </div>
         
-        <div id="message" style="margin-top: 1rem; text-align: center; color: var(--danger); font-weight: 500;"></div>
+        <div class="form-group">
+            <label>班级登录用户名：</label>
+            <input type="text" id="class_username" placeholder="班级登录用户名" value="2314" required>
+        </div>
+        
+        <div class="form-group">
+            <label>班级登录密码：</label>
+            <input type="password" id="class_password" placeholder="班级登录密码" value="hzwy2314" required>
+        </div>
+        
+        <div class="form-group">
+            <label>管理员用户名：</label>
+            <input type="text" id="admin_username" placeholder="管理员用户名" value="2314admin" required>
+        </div>
+        
+        <div class="form-group">
+            <label>管理员密码：</label>
+            <input type="password" id="admin_password" placeholder="管理员密码" value="2314admin2314admin" required>
+        </div>
+        
+        <button onclick="submitSetup()">初始化系统</button>
+        
+        <div id="message"></div>
     </div>
 
     <script>
-        document.getElementById('setupForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            
+        document.addEventListener('DOMContentLoaded', function() {
+            var container = document.getElementById('setupContainer');
+            setTimeout(function() {
+                container.classList.add('loaded');
+            }, 100);
+        });
+
+        async function submitSetup() {
             const formData = {
                 site_title: document.getElementById('site_title').value,
                 class_name: document.getElementById('class_name').value,
                 class_username: document.getElementById('class_username').value,
                 class_password: document.getElementById('class_password').value,
+                admin_username: document.getElementById('admin_username').value,
                 admin_password: document.getElementById('admin_password').value
             };
 
-            const submitBtn = e.target.querySelector('button');
+            const submitBtn = document.querySelector('button');
             const originalText = submitBtn.textContent;
             submitBtn.textContent = '初始化中...';
             submitBtn.disabled = true;
@@ -1554,7 +1656,7 @@ function renderSetupPage() {
                 submitBtn.textContent = originalText;
                 submitBtn.disabled = false;
             }
-        });
+        }
     </script>
 </body>
 </html>
@@ -1565,8 +1667,19 @@ function renderSetupPage() {
 }
 
 // 渲染登录页面
-function renderLoginPage() {
-  const html = `
+async function renderLoginPage(db, request) {
+  try {
+    // 检查是否有现有会话
+    const session = await validateSession(request, db);
+    if (session) {
+      if (session.role === 'class') {
+        return Response.redirect(new URL('/class', request.url));
+      } else if (session.role === 'admin') {
+        return Response.redirect(new URL('/admin', request.url));
+      }
+    }
+
+    const html = `
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1574,318 +1687,285 @@ function renderLoginPage() {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>班级评分系统 - 登录</title>
     <style>
-        * { 
-            margin: 0; padding: 0; box-sizing: border-box; 
-            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
-        }
-        
-        :root {
-            --primary: #6366f1;
-            --primary-dark: #4f46e5;
-            --secondary: #10b981;
-            --danger: #ef4444;
-            --warning: #f59e0b;
-            --background: #f8fafc;
-            --surface: #ffffff;
-            --text: #1e293b;
-            --text-light: #64748b;
-            --border: #e2e8f0;
-            --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+        html, body { 
+            height: 100%; 
+            margin: 0; 
+            overflow: auto; 
+            background-color: #e0f7fa;
+            font-family: 'Roboto', Arial, sans-serif;
         }
         
         body { 
-            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
-            min-height: 100vh; 
             display: flex; 
+            flex-direction: column; 
             align-items: center; 
-            justify-content: center;
-            padding: 1rem;
+            justify-content: center; 
+            min-height: 100vh; 
+            color: #333333;
+            background-image: url('https://www.loliapi.com/acg/');
+            background-size: cover; 
+            background-position: center; 
+            background-repeat: no-repeat;
+            position: relative;
         }
         
         .login-container {
-            background: var(--surface); 
-            padding: 3rem; 
-            border-radius: 24px;
-            box-shadow: var(--shadow); 
-            width: 100%; 
-            max-width: 440px;
-            transform: translateY(0); 
-            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
-            position: relative;
-            overflow: hidden;
+            text-align: center; 
+            max-width: 90%;
+            padding: 30px; 
+            background-color: rgba(255, 255, 255, 0.3);
+            border-radius: 15px; 
+            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
+            backdrop-filter: blur(5px);
+            border: 1px solid rgba(79, 195, 247, 0.3);
+            transform: scale(0.5);
+            opacity: 0.5;
+            filter: blur(10px);
+            transition: transform 1s ease-out, opacity 1s ease-out, filter 1s ease-out;
         }
         
-        .login-container::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 4px;
-            background: linear-gradient(90deg, var(--primary), var(--secondary));
-        }
-        
-        .login-container:hover { 
-            transform: translateY(-8px); 
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+        .login-container.loaded {
+            transform: scale(1);
+            opacity: 1;
+            filter: blur(0);
         }
         
         h1 { 
-            text-align: center; 
-            margin-bottom: 2rem; 
-            color: var(--text); 
-            font-weight: 700;
-            font-size: 2rem;
-            background: linear-gradient(135deg, var(--primary), var(--secondary));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
+            font-size: 2.5rem; 
+            margin-bottom: 20px; 
+            color: #0277bd;
+            text-shadow: 0 0 5px rgba(79, 195, 247, 0.3);
         }
         
-        .input-group { 
-            margin-bottom: 1.5rem; 
-            position: relative;
+        .role-select {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        
+        .role-btn {
+            padding: 10px 20px;
+            border: 2px solid rgba(79, 195, 247, 0.5);
+            background: rgba(255, 255, 255, 0.3);
+            border-radius: 25px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-weight: bold;
+        }
+        
+        .role-btn.active {
+            background: rgba(79, 195, 247, 0.5);
+            color: white;
+        }
+        
+        .role-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(79, 195, 247, 0.4);
         }
         
         input { 
-            width: 100%; 
-            padding: 1rem 1rem 1rem 3rem; 
-            border: 2px solid var(--border); 
-            border-radius: 12px; 
-            font-size: 1rem; 
+            margin: 15px auto; 
+            padding: 12px 20px; 
+            font-size: 16px; 
+            border-radius: 25px; 
+            outline: none; 
+            display: block; 
+            width: 80%;
+            max-width: 300px;
             transition: all 0.3s ease;
-            background: var(--surface);
-            color: var(--text);
+            background-color: rgba(255, 255, 255, 0.5);
+            border: 1px solid rgba(79, 195, 247, 0.5);
+            color: #333333;
+            text-align: center;
         }
         
         input:focus { 
-            outline: none; 
-            border-color: var(--primary); 
-            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1); 
-            transform: translateY(-2px);
-        }
-        
-        .input-icon {
-            position: absolute;
-            left: 1rem;
-            top: 50%;
-            transform: translateY(-50%);
-            color: var(--text-light);
-            transition: color 0.3s ease;
-        }
-        
-        input:focus + .input-icon {
-            color: var(--primary);
+            background-color: rgba(255, 255, 255, 0.7); 
+            border-color: #0277bd; 
+            box-shadow: 0 0 10px rgba(79, 195, 247, 0.3);
         }
         
         button { 
-            width: 100%; 
-            padding: 1rem; 
-            background: linear-gradient(135deg, var(--primary), var(--primary-dark)); 
-            color: white; 
-            border: none; 
-            border-radius: 12px; 
-            font-size: 1rem; 
-            font-weight: 600;
-            cursor: pointer; 
+            margin: 15px auto; 
+            padding: 12px 20px; 
+            font-size: 16px; 
+            border-radius: 25px; 
+            outline: none; 
+            display: block; 
+            width: 80%;
+            max-width: 300px;
             transition: all 0.3s ease;
-            position: relative;
-            overflow: hidden;
-        }
-        
-        button::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
-            transition: left 0.5s;
-        }
-        
-        button:hover::before {
-            left: 100%;
+            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
+            border: none; 
+            color: #333333; 
+            cursor: pointer; 
+            font-weight: bold; 
+            text-transform: uppercase;
+            letter-spacing: 1px;
         }
         
         button:hover { 
-            transform: translateY(-2px); 
-            box-shadow: 0 10px 25px -5px rgba(99, 102, 241, 0.4);
+            background: linear-gradient(45deg, #29b6f6, #4fc3f7);
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(79, 195, 247, 0.4);
         }
         
-        button:active {
-            transform: translateY(0);
+        .login-info {
+            margin-top: 20px;
+            padding: 15px;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+            font-size: 0.9rem;
         }
         
-        .role-select { 
-            display: flex; 
-            gap: 0.75rem; 
-            margin-bottom: 2rem; 
-            background: var(--background);
-            padding: 0.5rem;
-            border-radius: 12px;
+        #message {
+            margin-top: 20px;
+            color: #d32f2f;
+            font-weight: bold;
         }
         
-        .role-btn { 
-            flex: 1; 
-            padding: 0.8rem; 
-            border: 2px solid transparent; 
-            background: transparent; 
-            border-radius: 8px; 
-            cursor: pointer; 
-            transition: all 0.3s ease; 
-            text-align: center;
-            font-weight: 500;
-            color: var(--text-light);
-        }
-        
-        .role-btn.active { 
-            background: var(--surface); 
-            border-color: var(--primary);
-            color: var(--primary);
-            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.15);
-        }
-        
-        @media (max-width: 480px) {
+        @media (max-width: 768px) {
             .login-container {
-                padding: 2rem 1.5rem;
+                max-width: 95%;
+                padding: 20px;
             }
             
             h1 {
-                font-size: 1.75rem;
+                font-size: 1.8rem;
+            }
+            
+            .role-select {
+                flex-direction: column;
+                align-items: center;
+            }
+            
+            input, button {
+                width: 90%;
+                font-size: 14px;
+                padding: 10px;
             }
         }
     </style>
 </head>
 <body>
-    <div class="login-container">
+    <div class="login-container" id="loginContainer">
         <h1>班级评分系统</h1>
+        
         <div class="role-select">
             <div class="role-btn active" data-role="class">班级登录</div>
-            <div class="role-btn" data-role="admin">班主任登录</div>
             <div class="role-btn" data-role="visitor">游客登录</div>
         </div>
-        <form id="loginForm">
-            <div class="input-group">
-                <div class="input-icon">👤</div>
-                <input type="text" id="username" placeholder="用户名" required>
-            </div>
-            <div class="input-group">
-                <div class="input-icon">🔒</div>
-                <input type="password" id="password" placeholder="密码" required>
-            </div>
+        
+        <form id="loginForm" style="display: block;">
+            <input type="text" id="username" placeholder="用户名" value="2314" required>
+            <input type="password" id="password" placeholder="密码" required>
             <button type="submit">登录系统</button>
         </form>
         
-        <div id="message" style="margin-top: 1rem; text-align: center; color: var(--danger); font-weight: 500;"></div>
+        <div class="login-info">
+            <p>By 2314 刘沁熙</p>
+            <p>基于Cloudflare Worker搭建</p>
+            <p>Cloudflare CDN提供加速服务</p>
+        </div>
+        
+        <div id="message"></div>
     </div>
 
     <script>
-        let currentRole = 'class';
-        const roleCredentials = {
-            class: { username: '2314', password: '' },
-            admin: { username: '2314admin', password: '' }
-        };
-
-        document.querySelectorAll('.role-btn').forEach(btn => {
-            btn.addEventListener('click', () => {
-                document.querySelectorAll('.role-btn').forEach(b => b.classList.remove('active'));
-                btn.classList.add('active');
-                currentRole = btn.dataset.role;
-                
-                if (currentRole === 'visitor') {
-                    window.location.href = '/';
-                } else {
-                    const creds = roleCredentials[currentRole];
-                    document.getElementById('username').value = creds.username;
-                    document.getElementById('password').value = '';
-                }
-            });
-        });
-
-        // 检查IP会话
-        async function checkIPSession() {
-            try {
-                const response = await fetch('/api/check-ip');
-                const result = await response.json();
-                
-                if (result.success && result.hasSession) {
-                    // 有IP会话，自动跳转
-                    if (result.session.role === 'class') {
-                        window.location.href = '/class';
-                    } else if (result.session.role === 'admin') {
-                        window.location.href = '/admin';
+        document.addEventListener('DOMContentLoaded', function() {
+            var container = document.getElementById('loginContainer');
+            setTimeout(function() {
+                container.classList.add('loaded');
+            }, 100);
+            
+            // 设置默认密码
+            document.getElementById('password').value = 'hzwy2314';
+            
+            // 角色选择
+            document.querySelectorAll('.role-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    document.querySelectorAll('.role-btn').forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    
+                    if (btn.dataset.role === 'visitor') {
+                        window.location.href = '/';
+                    } else if (btn.dataset.role === 'class') {
+                        document.getElementById('username').value = '2314';
+                        document.getElementById('password').value = 'hzwy2314';
                     }
-                }
-            } catch (error) {
-                console.log('检查IP会话失败:', error);
-            }
-        }
-
-        // 页面加载时检查IP会话
-        checkIPSession();
-
-        document.getElementById('loginForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const username = document.getElementById('username').value;
-            const password = document.getElementById('password').value;
-
-            const submitBtn = e.target.querySelector('button');
-            const originalText = submitBtn.textContent;
-            submitBtn.textContent = '登录中...';
-            submitBtn.disabled = true;
-
-            try {
-                const response = await fetch('/api/login', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, password })
                 });
+            });
+            
+            // 表单提交
+            document.getElementById('loginForm').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const username = document.getElementById('username').value;
+                const password = document.getElementById('password').value;
 
-                const result = await response.json();
-                
-                if (result.success) {
-                    submitBtn.textContent = '登录成功!';
-                    setTimeout(() => {
-                        if (result.role === 'class') {
-                            window.location.href = '/class';
-                        } else if (result.role === 'admin') {
-                            window.location.href = '/admin';
-                        }
-                    }, 500);
-                } else {
-                    document.getElementById('message').textContent = result.error;
+                const submitBtn = e.target.querySelector('button');
+                const originalText = submitBtn.textContent;
+                submitBtn.textContent = '登录中...';
+                submitBtn.disabled = true;
+
+                try {
+                    const response = await fetch('/api/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ username, password })
+                    });
+
+                    const result = await response.json();
+                    
+                    if (result.success) {
+                        submitBtn.textContent = '登录成功!';
+                        setTimeout(() => {
+                            if (result.role === 'class') {
+                                window.location.href = '/class';
+                            } else if (result.role === 'admin') {
+                                window.location.href = '/admin';
+                            }
+                        }, 500);
+                    } else {
+                        document.getElementById('message').textContent = result.error;
+                        submitBtn.textContent = originalText;
+                        submitBtn.disabled = false;
+                    }
+                } catch (error) {
+                    document.getElementById('message').textContent = '网络错误，请重试';
                     submitBtn.textContent = originalText;
                     submitBtn.disabled = false;
                 }
-            } catch (error) {
-                document.getElementById('message').textContent = '网络错误，请重试';
-                submitBtn.textContent = originalText;
-                submitBtn.disabled = false;
-            }
+            });
         });
     </script>
 </body>
 </html>
-  `;
-  return new Response(html, {
-    headers: { 'Content-Type': 'text/html; charset=utf-8' }
-  });
+    `;
+    
+    return new Response(html, {
+      headers: { 'Content-Type': 'text/html; charset=utf-8' }
+    });
+  } catch (error) {
+    return renderErrorPage('登录页面加载失败: ' + error.message);
+  }
 }
 
 // 渲染班级页面
-async function renderClassPage(db, request, ipSession) {
+async function renderClassPage(db, request, clientIP, userAgent) {
   try {
-    // 检查IP会话或需要登录
-    if (!ipSession.authenticated || ipSession.role !== 'class') {
+    const session = await validateSession(request, db);
+    if (!session || session.role !== 'class') {
       return Response.redirect(new URL('/login', request.url));
     }
 
-    const [studentsData, scoreCategories, tasks, settings, rankingData] = await Promise.all([
+    const [studentsData, scoreCategories, tasks, settings, recentStudents] = await Promise.all([
       handleGetStudents(db).then(r => r.json()),
       db.prepare('SELECT * FROM score_categories ORDER BY type, id').all(),
       db.prepare('SELECT * FROM tasks ORDER BY created_at DESC LIMIT 10').all(),
       db.prepare('SELECT key, value FROM settings WHERE key IN (?, ?, ?)').bind('site_title', 'class_name', 'current_month').all(),
-      handleGetRanking(db).then(r => r.json())
+      handleGetRecentStudents(db).then(r => r.json())
     ]);
 
     if (!studentsData.success) {
@@ -1897,7 +1977,13 @@ async function renderClassPage(db, request, ipSession) {
       settingMap[row.key] = row.value;
     });
 
-    const currentMonth = settingMap.current_month || new Date().toISOString().slice(0, 7);
+    // 修正score_categories，将"英语老师"改为"班主任"
+    const modifiedCategories = (scoreCategories.results || []).map(cat => {
+      if (cat.operator === '英语老师') {
+        return { ...cat, operator: '班主任' };
+      }
+      return cat;
+    });
 
     // 完整的班级页面HTML
     const html = `
@@ -1908,11 +1994,6 @@ async function renderClassPage(db, request, ipSession) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${settingMap.site_title || '2314班综合评分系统'}</title>
     <style>
-        * { 
-            margin: 0; padding: 0; box-sizing: border-box; 
-            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
-        }
-        
         :root {
             --primary: #6366f1;
             --primary-dark: #4f46e5;
@@ -1924,60 +2005,88 @@ async function renderClassPage(db, request, ipSession) {
             --text: #1e293b;
             --text-light: #64748b;
             --border: #e2e8f0;
-            --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+            --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
             --shadow-lg: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+        }
+        
+        * { 
+            margin: 0; padding: 0; box-sizing: border-box; 
+            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
         }
         
         body { 
             background: var(--background); 
             color: var(--text);
             min-height: 100vh;
-            overflow-x: hidden;
+            background-size: cover;
+            background-position: center;
+            background-attachment: fixed;
+        }
+        
+        .notification-container {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 10000;
+            max-width: 350px;
+        }
+        
+        .notification {
+            background: var(--surface);
+            border-radius: 12px;
+            padding: 1rem 1.5rem;
+            margin-bottom: 1rem;
+            box-shadow: var(--shadow-lg);
+            border-left: 4px solid var(--primary);
+            animation: slideInRight 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--border);
+        }
+        
+        .notification.success { border-left-color: var(--secondary); }
+        .notification.error { border-left-color: var(--danger); }
+        .notification.warning { border-left-color: var(--warning); }
+        
+        @keyframes slideInRight {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
         }
         
         .header { 
-            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); 
-            color: white; 
-            padding: 1.5rem 2rem; 
+            background: rgba(255, 255, 255, 0.9); 
+            color: var(--text); 
+            padding: 1rem 2rem; 
             box-shadow: var(--shadow);
             position: sticky;
             top: 0;
-            z-index: 100;
+            z-index: 1000;
             backdrop-filter: blur(10px);
-        }
-        
-        .header-content { 
-            display: flex; 
-            justify-content: space-between; 
-            align-items: center; 
-            max-width: 1400px;
-            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border);
         }
         
         .class-info h1 { 
             font-weight: 700; 
-            margin-bottom: 0.5rem; 
-            font-size: 1.75rem;
-        }
-        
-        .date { 
-            font-size: 0.9rem; 
-            opacity: 0.9; 
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
+            margin-bottom: 0.25rem; 
+            font-size: 1.5rem;
+            color: var(--primary);
         }
         
         .header-actions {
             display: flex;
-            gap: 1rem;
+            gap: 0.75rem;
             align-items: center;
         }
         
         .btn {
-            padding: 0.75rem 1.5rem;
+            padding: 0.5rem 1rem;
             border: none;
-            border-radius: 12px;
+            border-radius: 8px;
             font-weight: 600;
             cursor: pointer;
             transition: all 0.3s ease;
@@ -1985,202 +2094,260 @@ async function renderClassPage(db, request, ipSession) {
             align-items: center;
             gap: 0.5rem;
             text-decoration: none;
+            font-size: 0.875rem;
         }
         
         .btn-primary {
-            background: rgba(255,255,255,0.2);
+            background: var(--primary);
             color: white;
-            border: 1px solid rgba(255,255,255,0.3);
         }
         
         .btn-primary:hover {
-            background: rgba(255,255,255,0.3);
+            background: var(--primary-dark);
             transform: translateY(-2px);
-            box-shadow: 0 8px 20px rgba(255,255,255,0.2);
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
         }
         
-        .btn-danger {
-            background: var(--danger);
-            color: white;
+        .btn-secondary {
+            background: var(--background);
+            color: var(--text);
+            border: 1px solid var(--border);
         }
         
-        .btn-danger:hover {
-            background: #dc2626;
+        .btn-secondary:hover {
+            background: var(--surface);
             transform: translateY(-2px);
-        }
-        
-        .announcement {
-            background: var(--surface); 
-            margin: 1.5rem 2rem; 
-            padding: 1.5rem; 
-            border-radius: 16px;
-            box-shadow: var(--shadow); 
-            border-left: 6px solid var(--primary);
-            animation: slideInUp 0.5s ease;
-            position: relative;
-            overflow: hidden;
-        }
-        
-        .announcement::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(99, 102, 241, 0.05), transparent);
-            transform: translateX(-100%);
-            transition: transform 0.6s ease;
-        }
-        
-        .announcement:hover::before {
-            transform: translateX(100%);
         }
         
         .main-content { 
-            display: grid; 
-            grid-template-columns: 1fr; 
-            gap: 2rem; 
-            padding: 0 2rem 2rem; 
+            padding: 2rem; 
             max-width: 1400px; 
             margin: 0 auto;
         }
         
-        .score-section { 
-            background: var(--surface); 
-            border-radius: 20px; 
-            padding: 2rem;
-            box-shadow: var(--shadow); 
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        
+        .stat-card {
+            background: var(--surface);
+            border-radius: 16px;
+            padding: 1.5rem;
+            box-shadow: var(--shadow);
             transition: all 0.3s ease;
-            animation: fadeIn 0.6s ease;
-            position: relative;
-            overflow: hidden;
+            border: 1px solid var(--border);
         }
         
-        .score-section::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 4px;
-            background: linear-gradient(90deg, var(--primary), var(--secondary));
-        }
-        
-        .score-section:hover { 
-            transform: translateY(-8px); 
+        .stat-card:hover {
+            transform: translateY(-4px);
             box-shadow: var(--shadow-lg);
         }
         
-        .section-title { 
-            font-size: 1.5rem; 
-            margin-bottom: 1.5rem; 
-            padding-bottom: 1rem;
-            border-bottom: 2px solid var(--border); 
-            color: var(--text); 
-            display: flex; 
+        .stat-title {
+            color: var(--text-light);
+            font-size: 0.875rem;
+            margin-bottom: 0.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--text);
+        }
+        
+        .rank-btn {
+            margin-top: 1rem;
+            width: 100%;
+        }
+        
+        .students-section {
+            background: var(--surface);
+            border-radius: 16px;
+            padding: 2rem;
+            box-shadow: var(--shadow);
+            margin-bottom: 2rem;
+            border: 1px solid var(--border);
+        }
+        
+        .section-header {
+            display: flex;
             justify-content: space-between;
             align-items: center;
+            margin-bottom: 1.5rem;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+        
+        .section-title {
+            font-size: 1.5rem;
             font-weight: 700;
-        }
-        
-        .student-table { 
-            width: 100%; 
-            border-collapse: separate; 
-            border-spacing: 0;
-        }
-        
-        .student-table th, .student-table td { 
-            padding: 1rem; 
-            text-align: left; 
-            border-bottom: 1px solid var(--border);
-            transition: all 0.2s ease;
-        }
-        
-        .student-table th { 
-            background: var(--background); 
-            font-weight: 600; 
-            color: var(--text-light);
-            position: sticky;
-            top: 0;
-            backdrop-filter: blur(10px);
-        }
-        
-        .student-table tr:hover td { 
-            background: var(--background); 
-            transform: scale(1.02);
-        }
-        
-        .student-table .score-cell { 
-            cursor: pointer; 
-            position: relative;
-            font-weight: 600;
-            transition: all 0.3s ease;
-        }
-        
-        .student-table .score-cell:hover { 
-            background: rgba(99, 102, 241, 0.1) !important; 
-            transform: scale(1.05);
-        }
-        
-        .add-score { 
-            color: var(--secondary); 
-            position: relative;
-            overflow: hidden;
-        }
-        
-        .add-score::before {
-            content: '+';
-            margin-right: 2px;
-        }
-        
-        .minus-score { 
-            color: var(--danger);
-            position: relative;
-            overflow: hidden;
-        }
-        
-        .minus-score::before {
-            content: '-';
-            margin-right: 2px;
-        }
-        
-        .total-score { 
-            color: var(--primary); 
-            font-weight: 700;
-            font-size: 1.1em;
-        }
-        
-        .rank-badge {
-            display: inline-flex;
+            color: var(--text);
+            display: flex;
             align-items: center;
-            justify-content: center;
-            width: 2rem;
-            height: 2rem;
-            border-radius: 50%;
+            gap: 0.75rem;
+        }
+        
+        .batch-controls {
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        .batch-btn {
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            border: 2px solid var(--border);
+            background: var(--surface);
+            color: var(--text);
+        }
+        
+        .batch-btn.active {
             background: var(--primary);
             color: white;
-            font-weight: 700;
-            font-size: 0.875rem;
+            border-color: var(--primary);
+        }
+        
+        .students-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        
+        .student-card {
+            background: var(--background);
+            border-radius: 12px;
+            padding: 1.5rem;
             transition: all 0.3s ease;
+            border: 1px solid var(--border);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .student-card:hover {
+            transform: translateY(-4px);
+            box-shadow: var(--shadow);
+            border-color: var(--primary);
+        }
+        
+        .student-card.selected {
+            border-color: var(--primary);
+            background: rgba(99, 102, 241, 0.05);
+        }
+        
+        .student-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 1rem;
+        }
+        
+        .student-name {
+            font-weight: 700;
+            font-size: 1.1rem;
+            color: var(--text);
+        }
+        
+        .student-rank {
+            background: var(--primary);
+            color: white;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 0.75rem;
+        }
+        
+        .student-scores {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }
+        
+        .score-item {
+            text-align: center;
+        }
+        
+        .score-label {
+            font-size: 0.75rem;
+            color: var(--text-light);
+            margin-bottom: 0.25rem;
+        }
+        
+        .score-value {
+            font-weight: 700;
+            font-size: 1.25rem;
+        }
+        
+        .add-score { color: var(--secondary); }
+        .minus-score { color: var(--danger); }
+        .total-score { color: var(--primary); }
+        
+        .student-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+        
+        .action-btn {
+            flex: 1;
+            padding: 0.5rem;
+            border-radius: 8px;
+            border: none;
+            font-weight: 600;
             cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 0.75rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.25rem;
         }
         
-        .rank-badge:hover {
-            transform: scale(1.1) rotate(5deg);
+        .add-btn { 
+            background: rgba(16, 185, 129, 0.1);
+            color: var(--secondary);
+            border: 1px solid rgba(16, 185, 129, 0.2);
         }
         
-        .rank-1 { 
-            background: linear-gradient(135deg, #f59e0b, #d97706);
-            box-shadow: 0 4px 12px rgba(245, 158, 11, 0.3);
+        .add-btn:hover {
+            background: rgba(16, 185, 129, 0.2);
+            transform: translateY(-2px);
         }
-        .rank-2 { 
-            background: linear-gradient(135deg, #6b7280, #4b5563);
-            box-shadow: 0 4px 12px rgba(107, 114, 128, 0.3);
+        
+        .minus-btn { 
+            background: rgba(239, 68, 68, 0.1);
+            color: var(--danger);
+            border: 1px solid rgba(239, 68, 68, 0.2);
         }
-        .rank-3 { 
-            background: linear-gradient(135deg, #92400e, #78350f);
-            box-shadow: 0 4px 12px rgba(146, 64, 14, 0.3);
+        
+        .minus-btn:hover {
+            background: rgba(239, 68, 68, 0.2);
+            transform: translateY(-2px);
+        }
+        
+        .detail-btn { 
+            background: rgba(99, 102, 241, 0.1);
+            color: var(--primary);
+            border: 1px solid rgba(99, 102, 241, 0.2);
+        }
+        
+        .detail-btn:hover {
+            background: rgba(99, 102, 241, 0.2);
+            transform: translateY(-2px);
         }
         
         /* 模态框样式 */
@@ -2202,10 +2369,10 @@ async function renderClassPage(db, request, ipSession) {
         
         .modal-content {
             background: var(--surface);
-            padding: 2.5rem;
-            border-radius: 24px;
+            padding: 2rem;
+            border-radius: 20px;
             width: 100%;
-            max-width: 600px;
+            max-width: 500px;
             animation: slideUp 0.4s cubic-bezier(0.4, 0, 0.2, 1);
             box-shadow: var(--shadow-lg);
             border: 1px solid var(--border);
@@ -2247,9 +2414,12 @@ async function renderClassPage(db, request, ipSession) {
             to { transform: translateY(0); opacity: 1; } 
         }
         
-        @keyframes slideInUp {
-            from { transform: translateY(20px); opacity: 0; }
-            to { transform: translateY(0); opacity: 1; }
+        .modal-title {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: 1.5rem;
+            color: var(--text);
+            text-align: center;
         }
         
         .input-group { 
@@ -2265,9 +2435,9 @@ async function renderClassPage(db, request, ipSession) {
         
         select, input[type="text"], input[type="number"], textarea {
             width: 100%;
-            padding: 1rem;
+            padding: 0.75rem 1rem;
             border: 2px solid var(--border);
-            border-radius: 12px;
+            border-radius: 8px;
             font-size: 1rem;
             transition: all 0.3s ease;
             background: var(--surface);
@@ -2278,72 +2448,50 @@ async function renderClassPage(db, request, ipSession) {
             outline: none;
             border-color: var(--primary);
             box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
-            transform: translateY(-2px);
         }
         
         .score-buttons { 
             display: grid; 
             grid-template-columns: repeat(3, 1fr); 
-            gap: 0.75rem; 
+            gap: 0.5rem; 
             margin: 1rem 0; 
         }
         
         .score-btn { 
-            padding: 1.5rem; 
+            padding: 1rem; 
             border: 2px solid var(--border); 
             background: var(--surface); 
-            border-radius: 16px;
+            border-radius: 8px;
             cursor: pointer; 
             transition: all 0.3s ease; 
             text-align: center;
-            font-weight: 700;
+            font-weight: 600;
             color: var(--text);
-            font-size: 1.2rem;
-            position: relative;
-            overflow: hidden;
-        }
-        
-        .score-btn::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(99, 102, 241, 0.1), transparent);
-            transition: left 0.5s;
-        }
-        
-        .score-btn:hover::before {
-            left: 100%;
         }
         
         .score-btn:hover { 
             border-color: var(--primary); 
             background: rgba(99, 102, 241, 0.05);
-            transform: translateY(-4px) scale(1.05);
-            box-shadow: 0 8px 20px rgba(99, 102, 241, 0.2);
+            transform: translateY(-2px);
         }
         
         .score-btn.selected { 
             border-color: var(--primary); 
             background: var(--primary); 
             color: white;
-            box-shadow: 0 8px 25px rgba(99, 102, 241, 0.4);
-            transform: translateY(-2px) scale(1.02);
         }
         
-        .action-buttons { 
+        .modal-actions { 
             display: flex; 
             gap: 1rem; 
             margin-top: 2rem; 
         }
         
-        .action-btn { 
+        .modal-btn { 
             flex: 1; 
-            padding: 1rem; 
+            padding: 0.75rem; 
             border: none; 
-            border-radius: 12px; 
+            border-radius: 8px; 
             cursor: pointer; 
             transition: all 0.3s ease; 
             font-weight: 600;
@@ -2361,18 +2509,6 @@ async function renderClassPage(db, request, ipSession) {
         .submit-btn:hover { 
             background: #0da271;
             transform: translateY(-2px);
-            box-shadow: 0 8px 20px rgba(16, 185, 129, 0.3);
-        }
-        
-        .revoke-btn { 
-            background: var(--danger); 
-            color: white; 
-        }
-        
-        .revoke-btn:hover { 
-            background: #dc2626;
-            transform: translateY(-2px);
-            box-shadow: 0 8px 20px rgba(239, 68, 68, 0.3);
         }
         
         .cancel-btn { 
@@ -2385,458 +2521,324 @@ async function renderClassPage(db, request, ipSession) {
             transform: translateY(-2px);
         }
         
-        /* 通知样式 */
-        .notification {
-            position: fixed;
-            top: 2rem;
-            right: 2rem;
-            padding: 1rem 1.5rem;
-            border-radius: 12px;
-            color: white;
-            font-weight: 600;
-            z-index: 10000;
-            animation: slideInRight 0.3s ease;
-            box-shadow: var(--shadow);
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-        
-        .notification.success {
-            background: var(--secondary);
-        }
-        
-        .notification.error {
-            background: var(--danger);
-        }
-        
-        .notification.info {
-            background: var(--primary);
-        }
-        
-        @keyframes slideInRight {
-            from { transform: translateX(100%); opacity: 0; }
-            to { transform: translateX(0); opacity: 1; }
-        }
-        
-        @keyframes slideOutRight {
-            from { transform: translateX(0); opacity: 1; }
-            to { transform: translateX(100%); opacity: 0; }
-        }
-        
-        /* 多选学生样式 */
-        .student-selector {
-            margin-bottom: 1.5rem;
+        .logs-container {
             max-height: 300px;
             overflow-y: auto;
-            border: 2px solid var(--border);
-            border-radius: 12px;
+            margin-top: 1rem;
+            border: 1px solid var(--border);
+            border-radius: 8px;
             padding: 1rem;
         }
         
-        .student-option {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            padding: 0.5rem;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: background 0.2s ease;
+        .log-item {
+            padding: 0.75rem;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.875rem;
         }
         
-        .student-option:hover {
-            background: var(--background);
+        .log-item:last-child {
+            border-bottom: none;
         }
         
-        .student-option.selected {
-            background: rgba(99, 102, 241, 0.1);
-            border-left: 3px solid var(--primary);
-        }
-        
-        .student-checkbox {
-            width: 1.2rem;
-            height: 1.2rem;
-            border-radius: 4px;
-            border: 2px solid var(--border);
-            cursor: pointer;
-        }
-        
-        /* IP信息弹窗 */
-        .ip-info-modal {
-            position: fixed;
-            top: 1rem;
-            right: 1rem;
-            background: var(--surface);
-            padding: 1.5rem;
-            border-radius: 16px;
-            box-shadow: var(--shadow-lg);
-            z-index: 9999;
-            max-width: 400px;
-            animation: slideInRight 0.3s ease;
-            border: 1px solid var(--border);
-        }
-        
-        .ip-info-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 1rem;
-        }
-        
-        .ip-info-close {
-            background: none;
-            border: none;
-            font-size: 1.2rem;
-            cursor: pointer;
+        .log-time {
             color: var(--text-light);
+            font-size: 0.75rem;
+            margin-bottom: 0.25rem;
         }
         
-        .ip-info-item {
-            margin-bottom: 0.75rem;
+        .log-content {
             display: flex;
             justify-content: space-between;
+            align-items: center;
         }
         
-        .ip-info-label {
+        .log-action {
+            padding: 0.25rem 0.5rem;
+            border-radius: 12px;
+            font-size: 0.75rem;
             font-weight: 600;
+        }
+        
+        .log-action.add {
+            background: rgba(16, 185, 129, 0.1);
+            color: var(--secondary);
+        }
+        
+        .log-action.minus {
+            background: rgba(239, 68, 68, 0.1);
+            color: var(--danger);
+        }
+        
+        .log-action.revoke {
+            background: rgba(245, 158, 11, 0.1);
+            color: var(--warning);
+        }
+        
+        .system-info {
+            position: fixed;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 12px;
+            padding: 1rem;
+            font-size: 0.75rem;
             color: var(--text-light);
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--border);
+            max-width: 300px;
         }
         
-        .ip-info-value {
-            color: var(--text);
-            text-align: right;
-        }
-        
-        /* 响应式设计 */
         @media (max-width: 768px) {
             .main-content { 
-                padding: 0 1rem 1rem; 
-                gap: 1.5rem;
+                padding: 1rem; 
             }
             
             .header { 
                 padding: 1rem; 
-            }
-            
-            .header-content { 
-                flex-direction: column; 
-                gap: 1rem; 
-                text-align: center; 
+                flex-direction: column;
+                gap: 1rem;
             }
             
             .header-actions {
                 width: 100%;
                 justify-content: center;
+                flex-wrap: wrap;
             }
             
-            .score-section {
-                padding: 1.5rem;
-            }
-            
-            .announcement {
-                margin: 1rem;
-            }
-            
-            .score-buttons {
-                grid-template-columns: repeat(2, 1fr);
+            .students-grid {
+                grid-template-columns: 1fr;
             }
             
             .modal-content {
                 padding: 1.5rem;
+                max-width: 95%;
             }
             
-            .ip-info-modal {
-                left: 1rem;
-                right: 1rem;
-                max-width: none;
+            .system-info {
+                position: relative;
+                bottom: auto;
+                left: auto;
+                margin: 2rem auto;
+                max-width: 100%;
             }
         }
         
-        @media (max-width: 480px) {
-            .action-buttons {
-                flex-direction: column;
-            }
-            
-            .btn {
-                padding: 0.5rem 1rem;
-                font-size: 0.875rem;
-            }
-        }
-        
-        /* 排名按钮样式 */
-        .ranking-btn {
-            background: linear-gradient(135deg, var(--primary), var(--primary-dark));
-            color: white;
-            border: none;
-            padding: 0.75rem 1.5rem;
-            border-radius: 12px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-        
-        .ranking-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 20px rgba(99, 102, 241, 0.3);
-        }
-        
-        /* 详细信息模态框 */
-        .detail-modal {
-            max-width: 800px;
-        }
-        
-        .log-item {
-            padding: 1rem;
-            border-left: 4px solid var(--primary);
-            background: var(--background);
-            border-radius: 8px;
-            margin-bottom: 1rem;
-        }
-        
-        .log-header {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 0.5rem;
-        }
-        
-        .log-time {
+        .footer {
+            text-align: center;
+            padding: 2rem;
             color: var(--text-light);
             font-size: 0.875rem;
+            margin-top: 2rem;
+            border-top: 1px solid var(--border);
         }
         
-        .log-score {
-            font-weight: 700;
-            color: var(--primary);
+        .loading {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 2rem;
         }
         
-        .log-note {
-            color: var(--text);
-            margin-top: 0.5rem;
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 3px solid var(--border);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
         }
     </style>
 </head>
 <body>
+    <div class="notification-container" id="notificationContainer"></div>
+    
     <div class="header">
-        <div class="header-content">
-            <div class="class-info">
-                <h1>${settingMap.site_title || '2314班综合评分系统'}</h1>
-                <div class="date">
-                    <span>📅</span>
-                    <span id="currentDate"></span>
-                </div>
-            </div>
-            <div class="header-actions">
-                <button class="btn btn-primary" onclick="showRankingModal()">
-                    <span>🏆</span>
-                    查看排名
-                </button>
-                <button class="btn btn-primary" onclick="createSnapshot()">
-                    <span>📸</span>
-                    保存快照
-                </button>
-                <button class="btn btn-primary" onclick="showSnapshots()">
-                    <span>📊</span>
-                    历史数据
-                </button>
-                <button class="btn btn-primary" onclick="showIPInfo()">
-                    <span>🌐</span>
-                    连接信息
-                </button>
-                <button class="btn btn-primary" onclick="logout()">
-                    <span>🚪</span>
-                    退出登录
-                </button>
+        <div class="class-info">
+            <h1>${settingMap.site_title || '2314班综合评分系统'}</h1>
+            <div style="font-size: 0.875rem; color: var(--text-light);">
+                ${settingMap.class_name || '2314班'} - 班级视图
             </div>
         </div>
-    </div>
-
-    <div class="announcement">
-        <strong>📢 系统信息：</strong> 
-        <span>By 2314 刘沁熙 基于cloudflare worker搭建 cloudflare cdn提供加速服务</span>
+        
+        <div class="header-actions">
+            <button class="btn btn-primary" onclick="createSnapshot()">
+                <span>💾</span>
+                保存快照
+            </button>
+            <a href="/snapshots" class="btn btn-secondary">
+                <span>📊</span>
+                历史数据
+            </a>
+            <button class="btn btn-secondary" onclick="showRanking()">
+                <span>🏆</span>
+                查看排名
+            </button>
+            <button class="btn btn-secondary" onclick="logout()">
+                <span>🚪</span>
+                退出登录
+            </button>
+        </div>
     </div>
 
     <div class="main-content">
-        <!-- 学生综合评分表格 -->
-        <div class="score-section">
-            <div class="section-title">
-                <span>📊 学生综合评分表</span>
-                <div style="display: flex; gap: 1rem;">
-                    <button class="ranking-btn" onclick="showRankingModal()">
-                        🏆 查看总分排名
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-title">
+                    <span>👥</span>
+                    学生总数
+                </div>
+                <div class="stat-value">${studentsData.students ? studentsData.students.length : 0}</div>
+                <button class="btn btn-primary rank-btn" onclick="showRanking()">
+                    查看排名
+                </button>
+            </div>
+            
+            <div class="stat-card">
+                <div class="stat-title">
+                    <span>📈</span>
+                    总加分
+                </div>
+                <div class="stat-value add-score">${studentsData.students ? studentsData.students.reduce((acc, s) => acc + s.add_score, 0) : 0}</div>
+            </div>
+            
+            <div class="stat-card">
+                <div class="stat-title">
+                    <span>📉</span>
+                    总扣分
+                </div>
+                <div class="stat-value minus-score">${studentsData.students ? studentsData.students.reduce((acc, s) => acc + s.minus_score, 0) : 0}</div>
+            </div>
+            
+            <div class="stat-card">
+                <div class="stat-title">
+                    <span>⚖️</span>
+                    平均分
+                </div>
+                <div class="stat-value total-score">
+                    ${studentsData.students && studentsData.students.length > 0 
+                      ? (studentsData.students.reduce((acc, s) => acc + s.total_score, 0) / studentsData.students.length).toFixed(1)
+                      : '0'}
+                </div>
+            </div>
+        </div>
+
+        <div class="students-section">
+            <div class="section-header">
+                <div class="section-title">
+                    <span>👨‍🎓</span>
+                    学生列表
+                </div>
+                
+                <div class="batch-controls">
+                    <div style="font-size: 0.875rem; color: var(--text-light);">
+                        <span id="selectedCount">0</span> 名学生已选择
+                    </div>
+                    <button class="batch-btn" onclick="toggleBatchMode()">
+                        <span>📝</span>
+                        批量评分
                     </button>
-                    <button class="btn btn-primary" onclick="showBatchScoreModal()">
-                        📝 批量评分
+                    <button class="batch-btn" onclick="clearSelection()">
+                        <span>🗑️</span>
+                        清除选择
                     </button>
                 </div>
             </div>
-            <div style="overflow-x: auto;">
-                <table class="student-table">
-                    <thead>
-                        <tr>
-                            <th width="80">选择</th>
-                            <th width="120">姓名</th>
-                            <th width="120" class="score-cell">加分</th>
-                            <th width="120" class="score-cell">扣分</th>
-                            <th width="120">总分</th>
-                            <th width="100">操作</th>
-                        </tr>
-                    </thead>
-                    <tbody id="studentsBody">
-                        ${studentsData.students.map((student, index) => `
-                            <tr>
-                                <td>
-                                    <input type="checkbox" class="student-checkbox" data-id="${student.id}" data-name="${student.name}" onchange="updateSelectedStudents()">
-                                </td>
-                                <td>
-                                    <div style="display: flex; align-items: center; gap: 0.5rem;">
-                                        <span>${student.name}</span>
-                                        <div class="rank-badge" onclick="showRankingModal()" style="cursor: pointer;">
-                                            ${rankingData.ranking.findIndex(s => s.id === student.id) + 1}
-                                        </div>
-                                    </div>
-                                </td>
-                                <td class="score-cell add-score" onclick="startScoreProcess(${student.id}, 'add', '${student.name}')">
-                                    ${student.add_score}
-                                </td>
-                                <td class="score-cell minus-score" onclick="startScoreProcess(${student.id}, 'minus', '${student.name}')">
-                                    ${student.minus_score}
-                                </td>
-                                <td class="total-score">
-                                    ${student.total_score > 0 ? '+' : ''}${student.total_score}
-                                </td>
-                                <td>
-                                    <button class="btn-primary" style="padding: 0.5rem 1rem; font-size: 0.875rem;" onclick="showStudentDetail(${student.id}, '${student.name}')">
-                                        详细
-                                    </button>
-                                </td>
-                            </tr>
-                        `).join('')}
-                    </tbody>
-                </table>
+            
+            <div style="margin-bottom: 1rem; font-size: 0.875rem; color: var(--text-light);">
+                最近评分：${recentStudents.success && recentStudents.students.length > 0 
+                  ? recentStudents.students.map(s => s.name).join('、')
+                  : '暂无'}
+            </div>
+            
+            <div class="students-grid" id="studentsGrid">
+                ${studentsData.students ? studentsData.students.map((student, index) => `
+                    <div class="student-card" data-id="${student.id}" onclick="toggleSelectStudent(${student.id}, event)">
+                        <div class="student-header">
+                            <div class="student-name">${student.name}</div>
+                            <div class="student-rank">${index + 1}</div>
+                        </div>
+                        
+                        <div class="student-scores">
+                            <div class="score-item">
+                                <div class="score-label">加分</div>
+                                <div class="score-value add-score">${student.add_score}</div>
+                            </div>
+                            <div class="score-item">
+                                <div class="score-label">扣分</div>
+                                <div class="score-value minus-score">${student.minus_score}</div>
+                            </div>
+                            <div class="score-item">
+                                <div class="score-label">总分</div>
+                                <div class="score-value total-score">${student.total_score > 0 ? '+' : ''}${student.total_score}</div>
+                            </div>
+                        </div>
+                        
+                        <div class="student-actions">
+                            <button class="action-btn add-btn" onclick="startScoreProcess(${student.id}, 'add', '${student.name}', event)">
+                                <span>➕</span>
+                                加分
+                            </button>
+                            <button class="action-btn minus-btn" onclick="startScoreProcess(${student.id}, 'minus', '${student.name}', event)">
+                                <span>➖</span>
+                                扣分
+                            </button>
+                            <button class="action-btn detail-btn" onclick="showStudentDetail(${student.id}, '${student.name}', event)">
+                                <span>📋</span>
+                                详细
+                            </button>
+                        </div>
+                    </div>
+                `).join('') : '<div class="loading"><div class="spinner"></div></div>'}
+            </div>
+            
+            <div id="batchActions" style="display: none;">
+                <div class="modal-actions">
+                    <button class="modal-btn submit-btn" onclick="startBatchScore('add')">
+                        <span>➕</span>
+                        批量加分
+                    </button>
+                    <button class="modal-btn cancel-btn" onclick="startBatchScore('minus')">
+                        <span>➖</span>
+                        批量扣分
+                    </button>
+                </div>
             </div>
         </div>
     </div>
 
-    <!-- 单个学生评分弹窗 -->
+    <!-- 评分弹窗 -->
     <div class="modal-overlay" id="scoreModal">
         <div class="modal-content">
             <button class="modal-close" onclick="closeScoreModal()">×</button>
+            <div class="modal-title" id="scoreModalTitle"></div>
             
-            <div class="step-indicator">
-                <div class="step-dot active" id="step1Dot"></div>
-                <div class="step-dot" id="step2Dot"></div>
-            </div>
-            
-            <!-- 第一步：选择分数 -->
-            <div class="step-container active" id="step1">
-                <div class="step-title">
-                    为 <span class="student-highlight" id="step1StudentName"></span> 
-                    <span id="step1ActionType"></span>
-                </div>
+            <div class="input-group">
+                <label>分值：</label>
                 <div class="score-buttons" id="scoreButtons">
                     <div class="score-btn" data-score="1">1分</div>
                     <div class="score-btn" data-score="2">2分</div>
                     <div class="score-btn" data-score="3">3分</div>
-                    <div class="score-btn" data-score="4">4分</div>
                     <div class="score-btn" data-score="5">5分</div>
+                    <div class="score-btn" data-score="10">10分</div>
                     <div class="score-btn" data-score="custom">自定义</div>
                 </div>
-                <input type="number" id="customScore" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px; margin-top: 0.5rem; display: none;" placeholder="输入自定义分值" min="1" max="100">
-                <div class="action-buttons">
-                    <button class="cancel-btn" onclick="closeScoreModal()">
-                        <span>❌</span>
-                        取消
-                    </button>
-                    <button class="submit-btn" onclick="goToStep2()">
-                        <span>➡️</span>
-                        下一步
-                    </button>
-                </div>
-            </div>
-            
-            <!-- 第二步：选择原因和教师 -->
-            <div class="step-container" id="step2">
-                <div class="step-title">
-                    选择评分项目
-                </div>
-                
-                <div class="input-group">
-                    <label>评分项目：</label>
-                    <select id="categorySelect" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;">
-                        <!-- 动态填充 -->
-                    </select>
-                </div>
-                
-                <div class="input-group">
-                    <label>操作教师：</label>
-                    <select id="operatorSelect" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;">
-                        <option value="班主任">班主任</option>
-                        <option value="语文老师">语文老师</option>
-                        <option value="数学老师">数学老师</option>
-                        <option value="英语老师">英语老师</option>
-                        <option value="政治老师">政治老师</option>
-                        <option value="历史老师">历史老师</option>
-                        <option value="物理老师">物理老师</option>
-                        <option value="化学老师">化学老师</option>
-                    </select>
-                </div>
-                
-                <div class="input-group">
-                    <label>备注说明：</label>
-                    <textarea id="scoreNote" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;" placeholder="请输入备注信息" rows="3"></textarea>
-                    <div id="noteHistory" style="margin-top: 0.5rem; display: none;">
-                        <label>历史备注：</label>
-                        <div id="noteHistoryList" style="max-height: 100px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem;"></div>
-                    </div>
-                </div>
-                
-                <div class="action-buttons">
-                    <button class="cancel-btn" onclick="goToStep1()">
-                        <span>⬅️</span>
-                        上一步
-                    </button>
-                    <button class="submit-btn" onclick="submitScore()" id="submitScoreBtn">
-                        <span>✅</span>
-                        提交评分
-                    </button>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- 批量评分弹窗 -->
-    <div class="modal-overlay" id="batchScoreModal">
-        <div class="modal-content">
-            <button class="modal-close" onclick="closeBatchScoreModal()">×</button>
-            
-            <div class="step-title">批量评分</div>
-            
-            <div class="input-group">
-                <label>选择评分类型：</label>
-                <select id="batchScoreType" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;" onchange="loadBatchCategories()">
-                    <option value="add">加分</option>
-                    <option value="minus">扣分</option>
-                </select>
+                <input type="number" id="customScore" style="width: 100%; margin-top: 0.5rem; display: none;" placeholder="输入自定义分值" min="1" max="100">
             </div>
             
             <div class="input-group">
                 <label>评分项目：</label>
-                <select id="batchCategorySelect" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;">
+                <select id="categorySelect">
                     <!-- 动态填充 -->
                 </select>
             </div>
             
             <div class="input-group">
-                <label>分值：</label>
-                <input type="number" id="batchScoreValue" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;" value="1" min="1" max="100">
-            </div>
-            
-            <div class="input-group">
                 <label>操作教师：</label>
-                <select id="batchOperatorSelect" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;">
+                <select id="operatorSelect">
                     <option value="班主任">班主任</option>
                     <option value="语文老师">语文老师</option>
                     <option value="数学老师">数学老师</option>
@@ -2850,31 +2852,120 @@ async function renderClassPage(db, request, ipSession) {
             
             <div class="input-group">
                 <label>备注说明：</label>
-                <textarea id="batchScoreNote" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;" placeholder="请输入备注信息" rows="3"></textarea>
+                <textarea id="scoreNote" rows="3" placeholder="可选备注信息，自定义评分必须填写"></textarea>
             </div>
             
-            <div class="action-buttons">
-                <button class="cancel-btn" onclick="closeBatchScoreModal()">
+            <div class="modal-actions">
+                <button class="modal-btn cancel-btn" onclick="closeScoreModal()">
                     <span>❌</span>
                     取消
                 </button>
-                <button class="submit-btn" onclick="submitBatchScore()">
+                <button class="modal-btn submit-btn" onclick="submitScore()" id="submitScoreBtn">
                     <span>✅</span>
-                    提交批量评分
+                    提交评分
                 </button>
             </div>
         </div>
     </div>
 
-    <!-- 学生详细信息弹窗 -->
-    <div class="modal-overlay" id="studentDetailModal">
-        <div class="modal-content detail-modal">
-            <button class="modal-close" onclick="closeStudentDetailModal()">×</button>
+    <!-- 批量评分弹窗 -->
+    <div class="modal-overlay" id="batchScoreModal">
+        <div class="modal-content">
+            <button class="modal-close" onclick="closeBatchScoreModal()">×</button>
+            <div class="modal-title" id="batchScoreModalTitle"></div>
             
-            <div class="step-title" id="detailTitle"></div>
+            <div class="input-group">
+                <label>已选择 <span id="batchStudentCount">0</span> 名学生</label>
+                <div style="max-height: 200px; overflow-y: auto; padding: 0.5rem; border: 1px solid var(--border); border-radius: 8px;">
+                    <div id="selectedStudentsList"></div>
+                </div>
+            </div>
             
-            <div id="studentDetailContent">
-                <!-- 动态填充 -->
+            <div class="input-group">
+                <label>分值：</label>
+                <div class="score-buttons" id="batchScoreButtons">
+                    <div class="score-btn" data-score="1">1分</div>
+                    <div class="score-btn" data-score="2">2分</div>
+                    <div class="score-btn" data-score="3">3分</div>
+                    <div class="score-btn" data-score="5">5分</div>
+                    <div class="score-btn" data-score="10">10分</div>
+                    <div class="score-btn" data-score="custom">自定义</div>
+                </div>
+                <input type="number" id="batchCustomScore" style="width: 100%; margin-top: 0.5rem; display: none;" placeholder="输入自定义分值" min="1" max="100">
+            </div>
+            
+            <div class="input-group">
+                <label>评分项目：</label>
+                <select id="batchCategorySelect">
+                    <!-- 动态填充 -->
+                </select>
+            </div>
+            
+            <div class="input-group">
+                <label>操作教师：</label>
+                <select id="batchOperatorSelect">
+                    <option value="班主任">班主任</option>
+                    <option value="语文老师">语文老师</option>
+                    <option value="数学老师">数学老师</option>
+                    <option value="英语老师">英语老师</option>
+                    <option value="政治老师">政治老师</option>
+                    <option value="历史老师">历史老师</option>
+                    <option value="物理老师">物理老师</option>
+                    <option value="化学老师">化学老师</option>
+                </select>
+            </div>
+            
+            <div class="input-group">
+                <label>备注说明：</label>
+                <textarea id="batchScoreNote" rows="3" placeholder="可选备注信息，自定义评分必须填写"></textarea>
+            </div>
+            
+            <div class="modal-actions">
+                <button class="modal-btn cancel-btn" onclick="closeBatchScoreModal()">
+                    <span>❌</span>
+                    取消
+                </button>
+                <button class="modal-btn submit-btn" onclick="submitBatchScore()" id="submitBatchScoreBtn">
+                    <span>✅</span>
+                    批量提交
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 学生详情弹窗 -->
+    <div class="modal-overlay" id="detailModal">
+        <div class="modal-content">
+            <button class="modal-close" onclick="closeDetailModal()">×</button>
+            <div class="modal-title" id="detailModalTitle"></div>
+            
+            <div class="student-scores" style="margin-bottom: 1.5rem;">
+                <div class="score-item">
+                    <div class="score-label">加分</div>
+                    <div class="score-value add-score" id="detailAddScore">0</div>
+                </div>
+                <div class="score-item">
+                    <div class="score-label">扣分</div>
+                    <div class="score-value minus-score" id="detailMinusScore">0</div>
+                </div>
+                <div class="score-item">
+                    <div class="score-label">总分</div>
+                    <div class="score-value total-score" id="detailTotalScore">0</div>
+                </div>
+            </div>
+            
+            <div class="input-group">
+                <label>操作记录：</label>
+                <div class="logs-container" id="studentLogs">
+                    <!-- 动态填充 -->
+                </div>
+            </div>
+            
+            <div class="modal-actions">
+                <button class="modal-btn cancel-btn" onclick="closeDetailModal()">
+                    <span>❌</span>
+                    关闭
+                </button>
             </div>
         </div>
     </div>
@@ -2883,87 +2974,37 @@ async function renderClassPage(db, request, ipSession) {
     <div class="modal-overlay" id="rankingModal">
         <div class="modal-content">
             <button class="modal-close" onclick="closeRankingModal()">×</button>
+            <div class="modal-title">🏆 学生排名</div>
             
-            <div class="step-title">🏆 学生总分排名</div>
-            
-            <table class="student-table">
-                <thead>
-                    <tr>
-                        <th width="80">排名</th>
-                        <th>姓名</th>
-                        <th width="120">加分</th>
-                        <th width="120">扣分</th>
-                        <th width="120">总分</th>
-                    </tr>
-                </thead>
-                <tbody id="rankingBody">
-                    ${rankingData.ranking.map((student, index) => `
-                        <tr>
-                            <td>
-                                <div class="rank-badge ${index < 3 ? \`rank-\${index + 1}\` : ''}">
-                                    ${index + 1}
-                                </div>
-                            </td>
-                            <td>${student.name}</td>
-                            <td class="add-score">${student.add_score}</td>
-                            <td class="minus-score">${student.minus_score}</td>
-                            <td class="total-score">${student.total_score > 0 ? '+' : ''}${student.total_score}</td>
+            <div style="max-height: 400px; overflow-y: auto;">
+                <table style="width: 100%; border-collapse: collapse;">
+                    <thead>
+                        <tr style="background: var(--background);">
+                            <th style="padding: 1rem; text-align: left; border-bottom: 1px solid var(--border);">排名</th>
+                            <th style="padding: 1rem; text-align: left; border-bottom: 1px solid var(--border);">姓名</th>
+                            <th style="padding: 1rem; text-align: left; border-bottom: 1px solid var(--border);">加分</th>
+                            <th style="padding: 1rem; text-align: left; border-bottom: 1px solid var(--border);">扣分</th>
+                            <th style="padding: 1rem; text-align: left; border-bottom: 1px solid var(--border);">总分</th>
                         </tr>
-                    `).join('')}
-                </tbody>
-            </table>
-        </div>
-    </div>
-
-    <!-- 快照弹窗 -->
-    <div class="modal-overlay" id="snapshotModal">
-        <div class="modal-content">
-            <button class="modal-close" onclick="closeSnapshotModal()">×</button>
-            
-            <div class="step-title">📸 保存快照</div>
-            
-            <div class="input-group">
-                <label>快照标题：</label>
-                <input type="text" id="snapshotTitle" style="width: 100%; padding: 1rem; border: 2px solid var(--border); border-radius: 12px;" placeholder="输入快照标题（如：期中考核）">
+                    </thead>
+                    <tbody id="rankingBody">
+                        <!-- 动态填充 -->
+                    </tbody>
+                </table>
             </div>
             
-            <div class="action-buttons">
-                <button class="cancel-btn" onclick="closeSnapshotModal()">
+            <div class="modal-actions">
+                <button class="modal-btn cancel-btn" onclick="closeRankingModal()">
                     <span>❌</span>
-                    取消
-                </button>
-                <button class="submit-btn" onclick="submitSnapshot()">
-                    <span>💾</span>
-                    保存快照
+                    关闭
                 </button>
             </div>
         </div>
     </div>
 
-    <!-- IP信息弹窗 -->
-    <div class="ip-info-modal" id="ipInfoModal" style="display: none;">
-        <div class="ip-info-header">
-            <h3 style="margin: 0;">🌐 连接信息</h3>
-            <button class="ip-info-close" onclick="closeIPInfo()">×</button>
-        </div>
-        <div id="ipInfoContent">
-            <div class="ip-info-item">
-                <span class="ip-info-label">IP地址：</span>
-                <span class="ip-info-value" id="ipAddress">加载中...</span>
-            </div>
-            <div class="ip-info-item">
-                <span class="ip-info-label">延迟：</span>
-                <span class="ip-info-value" id="latency">测试中...</span>
-            </div>
-            <div class="ip-info-item">
-                <span class="ip-info-label">位置：</span>
-                <span class="ip-info-value" id="location">加载中...</span>
-            </div>
-            <div class="ip-info-item">
-                <span class="ip-info-label">运营商：</span>
-                <span class="ip-info-value" id="isp">加载中...</span>
-            </div>
-        </div>
+    <div class="footer">
+        <p>By 2314 刘沁熙 | 基于Cloudflare Worker搭建 | Cloudflare CDN提供加速服务</p>
+        <p id="systemInfo">加载中...</p>
     </div>
 
     <script>
@@ -2971,308 +3012,263 @@ async function renderClassPage(db, request, ipSession) {
         let currentScoreType = 'add';
         let currentStudentName = '';
         let selectedScore = 1;
-        let selectedStudents = [];
-        let currentStep = 1;
-        let noteHistory = {};
-        let latency = 0;
+        let isBatchMode = false;
+        let selectedStudents = new Set();
+        let batchScoreType = 'add';
+        let wallpaperUrl = '';
         let ipInfo = null;
-
-        // 设置当前日期
-        document.getElementById('currentDate').textContent = new Date().toLocaleDateString('zh-CN', {
-            year: 'numeric',
-            month: 'long',
-            day: 'numeric',
-            weekday: 'long'
-        });
-
-        // 页面加载时获取IP信息和测试延迟
-        window.addEventListener('load', async () => {
-            await fetchIPInfo();
-            await testLatency();
-            setTimeout(() => {
-                showIPInfo();
-            }, 1000);
-        });
-
-        // 获取IP信息
-        async function fetchIPInfo() {
-            try {
-                const startTime = Date.now();
-                const response = await fetch('https://ip.ilqx.dpdns.org/geo');
-                latency = Date.now() - startTime;
-                
-                if (response.ok) {
-                    ipInfo = await response.json();
-                    updateIPInfoDisplay();
-                }
-            } catch (error) {
-                console.error('获取IP信息失败:', error);
-            }
-        }
-
-        // 测试延迟
-        async function testLatency() {
-            try {
-                const startTime = Date.now();
-                await fetch('/api/health', { cache: 'no-store' });
-                latency = Date.now() - startTime;
-                updateIPInfoDisplay();
-            } catch (error) {
-                console.error('测试延迟失败:', error);
-            }
-        }
-
-        // 更新IP信息显示
-        function updateIPInfoDisplay() {
-            if (ipInfo) {
-                document.getElementById('ipAddress').textContent = ipInfo.ip || '未知';
-                document.getElementById('location').textContent = \`\${ipInfo.flag || ''} \${ipInfo.countryRegion || ipInfo.country || '未知'}\${ipInfo.city ? ' ' + ipInfo.city : ''}\`;
-                document.getElementById('isp').textContent = ipInfo.asOrganization || '未知';
-            }
-            document.getElementById('latency').textContent = \`\${latency}ms\`;
-        }
-
-        // 显示IP信息弹窗
-        function showIPInfo() {
-            const modal = document.getElementById('ipInfoModal');
-            modal.style.display = 'block';
-            setTimeout(() => {
-                modal.style.display = 'none';
-            }, 5000);
-        }
-
-        // 关闭IP信息弹窗
-        function closeIPInfo() {
-            document.getElementById('ipInfoModal').style.display = 'none';
-        }
-
-        // 开始评分流程
-        function startScoreProcess(studentId, type, studentName) {
-            currentStudentId = studentId;
-            currentScoreType = type;
-            currentStudentName = studentName;
-            currentStep = 1;
+        let pageLoadTime = Date.now();
+        
+        // 页面加载完成
+        document.addEventListener('DOMContentLoaded', async function() {
+            // 加载壁纸
+            await loadWallpaper();
             
-            // 更新第一步界面
-            document.getElementById('step1StudentName').textContent = studentName;
-            document.getElementById('step1ActionType').textContent = type === 'add' ? '加分' : '扣分';
+            // 加载IP信息
+            await loadIPInfo();
             
-            // 重置选择
-            selectedScore = 1;
-            updateScoreButtons();
-            document.getElementById('customScore').style.display = 'none';
-            document.getElementById('customScore').value = '';
-            document.getElementById('scoreNote').value = '';
+            // 检查会话
+            await checkSession();
             
-            // 显示第一步
-            showStep(1);
+            // 更新系统信息
+            updateSystemInfo();
             
-            // 显示模态框
-            document.getElementById('scoreModal').style.display = 'flex';
+            // 评分按钮事件
+            setupScoreButtons();
+            setupBatchScoreButtons();
             
             // 加载评分项目
             loadScoreCategories();
-            
-            // 加载备注历史
-            loadNoteHistory();
-        }
-
-        // 显示步骤
-        function showStep(step) {
-            currentStep = step;
-            
-            // 更新步骤指示器
-            document.getElementById('step1Dot').classList.toggle('active', step === 1);
-            document.getElementById('step2Dot').classList.toggle('active', step === 2);
-            
-            // 显示对应步骤内容
-            document.getElementById('step1').classList.toggle('active', step === 1);
-            document.getElementById('step2').classList.toggle('active', step === 2);
-        }
-
-        // 前往第二步
-        function goToStep2() {
-            if (selectedScore <= 0) {
-                showNotification('请选择有效的分值', 'error');
-                return;
-            }
-            showStep(2);
-        }
-
-        // 返回第一步
-        function goToStep1() {
-            showStep(1);
-        }
-
-        // 关闭评分弹窗
-        function closeScoreModal() {
-            document.getElementById('scoreModal').style.display = 'none';
-        }
-
-        // 更新分数按钮状态
-        function updateScoreButtons() {
-            document.querySelectorAll('.score-btn').forEach(btn => {
-                btn.classList.remove('selected');
-                if (btn.dataset.score === 'custom' && document.getElementById('customScore').style.display === 'block') {
-                    btn.classList.add('selected');
-                } else if (parseInt(btn.dataset.score) === selectedScore) {
-                    btn.classList.add('selected');
+            loadBatchScoreCategories();
+        });
+        
+        // 加载壁纸
+        async function loadWallpaper() {
+            try {
+                const response = await fetch('/api/wallpaper');
+                const result = await response.json();
+                
+                if (result.success && result.data && result.data.length > 0) {
+                    const wallpaper = result.data[0];
+                    wallpaperUrl = 'https://www.bing.com' + wallpaper.url;
+                    document.body.style.backgroundImage = \`url('\${wallpaperUrl}')\`;
                 }
-            });
+            } catch (error) {
+                console.error('加载壁纸失败:', error);
+            }
         }
-
-        // 分数按钮事件处理
-        document.addEventListener('DOMContentLoaded', function() {
-            document.querySelectorAll('.score-btn').forEach(btn => {
+        
+        // 加载IP信息
+        async function loadIPInfo() {
+            try {
+                const startTime = Date.now();
+                const response = await fetch('/api/ip-info');
+                const result = await response.json();
+                
+                if (result.success) {
+                    ipInfo = result.data;
+                    
+                    // 显示IP通知
+                    const latency = Date.now() - startTime;
+                    showNotification(\`\${ipInfo.flag} \${ipInfo.city} | 延迟: \${latency}ms\`, 'info', 5000);
+                }
+            } catch (error) {
+                console.error('加载IP信息失败:', error);
+            }
+        }
+        
+        // 检查会话
+        async function checkSession() {
+            try {
+                const response = await fetch('/api/check-session');
+                const result = await response.json();
+                
+                if (result.success) {
+                    console.log('会话有效:', result.session);
+                }
+            } catch (error) {
+                console.error('检查会话失败:', error);
+            }
+        }
+        
+        // 更新系统信息
+        function updateSystemInfo() {
+            const now = new Date();
+            const loadTime = Date.now() - pageLoadTime;
+            const timeStr = now.toLocaleString('zh-CN');
+            
+            let info = \`页面加载时间: \${loadTime}ms | 当前时间: \${timeStr}\`;
+            
+            if (ipInfo) {
+                info += \` | IP: \${ipInfo.ip} | 位置: \${ipInfo.city}, \${ipInfo.countryRegion}\`;
+            }
+            
+            document.getElementById('systemInfo').textContent = info;
+        }
+        
+        // 显示通知
+        function showNotification(message, type = 'info', duration = 3000) {
+            const container = document.getElementById('notificationContainer');
+            const notification = document.createElement('div');
+            notification.className = \`notification \${type}\`;
+            notification.innerHTML = \`
+                <span>\${type === 'success' ? '✅' : type === 'error' ? '❌' : type === 'warning' ? '⚠️' : 'ℹ️'}</span>
+                <span>\${message}</span>
+            \`;
+            
+            container.appendChild(notification);
+            
+            setTimeout(() => {
+                notification.style.animation = 'slideOutRight 0.3s ease';
+                setTimeout(() => {
+                    if (notification.parentNode) {
+                        notification.parentNode.removeChild(notification);
+                    }
+                }, 300);
+            }, duration);
+        }
+        
+        // 设置评分按钮事件
+        function setupScoreButtons() {
+            const buttons = document.querySelectorAll('#scoreButtons .score-btn');
+            buttons.forEach(btn => {
                 btn.addEventListener('click', function() {
+                    buttons.forEach(b => b.classList.remove('selected'));
+                    this.classList.add('selected');
+                    
                     if (this.dataset.score === 'custom') {
                         document.getElementById('customScore').style.display = 'block';
                         document.getElementById('customScore').focus();
                     } else {
                         document.getElementById('customScore').style.display = 'none';
                         selectedScore = parseInt(this.dataset.score);
-                        updateScoreButtons();
                     }
                 });
             });
-
+            
             document.getElementById('customScore').addEventListener('input', function() {
                 selectedScore = parseInt(this.value) || 0;
-                updateScoreButtons();
             });
-
-            // 点击弹窗外部关闭
-            document.getElementById('scoreModal').addEventListener('click', function(e) {
-                if (e.target === this) closeScoreModal();
+        }
+        
+        // 设置批量评分按钮事件
+        function setupBatchScoreButtons() {
+            const buttons = document.querySelectorAll('#batchScoreButtons .score-btn');
+            buttons.forEach(btn => {
+                btn.addEventListener('click', function() {
+                    buttons.forEach(b => b.classList.remove('selected'));
+                    this.classList.add('selected');
+                    
+                    if (this.dataset.score === 'custom') {
+                        document.getElementById('batchCustomScore').style.display = 'block';
+                        document.getElementById('batchCustomScore').focus();
+                    } else {
+                        document.getElementById('batchCustomScore').style.display = 'none';
+                    }
+                });
             });
             
-            document.getElementById('batchScoreModal').addEventListener('click', function(e) {
-                if (e.target === this) closeBatchScoreModal();
+            document.getElementById('batchCustomScore').addEventListener('input', function() {
+                // 批量评分的分数在提交时获取
             });
+        }
+        
+        // 开始评分流程
+        function startScoreProcess(studentId, type, studentName, event) {
+            if (event) event.stopPropagation();
             
-            document.getElementById('studentDetailModal').addEventListener('click', function(e) {
-                if (e.target === this) closeStudentDetailModal();
-            });
+            currentStudentId = studentId;
+            currentScoreType = type;
+            currentStudentName = studentName;
             
-            document.getElementById('rankingModal').addEventListener('click', function(e) {
-                if (e.target === this) closeRankingModal();
-            });
+            // 更新界面
+            document.getElementById('scoreModalTitle').textContent = 
+                \`为 \${studentName} \${type === 'add' ? '加分' : '扣分'}\`;
             
-            document.getElementById('snapshotModal').addEventListener('click', function(e) {
-                if (e.target === this) closeSnapshotModal();
+            // 重置选择
+            selectedScore = 1;
+            document.querySelectorAll('#scoreButtons .score-btn').forEach((btn, index) => {
+                btn.classList.remove('selected');
+                if (index === 0) btn.classList.add('selected');
             });
-        });
-
+            document.getElementById('customScore').style.display = 'none';
+            document.getElementById('customScore').value = '';
+            document.getElementById('scoreNote').value = '';
+            
+            // 显示模态框
+            document.getElementById('scoreModal').style.display = 'flex';
+        }
+        
+        // 关闭评分弹窗
+        function closeScoreModal() {
+            document.getElementById('scoreModal').style.display = 'none';
+        }
+        
         // 加载评分项目
         function loadScoreCategories() {
+            const categories = ${JSON.stringify(modifiedCategories)};
             const categorySelect = document.getElementById('categorySelect');
             categorySelect.innerHTML = '';
             
-            const categories = ${JSON.stringify((scoreCategories.results || []))};
             const filteredCategories = categories.filter(cat => cat.type === currentScoreType);
             
             filteredCategories.forEach(cat => {
                 const option = document.createElement('option');
                 option.value = cat.id;
                 option.textContent = cat.name;
-                option.dataset.requiresNote = cat.requires_note;
                 categorySelect.appendChild(option);
             });
+        }
+        
+        // 加载批量评分项目
+        function loadBatchScoreCategories() {
+            const categories = ${JSON.stringify(modifiedCategories)};
+            const categorySelect = document.getElementById('batchCategorySelect');
+            categorySelect.innerHTML = '';
             
-            // 监听项目选择变化
-            categorySelect.addEventListener('change', function() {
-                const selectedOption = this.options[this.selectedIndex];
-                const requiresNote = selectedOption.dataset.requiresNote === '1';
-                
-                if (requiresNote) {
-                    loadNoteHistory();
-                }
+            const filteredCategories = categories.filter(cat => cat.type === batchScoreType);
+            
+            filteredCategories.forEach(cat => {
+                const option = document.createElement('option');
+                option.value = cat.id;
+                option.textContent = cat.name;
+                categorySelect.appendChild(option);
             });
         }
-
-        // 加载备注历史
-        async function loadNoteHistory() {
-            const categorySelect = document.getElementById('categorySelect');
-            const selectedOption = categorySelect.options[categorySelect.selectedIndex];
-            const requiresNote = selectedOption.dataset.requiresNote === '1';
-            
-            if (!requiresNote) {
-                document.getElementById('noteHistory').style.display = 'none';
-                return;
-            }
-            
-            try {
-                const response = await fetch(\`/api/student-logs?studentId=\${currentStudentId}\`);
-                const result = await response.json();
-                
-                if (result.success && result.logs.length > 0) {
-                    const categoryName = selectedOption.textContent;
-                    const categoryLogs = result.logs.filter(log => log.category_name === categoryName);
-                    
-                    if (categoryLogs.length > 0) {
-                        const noteHistoryList = document.getElementById('noteHistoryList');
-                        noteHistoryList.innerHTML = '';
-                        
-                        categoryLogs.slice(0, 5).forEach(log => {
-                            const div = document.createElement('div');
-                            div.style.padding = '0.5rem';
-                            div.style.borderBottom = '1px solid var(--border)';
-                            div.style.cursor = 'pointer';
-                            div.textContent = log.note || '无备注';
-                            div.title = \`\${new Date(log.created_at).toLocaleString()} - \${log.operator}\`;
-                            div.onclick = () => {
-                                document.getElementById('scoreNote').value = log.note || '';
-                            };
-                            noteHistoryList.appendChild(div);
-                        });
-                        
-                        document.getElementById('noteHistory').style.display = 'block';
-                    } else {
-                        document.getElementById('noteHistory').style.display = 'none';
-                    }
-                } else {
-                    document.getElementById('noteHistory').style.display = 'none';
-                }
-            } catch (error) {
-                console.error('加载备注历史失败:', error);
-                document.getElementById('noteHistory').style.display = 'none';
-            }
-        }
-
+        
         // 提交分数
         async function submitScore() {
-            const categorySelect = document.getElementById('categorySelect');
-            const selectedOption = categorySelect.options[categorySelect.selectedIndex];
-            const requiresNote = selectedOption.dataset.requiresNote === '1';
-            
-            const categoryId = categorySelect.value;
+            const categoryId = document.getElementById('categorySelect').value;
             const operator = document.getElementById('operatorSelect').value;
             const note = document.getElementById('scoreNote').value;
             
+            // 获取分数
             let score = selectedScore;
-            if (document.getElementById('customScore').style.display === 'block') {
-                score = parseInt(document.getElementById('customScore').value) || 1;
+            const customScoreInput = document.getElementById('customScore');
+            if (customScoreInput.style.display === 'block') {
+                score = parseInt(customScoreInput.value) || 1;
             }
-
+            
             if (score <= 0) {
                 showNotification('分值必须大于0', 'error');
                 return;
             }
-
-            // 检查是否需要备注
-            if (requiresNote && (!note || note.trim() === '')) {
-                showNotification('该项目必须填写备注', 'error');
+            
+            // 检查是否为"其他"类别
+            const selectedCategory = ${JSON.stringify(modifiedCategories)}.find(cat => cat.id == categoryId);
+            if (selectedCategory && (selectedCategory.name.includes('其他') || selectedCategory.name.includes('自定义')) && (!note || note.trim() === '')) {
+                showNotification('自定义评分必须填写备注', 'error');
                 return;
             }
-
-            // 禁用提交按钮，防止重复提交
+            
             const submitBtn = document.getElementById('submitScoreBtn');
-            submitBtn.disabled = true;
+            const originalText = submitBtn.textContent;
             submitBtn.textContent = '提交中...';
-
+            submitBtn.disabled = true;
+            
             try {
-                const ip = '${request.headers.get("CF-Connecting-IP") || "unknown"}';
-                const userAgent = navigator.userAgent;
+                // 立即关闭弹窗，防止重复点击
+                closeScoreModal();
                 
                 const response = await fetch('/api/score', {
                     method: 'POST',
@@ -3283,198 +3279,301 @@ async function renderClassPage(db, request, ipSession) {
                         score: score,
                         operator: operator,
                         note: note,
-                        ip: ip,
-                        userAgent: userAgent
+                        userAgent: navigator.userAgent
                     })
                 });
 
                 const result = await response.json();
 
                 if (result.success) {
-                    // 立即关闭弹窗，防止重复点击
-                    closeScoreModal();
                     showNotification('评分提交成功！', 'success');
                     setTimeout(() => location.reload(), 1000);
                 } else {
                     showNotification(result.error || '提交失败', 'error');
+                    submitBtn.textContent = originalText;
                     submitBtn.disabled = false;
-                    submitBtn.innerHTML = '<span>✅</span> 提交评分';
                 }
             } catch (error) {
                 showNotification('网络错误，请重试', 'error');
+                submitBtn.textContent = originalText;
                 submitBtn.disabled = false;
-                submitBtn.innerHTML = '<span>✅</span> 提交评分';
             }
         }
-
-        // 更新已选学生
-        function updateSelectedStudents() {
-            selectedStudents = [];
-            document.querySelectorAll('.student-checkbox:checked').forEach(checkbox => {
-                selectedStudents.push({
-                    id: parseInt(checkbox.dataset.id),
-                    name: checkbox.dataset.name
-                });
-            });
+        
+        // 切换批量模式
+        function toggleBatchMode() {
+            isBatchMode = !isBatchMode;
+            const batchBtn = document.querySelector('.batch-btn');
+            const batchActions = document.getElementById('batchActions');
+            
+            if (isBatchMode) {
+                batchBtn.innerHTML = '<span>❌</span> 取消批量';
+                batchActions.style.display = 'block';
+            } else {
+                batchBtn.innerHTML = '<span>📝</span> 批量评分';
+                batchActions.style.display = 'none';
+                clearSelection();
+            }
         }
-
-        // 显示批量评分弹窗
-        function showBatchScoreModal() {
-            if (selectedStudents.length === 0) {
-                showNotification('请先选择学生', 'error');
+        
+        // 切换学生选择
+        function toggleSelectStudent(studentId, event) {
+            if (!isBatchMode) return;
+            if (event) event.stopPropagation();
+            
+            const card = document.querySelector(\`.student-card[data-id="\${studentId}"]\`);
+            
+            if (selectedStudents.has(studentId)) {
+                selectedStudents.delete(studentId);
+                card.classList.remove('selected');
+            } else {
+                selectedStudents.add(studentId);
+                card.classList.add('selected');
+            }
+            
+            updateSelectedCount();
+        }
+        
+        // 更新选择计数
+        function updateSelectedCount() {
+            document.getElementById('selectedCount').textContent = selectedStudents.size;
+        }
+        
+        // 清除选择
+        function clearSelection() {
+            selectedStudents.clear();
+            document.querySelectorAll('.student-card.selected').forEach(card => {
+                card.classList.remove('selected');
+            });
+            updateSelectedCount();
+        }
+        
+        // 开始批量评分
+        function startBatchScore(type) {
+            if (selectedStudents.size === 0) {
+                showNotification('请先选择学生', 'warning');
                 return;
             }
             
+            batchScoreType = type;
+            
+            // 更新界面
+            document.getElementById('batchScoreModalTitle').textContent = 
+                \`为 \${selectedStudents.size} 名学生批量\${type === 'add' ? '加分' : '扣分'}\`;
+            
+            document.getElementById('batchStudentCount').textContent = selectedStudents.size;
+            
+            // 显示已选择学生
+            const studentList = document.getElementById('selectedStudentsList');
+            studentList.innerHTML = '';
+            
+            selectedStudents.forEach(studentId => {
+                const card = document.querySelector(\`.student-card[data-id="\${studentId}"]\`);
+                const name = card.querySelector('.student-name').textContent;
+                studentList.innerHTML += \`<div style="padding: 0.25rem; border-bottom: 1px solid var(--border);">\${name}</div>\`;
+            });
+            
+            // 重置表单
+            document.querySelectorAll('#batchScoreButtons .score-btn').forEach((btn, index) => {
+                btn.classList.remove('selected');
+                if (index === 0) btn.classList.add('selected');
+            });
+            document.getElementById('batchCustomScore').style.display = 'none';
+            document.getElementById('batchCustomScore').value = '';
+            document.getElementById('batchScoreNote').value = '';
+            
+            // 加载评分项目
+            loadBatchScoreCategories();
+            
+            // 显示模态框
             document.getElementById('batchScoreModal').style.display = 'flex';
-            loadBatchCategories();
         }
-
+        
         // 关闭批量评分弹窗
         function closeBatchScoreModal() {
             document.getElementById('batchScoreModal').style.display = 'none';
         }
-
-        // 加载批量评分项目
-        function loadBatchCategories() {
-            const batchScoreType = document.getElementById('batchScoreType').value;
-            const batchCategorySelect = document.getElementById('batchCategorySelect');
-            batchCategorySelect.innerHTML = '';
-            
-            const categories = ${JSON.stringify((scoreCategories.results || []))};
-            const filteredCategories = categories.filter(cat => cat.type === batchScoreType);
-            
-            filteredCategories.forEach(cat => {
-                const option = document.createElement('option');
-                option.value = cat.id;
-                option.textContent = cat.name;
-                option.dataset.requiresNote = cat.requires_note;
-                batchCategorySelect.appendChild(option);
-            });
-        }
-
+        
         // 提交批量评分
         async function submitBatchScore() {
-            const batchCategorySelect = document.getElementById('batchCategorySelect');
-            const selectedOption = batchCategorySelect.options[batchCategorySelect.selectedIndex];
-            const requiresNote = selectedOption.dataset.requiresNote === '1';
-            
-            const categoryId = batchCategorySelect.value;
-            const score = parseInt(document.getElementById('batchScoreValue').value) || 1;
+            const categoryId = document.getElementById('batchCategorySelect').value;
             const operator = document.getElementById('batchOperatorSelect').value;
             const note = document.getElementById('batchScoreNote').value;
+            
+            // 获取分数
+            let score = 1;
+            const selectedBtn = document.querySelector('#batchScoreButtons .score-btn.selected');
+            if (selectedBtn.dataset.score === 'custom') {
+                score = parseInt(document.getElementById('batchCustomScore').value) || 1;
+            } else {
+                score = parseInt(selectedBtn.dataset.score);
+            }
             
             if (score <= 0) {
                 showNotification('分值必须大于0', 'error');
                 return;
             }
             
-            // 检查是否需要备注
-            if (requiresNote && (!note || note.trim() === '')) {
-                showNotification('该项目必须填写备注', 'error');
+            // 检查是否为"其他"类别
+            const selectedCategory = ${JSON.stringify(modifiedCategories)}.find(cat => cat.id == categoryId);
+            if (selectedCategory && (selectedCategory.name.includes('其他') || selectedCategory.name.includes('自定义')) && (!note || note.trim() === '')) {
+                showNotification('自定义评分必须填写备注', 'error');
                 return;
             }
-
+            
+            const submitBtn = document.getElementById('submitBatchScoreBtn');
+            const originalText = submitBtn.textContent;
+            submitBtn.textContent = '提交中...';
+            submitBtn.disabled = true;
+            
             try {
-                const ip = '${request.headers.get("CF-Connecting-IP") || "unknown"}';
-                const userAgent = navigator.userAgent;
+                // 立即关闭弹窗，防止重复点击
+                closeBatchScoreModal();
                 
                 const response = await fetch('/api/batch-score', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        studentIds: selectedStudents.map(s => s.id),
+                        studentIds: Array.from(selectedStudents),
                         categoryId: categoryId,
                         score: score,
                         operator: operator,
                         note: note,
-                        ip: ip,
-                        userAgent: userAgent
+                        userAgent: navigator.userAgent
                     })
                 });
 
                 const result = await response.json();
 
                 if (result.success) {
-                    closeBatchScoreModal();
-                    showNotification(\`批量评分成功！共\${selectedStudents.length}名学生\`, 'success');
-                    setTimeout(() => location.reload(), 1000);
+                    showNotification(result.message, 'success');
+                    isBatchMode = false;
+                    document.querySelector('.batch-btn').innerHTML = '<span>📝</span> 批量评分';
+                    document.getElementById('batchActions').style.display = 'none';
+                    clearSelection();
+                    setTimeout(() => location.reload(), 1500);
                 } else {
                     showNotification(result.error || '提交失败', 'error');
+                    submitBtn.textContent = originalText;
+                    submitBtn.disabled = false;
                 }
             } catch (error) {
                 showNotification('网络错误，请重试', 'error');
+                submitBtn.textContent = originalText;
+                submitBtn.disabled = false;
             }
         }
-
-        // 显示学生详细信息
-        async function showStudentDetail(studentId, studentName) {
+        
+        // 显示学生详情
+        async function showStudentDetail(studentId, studentName, event) {
+            if (event) event.stopPropagation();
+            
             currentStudentId = studentId;
             
-            document.getElementById('detailTitle').textContent = \`\${studentName} - 详细记录\`;
+            // 更新界面
+            document.getElementById('detailModalTitle').textContent = \`\${studentName} 的评分记录\`;
             
+            // 获取学生分数
+            const students = ${JSON.stringify(studentsData.students || [])};
+            const student = students.find(s => s.id === studentId);
+            if (student) {
+                document.getElementById('detailAddScore').textContent = student.add_score;
+                document.getElementById('detailMinusScore').textContent = student.minus_score;
+                document.getElementById('detailTotalScore').textContent = \`\${student.total_score > 0 ? '+' : ''}\${student.total_score}\`;
+            }
+            
+            // 加载操作记录
+            await loadStudentLogs(studentId);
+            
+            // 显示模态框
+            document.getElementById('detailModal').style.display = 'flex';
+        }
+        
+        // 加载学生日志
+        async function loadStudentLogs(studentId) {
             try {
                 const response = await fetch(\`/api/student-logs?studentId=\${studentId}\`);
                 const result = await response.json();
                 
-                let content = '<div style="margin-bottom: 1rem;"><strong>操作记录：</strong></div>';
+                const logsContainer = document.getElementById('studentLogs');
+                logsContainer.innerHTML = '';
                 
-                if (result.success && result.logs.length > 0) {
+                if (result.success && result.logs && result.logs.length > 0) {
                     result.logs.forEach(log => {
-                        const scoreClass = log.category_type === 'add' ? 'add-score' : 'minus-score';
-                        const scorePrefix = log.category_type === 'add' ? '+' : '-';
+                        const logItem = document.createElement('div');
+                        logItem.className = 'log-item';
                         
-                        content += \`
-                            <div class="log-item">
-                                <div class="log-header">
-                                    <div>
-                                        <strong>\${log.category_name}</strong>
-                                        <span style="margin-left: 1rem; font-size: 0.875rem; color: var(--text-light);">\${new Date(log.created_at).toLocaleString()}</span>
-                                    </div>
-                                    <div class="log-score \${scoreClass}">\${scorePrefix}\${log.score}分</div>
+                        const time = new Date(log.created_at).toLocaleString('zh-CN');
+                        let actionClass = '';
+                        let actionText = '';
+                        
+                        if (log.action_type === 'add') {
+                            actionClass = 'add';
+                            actionText = \`+\${log.score_change}\`;
+                        } else if (log.action_type === 'minus') {
+                            actionClass = 'minus';
+                            actionText = \`\${log.score_change}\`;
+                        } else {
+                            actionClass = 'revoke';
+                            actionText = '撤销';
+                        }
+                        
+                        logItem.innerHTML = \`
+                            <div class="log-time">\${time}</div>
+                            <div class="log-content">
+                                <div>
+                                    <strong>\${log.category_name}</strong>
+                                    <div style="font-size: 0.75rem; color: var(--text-light);">\${log.note || '无备注'}</div>
+                                    <div style="font-size: 0.75rem; color: var(--text-light);">操作者: \${log.operator}</div>
                                 </div>
-                                <div class="log-details">
-                                    <div>操作教师: \${log.operator}</div>
-                                    <div class="log-note">备注: \${log.note || '无'}</div>
-                                    <button onclick="revokeScore(\${log.id})" style="margin-top: 0.5rem; padding: 0.25rem 0.5rem; background: var(--danger); color: white; border: none; border-radius: 4px; cursor: pointer;">
-                                        撤销此操作
-                                    </button>
-                                </div>
+                                <div class="log-action \${actionClass}">\${actionText}</div>
                             </div>
+                            \${log.action_type !== 'revoke' ? \`<button onclick="revokeLog(\${log.id})" style="margin-top: 0.5rem; padding: 0.25rem 0.5rem; font-size: 0.75rem; background: rgba(245, 158, 11, 0.1); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.2); border-radius: 4px; cursor: pointer;">撤销此操作</button>\` : ''}
                         \`;
+                        
+                        logsContainer.appendChild(logItem);
                     });
                 } else {
-                    content += '<div style="text-align: center; padding: 2rem; color: var(--text-light);">暂无记录</div>';
+                    logsContainer.innerHTML = '<div style="text-align: center; padding: 2rem; color: var(--text-light);">暂无操作记录</div>';
                 }
-                
-                document.getElementById('studentDetailContent').innerHTML = content;
-                document.getElementById('studentDetailModal').style.display = 'flex';
             } catch (error) {
-                showNotification('加载详细记录失败', 'error');
+                console.error('加载日志失败:', error);
+                document.getElementById('studentLogs').innerHTML = '<div style="text-align: center; padding: 2rem; color: var(--danger);">加载失败</div>';
             }
         }
-
-        // 关闭学生详细信息弹窗
-        function closeStudentDetailModal() {
-            document.getElementById('studentDetailModal').style.display = 'none';
-        }
-
-        // 撤销评分
-        async function revokeScore(recordId) {
-            if (!confirm('确定要撤销这条记录吗？')) return;
+        
+        // 撤销日志
+        async function revokeLog(logId) {
+            if (!confirm('确定要撤销此操作吗？')) return;
             
             try {
                 const response = await fetch('/api/revoke', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ recordId })
+                    body: JSON.stringify({
+                        recordId: logId,
+                        userAgent: navigator.userAgent
+                    })
                 });
 
                 const result = await response.json();
 
                 if (result.success) {
-                    showNotification('撤销成功！', 'success');
-                    closeStudentDetailModal();
-                    setTimeout(() => location.reload(), 1000);
+                    showNotification('撤销操作成功！', 'success');
+                    await loadStudentLogs(currentStudentId);
+                    
+                    // 更新学生分数显示
+                    const studentsResponse = await fetch('/api/students');
+                    const studentsResult = await studentsResponse.json();
+                    
+                    if (studentsResult.success) {
+                        const student = studentsResult.students.find(s => s.id === currentStudentId);
+                        if (student) {
+                            document.getElementById('detailAddScore').textContent = student.add_score;
+                            document.getElementById('detailMinusScore').textContent = student.minus_score;
+                            document.getElementById('detailTotalScore').textContent = \`\${student.total_score > 0 ? '+' : ''}\${student.total_score}\`;
+                        }
+                    }
                 } else {
                     showNotification(result.error || '撤销失败', 'error');
                 }
@@ -3482,36 +3581,45 @@ async function renderClassPage(db, request, ipSession) {
                 showNotification('网络错误，请重试', 'error');
             }
         }
-
-        // 显示排名弹窗
-        function showRankingModal() {
+        
+        // 关闭详情弹窗
+        function closeDetailModal() {
+            document.getElementById('detailModal').style.display = 'none';
+        }
+        
+        // 显示排名
+        function showRanking() {
+            const students = ${JSON.stringify(studentsData.students || [])};
+            const rankingBody = document.getElementById('rankingBody');
+            rankingBody.innerHTML = '';
+            
+            students.forEach((student, index) => {
+                const row = document.createElement('tr');
+                row.innerHTML = \`
+                    <td style="padding: 1rem; border-bottom: 1px solid var(--border);">
+                        <div style="width: 28px; height: 28px; border-radius: 50%; background: \${index < 3 ? '#f59e0b' : '#6366f1'}; color: white; display: flex; align-items: center; justify-content: center; font-weight: 700;">\${index + 1}</div>
+                    </td>
+                    <td style="padding: 1rem; border-bottom: 1px solid var(--border); font-weight: 600;">\${student.name}</td>
+                    <td style="padding: 1rem; border-bottom: 1px solid var(--border); color: var(--secondary); font-weight: 600;">\${student.add_score}</td>
+                    <td style="padding: 1rem; border-bottom: 1px solid var(--border); color: var(--danger); font-weight: 600;">\${student.minus_score}</td>
+                    <td style="padding: 1rem; border-bottom: 1px solid var(--border); color: var(--primary); font-weight: 700;">\${student.total_score > 0 ? '+' : ''}\${student.total_score}</td>
+                \`;
+                rankingBody.appendChild(row);
+            });
+            
             document.getElementById('rankingModal').style.display = 'flex';
         }
-
+        
         // 关闭排名弹窗
         function closeRankingModal() {
             document.getElementById('rankingModal').style.display = 'none';
         }
-
-        // 显示快照弹窗
-        function createSnapshot() {
-            document.getElementById('snapshotModal').style.display = 'flex';
-        }
-
-        // 关闭快照弹窗
-        function closeSnapshotModal() {
-            document.getElementById('snapshotModal').style.display = 'none';
-        }
-
-        // 提交快照
-        async function submitSnapshot() {
-            const title = document.getElementById('snapshotTitle').value.trim();
+        
+        // 创建快照
+        async function createSnapshot() {
+            const title = prompt('请输入快照标题（如：期中考核）:');
+            if (!title) return;
             
-            if (!title) {
-                showNotification('请输入快照标题', 'error');
-                return;
-            }
-
             try {
                 const response = await fetch('/api/snapshot', {
                     method: 'POST',
@@ -3522,7 +3630,6 @@ async function renderClassPage(db, request, ipSession) {
                 const result = await response.json();
 
                 if (result.success) {
-                    closeSnapshotModal();
                     showNotification('快照保存成功！', 'success');
                 } else {
                     showNotification(result.error || '保存失败', 'error');
@@ -3531,41 +3638,7 @@ async function renderClassPage(db, request, ipSession) {
                 showNotification('网络错误，请重试', 'error');
             }
         }
-
-        // 显示历史快照页面
-        function showSnapshots() {
-            window.open('/snapshots', '_blank');
-        }
-
-        // 显示通知
-        function showNotification(message, type = 'info') {
-            // 移除现有通知
-            const existingNotification = document.querySelector('.notification');
-            if (existingNotification) {
-                existingNotification.remove();
-            }
-
-            // 创建通知元素
-            const notification = document.createElement('div');
-            notification.className = \`notification \${type}\`;
-            notification.innerHTML = \`
-                <span>\${type === 'success' ? '✅' : type === 'error' ? '❌' : 'ℹ️'}</span>
-                <span>\${message}</span>
-            \`;
-            
-            document.body.appendChild(notification);
-            
-            // 3秒后自动移除
-            setTimeout(() => {
-                notification.style.animation = 'slideOutRight 0.3s ease';
-                setTimeout(() => {
-                    if (notification.parentNode) {
-                        notification.parentNode.removeChild(notification);
-                    }
-                }, 300);
-            }, 3000);
-        }
-
+        
         // 退出登录
         async function logout() {
             try {
@@ -3575,6 +3648,18 @@ async function renderClassPage(db, request, ipSession) {
                 window.location.href = '/login';
             }
         }
+        
+        // 点击弹窗外部关闭
+        document.querySelectorAll('.modal-overlay').forEach(modal => {
+            modal.addEventListener('click', function(e) {
+                if (e.target === this) {
+                    this.style.display = 'none';
+                }
+            });
+        });
+        
+        // 定期更新系统信息
+        setInterval(updateSystemInfo, 60000);
     </script>
 </body>
 </html>
@@ -3589,18 +3674,17 @@ async function renderClassPage(db, request, ipSession) {
 }
 
 // 渲染管理员页面
-async function renderAdminPage(db, request, ipSession) {
+async function renderAdminPage(db, request, clientIP, userAgent) {
   try {
-    // 检查IP会话或需要登录
-    if (!ipSession.authenticated || ipSession.role !== 'admin') {
+    const session = await validateSession(request, db);
+    if (!session || session.role !== 'admin') {
       return Response.redirect(new URL('/login', request.url));
     }
 
-    const [studentsData, logs, settings, snapshots] = await Promise.all([
+    const [studentsData, logs, settings] = await Promise.all([
       handleGetStudents(db).then(r => r.json()),
-      db.prepare('SELECT ol.*, s.name as student_name FROM operation_logs ol JOIN students s ON ol.student_id = s.id ORDER BY ol.created_at DESC LIMIT 50').all(),
-      db.prepare('SELECT key, value FROM settings').all(),
-      db.prepare('SELECT DISTINCT title, snapshot_date FROM monthly_snapshots ORDER BY snapshot_date DESC LIMIT 10').all()
+      db.prepare('SELECT * FROM operation_logs ORDER BY created_at DESC LIMIT 100').all(),
+      db.prepare('SELECT key, value FROM settings').all()
     ]);
 
     if (!studentsData.success) {
@@ -3621,11 +3705,6 @@ async function renderAdminPage(db, request, ipSession) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${settingMap.site_title || '班级评分系统'} - 管理员</title>
     <style>
-        * { 
-            margin: 0; padding: 0; box-sizing: border-box; 
-            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
-        }
-        
         :root {
             --primary: #6366f1;
             --primary-dark: #4f46e5;
@@ -3638,106 +3717,191 @@ async function renderAdminPage(db, request, ipSession) {
             --text-light: #64748b;
             --border: #e2e8f0;
             --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+            --shadow-lg: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+        }
+        
+        * { 
+            margin: 0; padding: 0; box-sizing: border-box; 
+            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
         }
         
         body { 
             background: var(--background); 
             color: var(--text);
             min-height: 100vh;
+            background-size: cover;
+            background-position: center;
+            background-attachment: fixed;
+        }
+        
+        .notification-container {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 10000;
+            max-width: 350px;
+        }
+        
+        .notification {
+            background: var(--surface);
+            border-radius: 12px;
+            padding: 1rem 1.5rem;
+            margin-bottom: 1rem;
+            box-shadow: var(--shadow-lg);
+            border-left: 4px solid var(--primary);
+            animation: slideInRight 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--border);
+        }
+        
+        .notification.success { border-left-color: var(--secondary); }
+        .notification.error { border-left-color: var(--danger); }
+        .notification.warning { border-left-color: var(--warning); }
+        
+        @keyframes slideInRight {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
         }
         
         .header { 
-            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); 
-            color: white; 
-            padding: 1.5rem 2rem; 
+            background: rgba(255, 255, 255, 0.9); 
+            color: var(--text); 
+            padding: 1rem 2rem; 
             box-shadow: var(--shadow);
-        }
-        
-        .header-content { 
-            display: flex; 
-            justify-content: space-between; 
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+            backdrop-filter: blur(10px);
+            display: flex;
+            justify-content: space-between;
             align-items: center;
-            max-width: 1400px;
-            margin: 0 auto;
+            border-bottom: 1px solid var(--border);
         }
         
-        .class-info h1 { 
+        .admin-info h1 { 
             font-weight: 700; 
-            margin-bottom: 0.5rem; 
+            margin-bottom: 0.25rem; 
+            font-size: 1.5rem;
+            color: var(--primary);
         }
         
         .admin-badge {
-            background: rgba(255,255,255,0.2);
+            background: var(--primary);
+            color: white;
             padding: 0.25rem 0.75rem;
             border-radius: 20px;
-            font-size: 0.875rem;
-            margin-left: 1rem;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        
+        .header-actions {
+            display: flex;
+            gap: 0.75rem;
+            align-items: center;
         }
         
         .btn {
-            padding: 0.75rem 1.5rem;
+            padding: 0.5rem 1rem;
             border: none;
-            border-radius: 12px;
+            border-radius: 8px;
             font-weight: 600;
             cursor: pointer;
             transition: all 0.3s ease;
-            text-decoration: none;
-            display: inline-flex;
+            display: flex;
             align-items: center;
             gap: 0.5rem;
+            text-decoration: none;
+            font-size: 0.875rem;
         }
         
         .btn-primary {
-            background: rgba(255,255,255,0.2);
+            background: var(--primary);
             color: white;
-            border: 1px solid rgba(255,255,255,0.3);
         }
         
         .btn-primary:hover {
-            background: rgba(255,255,255,0.3);
+            background: var(--primary-dark);
             transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+        }
+        
+        .btn-secondary {
+            background: var(--background);
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+        
+        .btn-secondary:hover {
+            background: var(--surface);
+            transform: translateY(-2px);
+        }
+        
+        .btn-danger {
+            background: var(--danger);
+            color: white;
+        }
+        
+        .btn-danger:hover {
+            background: #dc2626;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);
         }
         
         .main-content {
             max-width: 1400px;
             margin: 0 auto;
             padding: 2rem;
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 2rem;
         }
         
-        .card {
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        
+        .stat-card {
             background: var(--surface);
-            border-radius: 20px;
-            padding: 2rem;
+            border-radius: 16px;
+            padding: 1.5rem;
             box-shadow: var(--shadow);
             transition: all 0.3s ease;
-            animation: fadeIn 0.6s ease;
-            position: relative;
-            overflow: hidden;
+            border: 1px solid var(--border);
         }
         
-        .card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 4px;
-            background: linear-gradient(90deg, var(--primary), var(--secondary));
+        .stat-card:hover {
+            transform: translateY(-4px);
+            box-shadow: var(--shadow-lg);
         }
         
-        .card:hover {
-            transform: translateY(-8px);
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+        .stat-title {
+            color: var(--text-light);
+            font-size: 0.875rem;
+            margin-bottom: 0.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
         }
         
-        .card-full {
-            grid-column: 1 / -1;
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--text);
         }
         
-        .card-title {
+        .admin-section {
+            background: var(--surface);
+            border-radius: 16px;
+            padding: 2rem;
+            box-shadow: var(--shadow);
+            margin-bottom: 2rem;
+            border: 1px solid var(--border);
+        }
+        
+        .section-title {
             font-size: 1.5rem;
             font-weight: 700;
             margin-bottom: 1.5rem;
@@ -3747,103 +3911,13 @@ async function renderAdminPage(db, request, ipSession) {
             gap: 0.75rem;
         }
         
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 1rem;
-            margin-bottom: 2rem;
+        .danger-zone {
+            border: 2px solid var(--danger);
+            background: rgba(239, 68, 68, 0.05);
         }
         
-        .stat-card {
-            background: var(--background);
-            padding: 1.5rem;
-            border-radius: 16px;
-            text-align: center;
-            border-left: 4px solid var(--primary);
-            transition: all 0.3s ease;
-        }
-        
-        .stat-card:hover {
-            transform: translateY(-4px);
-            box-shadow: var(--shadow);
-        }
-        
-        .stat-number {
-            font-size: 2rem;
-            font-weight: 700;
-            color: var(--primary);
-            margin-bottom: 0.5rem;
-        }
-        
-        .stat-label {
-            color: var(--text-light);
-            font-size: 0.875rem;
-        }
-        
-        .table-container {
-            overflow-x: auto;
-        }
-        
-        .data-table {
-            width: 100%;
-            border-collapse: separate;
-            border-spacing: 0;
-        }
-        
-        .data-table th, .data-table td {
-            padding: 1rem;
-            text-align: left;
-            border-bottom: 1px solid var(--border);
-            transition: all 0.2s ease;
-        }
-        
-        .data-table th {
-            background: var(--background);
-            font-weight: 600;
-            color: var(--text-light);
-            position: sticky;
-            top: 0;
-        }
-        
-        .data-table tr:hover td {
-            background: var(--background);
-            transform: scale(1.02);
-        }
-        
-        .positive { color: var(--secondary); font-weight: 600; }
-        .negative { color: var(--danger); font-weight: 600; }
-        
-        .log-item {
-            padding: 1rem;
-            border-left: 4px solid var(--primary);
-            background: var(--background);
-            border-radius: 8px;
-            margin-bottom: 1rem;
-            transition: all 0.2s ease;
-        }
-        
-        .log-item:hover {
-            transform: translateX(8px);
-        }
-        
-        .log-header {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 0.5rem;
-        }
-        
-        .log-student {
-            font-weight: 600;
-            color: var(--text);
-        }
-        
-        .log-score {
-            font-weight: 700;
-        }
-        
-        .log-details {
-            color: var(--text-light);
-            font-size: 0.875rem;
+        .danger-zone .section-title {
+            color: var(--danger);
         }
         
         .settings-form {
@@ -3863,11 +3937,13 @@ async function renderAdminPage(db, request, ipSession) {
         }
         
         .form-group input {
-            padding: 1rem;
+            padding: 0.75rem 1rem;
             border: 2px solid var(--border);
-            border-radius: 12px;
+            border-radius: 8px;
             font-size: 1rem;
             transition: all 0.3s ease;
+            background: var(--surface);
+            color: var(--text);
         }
         
         .form-group input:focus {
@@ -3876,80 +3952,66 @@ async function renderAdminPage(db, request, ipSession) {
             box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
         }
         
-        .btn-success {
-            background: var(--secondary);
-            color: white;
+        .logs-container {
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid var(--border);
+            border-radius: 8px;
         }
         
-        .btn-success:hover {
-            background: #0da271;
-            transform: translateY(-2px);
-        }
-        
-        .btn-danger {
-            background: var(--danger);
-            color: white;
-        }
-        
-        .btn-danger:hover {
-            background: #dc2626;
-            transform: translateY(-2px);
-        }
-        
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        
-        @media (max-width: 768px) {
-            .main-content {
-                grid-template-columns: 1fr;
-                padding: 1rem;
-                gap: 1.5rem;
-            }
-            
-            .stats-grid {
-                grid-template-columns: 1fr;
-            }
-            
-            .header {
-                padding: 1rem;
-            }
-            
-            .header-content {
-                flex-direction: column;
-                gap: 1rem;
-                text-align: center;
-            }
-        }
-        
-        /* 快照样式 */
-        .snapshot-item {
+        .log-item {
             padding: 1rem;
-            border: 2px solid var(--border);
-            border-radius: 12px;
-            margin-bottom: 1rem;
-            transition: all 0.3s ease;
-            cursor: pointer;
-        }
-        
-        .snapshot-item:hover {
-            border-color: var(--primary);
-            transform: translateX(8px);
-        }
-        
-        .snapshot-title {
-            font-weight: 600;
-            color: var(--text);
-            margin-bottom: 0.5rem;
-        }
-        
-        .snapshot-date {
-            color: var(--text-light);
+            border-bottom: 1px solid var(--border);
             font-size: 0.875rem;
         }
         
-        /* 模态框 */
+        .log-item:last-child {
+            border-bottom: none;
+        }
+        
+        .log-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.5rem;
+        }
+        
+        .log-student {
+            font-weight: 600;
+            color: var(--text);
+        }
+        
+        .log-time {
+            color: var(--text-light);
+            font-size: 0.75rem;
+        }
+        
+        .log-details {
+            color: var(--text-light);
+            margin-bottom: 0.5rem;
+        }
+        
+        .log-score {
+            font-weight: 700;
+            padding: 0.25rem 0.5rem;
+            border-radius: 12px;
+            font-size: 0.75rem;
+        }
+        
+        .log-score.add {
+            background: rgba(16, 185, 129, 0.1);
+            color: var(--secondary);
+        }
+        
+        .log-score.minus {
+            background: rgba(239, 68, 68, 0.1);
+            color: var(--danger);
+        }
+        
+        .log-score.revoke {
+            background: rgba(245, 158, 11, 0.1);
+            color: var(--warning);
+        }
+        
         .modal-overlay {
             display: none;
             position: fixed;
@@ -3961,16 +4023,21 @@ async function renderAdminPage(db, request, ipSession) {
             z-index: 1000;
             align-items: center;
             justify-content: center;
+            animation: fadeIn 0.3s ease;
+            backdrop-filter: blur(5px);
             padding: 1rem;
         }
         
         .modal-content {
             background: var(--surface);
-            padding: 2.5rem;
-            border-radius: 24px;
+            padding: 2rem;
+            border-radius: 20px;
             width: 100%;
             max-width: 500px;
-            box-shadow: var(--shadow);
+            animation: slideUp 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: var(--shadow-lg);
+            border: 1px solid var(--border);
+            position: relative;
         }
         
         .modal-close {
@@ -3982,237 +4049,467 @@ async function renderAdminPage(db, request, ipSession) {
             font-size: 1.5rem;
             cursor: pointer;
             color: var(--text-light);
+            transition: color 0.3s ease;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
         
-        .danger-modal .modal-content {
-            border-top: 6px solid var(--danger);
-        }
-        
-        .danger-title {
+        .modal-close:hover {
             color: var(--danger);
-            text-align: center;
-            margin-bottom: 1.5rem;
+            background: rgba(239, 68, 68, 0.1);
         }
         
-        .confirm-input {
-            width: 100%;
-            padding: 1rem;
-            border: 2px solid var(--border);
-            border-radius: 12px;
+        @keyframes fadeIn { 
+            from { opacity: 0; } 
+            to { opacity: 1; } 
+        }
+        
+        @keyframes slideUp { 
+            from { transform: translateY(30px); opacity: 0; } 
+            to { transform: translateY(0); opacity: 1; } 
+        }
+        
+        .modal-title {
+            font-size: 1.5rem;
+            font-weight: 700;
             margin-bottom: 1.5rem;
+            color: var(--text);
             text-align: center;
+        }
+        
+        .modal-actions { 
+            display: flex; 
+            gap: 1rem; 
+            margin-top: 2rem; 
+        }
+        
+        .modal-btn { 
+            flex: 1; 
+            padding: 0.75rem; 
+            border: none; 
+            border-radius: 8px; 
+            cursor: pointer; 
+            transition: all 0.3s ease; 
             font-weight: 600;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+        
+        .submit-btn { 
+            background: var(--secondary); 
+            color: white; 
+        }
+        
+        .submit-btn:hover { 
+            background: #0da271;
+            transform: translateY(-2px);
+        }
+        
+        .cancel-btn { 
+            background: var(--text-light); 
+            color: white; 
+        }
+        
+        .cancel-btn:hover { 
+            background: #475569;
+            transform: translateY(-2px);
+        }
+        
+        .danger-btn { 
+            background: var(--danger); 
+            color: white; 
+        }
+        
+        .danger-btn:hover { 
+            background: #dc2626;
+            transform: translateY(-2px);
+        }
+        
+        .system-info {
+            position: fixed;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 12px;
+            padding: 1rem;
+            font-size: 0.75rem;
+            color: var(--text-light);
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--border);
+            max-width: 300px;
+        }
+        
+        .footer {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-light);
+            font-size: 0.875rem;
+            margin-top: 2rem;
+            border-top: 1px solid var(--border);
+        }
+        
+        @media (max-width: 768px) {
+            .main-content { 
+                padding: 1rem; 
+            }
+            
+            .header { 
+                padding: 1rem; 
+                flex-direction: column;
+                gap: 1rem;
+            }
+            
+            .header-actions {
+                width: 100%;
+                justify-content: center;
+                flex-wrap: wrap;
+            }
+            
+            .modal-content {
+                padding: 1.5rem;
+                max-width: 95%;
+            }
+            
+            .system-info {
+                position: relative;
+                bottom: auto;
+                left: auto;
+                margin: 2rem auto;
+                max-width: 100%;
+            }
         }
     </style>
 </head>
 <body>
+    <div class="notification-container" id="notificationContainer"></div>
+    
     <div class="header">
-        <div class="header-content">
-            <div class="class-info">
-                <h1>${settingMap.site_title || '2314班综合评分系统'}
-                    <span class="admin-badge">管理员模式</span>
-                </h1>
-                <div>系统管理面板</div>
+        <div class="admin-info">
+            <h1>${settingMap.site_title || '2314班综合评分系统'}
+                <span class="admin-badge">管理员模式</span>
+            </h1>
+            <div style="font-size: 0.875rem; color: var(--text-light);">
+                系统管理面板
             </div>
-            <div>
-                <a href="/class" class="btn btn-primary">📊 班级视图</a>
-                <button class="btn btn-primary" onclick="logout()">🚪 退出登录</button>
-            </div>
+        </div>
+        
+        <div class="header-actions">
+            <a href="/class" class="btn btn-primary">
+                <span>📊</span>
+                班级视图
+            </a>
+            <button class="btn btn-secondary" onclick="createSnapshot()">
+                <span>💾</span>
+                保存快照
+            </button>
+            <a href="/snapshots" class="btn btn-secondary">
+                <span>📈</span>
+                历史数据
+            </a>
+            <button class="btn btn-secondary" onclick="logout()">
+                <span>🚪</span>
+                退出登录
+            </button>
         </div>
     </div>
 
     <div class="main-content">
-        <!-- 统计信息 -->
-        <div class="card card-full">
-            <div class="card-title">📈 系统概览</div>
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-number">${studentsData.students.length}</div>
-                    <div class="stat-label">学生总数</div>
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-title">
+                    <span>👥</span>
+                    学生总数
                 </div>
-                <div class="stat-card">
-                    <div class="stat-number">${studentsData.students.reduce((acc, s) => acc + s.add_score, 0)}</div>
-                    <div class="stat-label">总加分</div>
+                <div class="stat-value">${studentsData.students ? studentsData.students.length : 0}</div>
+            </div>
+            
+            <div class="stat-card">
+                <div class="stat-title">
+                    <span>📈</span>
+                    总加分
                 </div>
-                <div class="stat-card">
-                    <div class="stat-number">${studentsData.students.reduce((acc, s) => acc + s.minus_score, 0)}</div>
-                    <div class="stat-label">总扣分</div>
+                <div class="stat-value" style="color: var(--secondary);">${studentsData.students ? studentsData.students.reduce((acc, s) => acc + s.add_score, 0) : 0}</div>
+            </div>
+            
+            <div class="stat-card">
+                <div class="stat-title">
+                    <span>📉</span>
+                    总扣分
                 </div>
+                <div class="stat-value" style="color: var(--danger);">${studentsData.students ? studentsData.students.reduce((acc, s) => acc + s.minus_score, 0) : 0}</div>
+            </div>
+            
+            <div class="stat-card">
+                <div class="stat-title">
+                    <span>📋</span>
+                    操作日志数
+                </div>
+                <div class="stat-value" style="color: var(--primary);">${logs.results ? logs.results.length : 0}</div>
             </div>
         </div>
 
-        <!-- 系统设置 -->
-        <div class="card">
-            <div class="card-title">⚙️ 系统设置</div>
+        <div class="admin-section">
+            <div class="section-title">
+                <span>⚙️</span>
+                系统设置
+            </div>
+            
             <form class="settings-form" id="settingsForm">
                 <div class="form-group">
-                    <label>网站标题</label>
+                    <label>网站标题：</label>
                     <input type="text" name="site_title" value="${settingMap.site_title || ''}" required>
                 </div>
+                
                 <div class="form-group">
-                    <label>班级名称</label>
+                    <label>班级名称：</label>
                     <input type="text" name="class_name" value="${settingMap.class_name || ''}" required>
                 </div>
+                
                 <div class="form-group">
-                    <label>班级账号</label>
+                    <label>班级账号：</label>
                     <input type="text" name="class_username" value="${settingMap.class_username || ''}" required>
                 </div>
+                
                 <div class="form-group">
-                    <label>班级密码</label>
+                    <label>班级密码：</label>
                     <input type="password" name="class_password" value="${settingMap.class_password || ''}" required>
                 </div>
+                
                 <div class="form-group">
-                    <label>管理员账号</label>
-                    <input type="text" value="2314admin" readonly disabled style="background: var(--background);">
+                    <label>管理员账号：</label>
+                    <input type="text" name="admin_username" value="${settingMap.admin_username || ''}" required>
                 </div>
+                
                 <div class="form-group">
-                    <label>管理员密码</label>
+                    <label>管理员密码：</label>
                     <input type="password" name="admin_password" value="${settingMap.admin_password || ''}" required>
                 </div>
-                <button type="submit" class="btn btn-success">💾 保存设置</button>
+                
+                <button type="submit" class="btn btn-primary">
+                    <span>💾</span>
+                    保存设置
+                </button>
             </form>
         </div>
 
-        <!-- 系统管理 -->
-        <div class="card">
-            <div class="card-title">🔧 系统管理</div>
-            <div style="display: flex; flex-direction: column; gap: 1rem;">
-                <button class="btn btn-primary" onclick="createSnapshot()">
-                    💾 保存快照
-                </button>
-                <button class="btn btn-primary" onclick="showSnapshots()">
-                    📈 查看历史快照
-                </button>
-                <button class="btn btn-danger" onclick="showResetConfirm()">
-                    🔄 重置当前分数
-                </button>
-                <button class="btn btn-danger" onclick="showClearConfirm()">
-                    🗑️ 清空所有数据
-                </button>
+        <div class="admin-section">
+            <div class="section-title">
+                <span>📋</span>
+                系统操作日志
             </div>
-        </div>
-
-        <!-- 最近快照 -->
-        <div class="card">
-            <div class="card-title">📸 最近快照</div>
-            <div>
-                ${(snapshots.results || []).length > 0 ? (snapshots.results || []).map(snapshot => `
-                    <div class="snapshot-item" onclick="viewSnapshot('${snapshot.title}')">
-                        <div class="snapshot-title">${snapshot.title}</div>
-                        <div class="snapshot-date">${new Date(snapshot.snapshot_date).toLocaleString('zh-CN')}</div>
+            
+            <div class="logs-container">
+                ${logs.results ? logs.results.map(log => `
+                    <div class="log-item">
+                        <div class="log-header">
+                            <div class="log-student">${log.student_name || '系统'}</div>
+                            <div class="log-time">${new Date(log.created_at).toLocaleString('zh-CN')}</div>
+                        </div>
+                        <div class="log-details">
+                            ${log.category_name || '系统操作'} - ${log.operator || '系统'} 
+                            ${log.note ? ` - ${log.note}` : ''}
+                            ${log.ip_address ? `<div style="font-size: 0.75rem; color: var(--text-light); margin-top: 0.25rem;">IP: ${log.ip_address}</div>` : ''}
+                        </div>
+                        <div class="log-score ${log.action_type}">
+                            ${log.action_type === 'add' ? '+' : ''}${log.score_change}
+                        </div>
                     </div>
-                `).join('') : '<div style="text-align: center; color: var(--text-light); padding: 2rem;">暂无快照</div>'}
+                `).join('') : '<div style="text-align: center; padding: 2rem; color: var(--text-light);">暂无日志</div>'}
             </div>
         </div>
 
-        <!-- 操作日志 -->
-        <div class="card card-full">
-            <div class="card-title">📋 最近操作日志</div>
-            <div class="table-container">
-                <table class="data-table">
-                    <thead>
-                        <tr>
-                            <th>时间</th>
-                            <th>学生</th>
-                            <th>操作类型</th>
-                            <th>分数变化</th>
-                            <th>操作教师</th>
-                            <th>备注</th>
-                            <th>IP地址</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        ${(logs.results || []).map(log => `
-                            <tr>
-                                <td>${new Date(log.created_at).toLocaleString('zh-CN')}</td>
-                                <td>${log.student_name}</td>
-                                <td>
-                                    <span style="padding: 0.25rem 0.75rem; border-radius: 20px; font-size: 0.875rem; background: ${log.action_type === 'add' ? 'var(--secondary)' : log.action_type === 'minus' ? 'var(--danger)' : 'var(--warning)'}; color: white;">
-                                        ${log.action_type === 'add' ? '加分' : log.action_type === 'minus' ? '扣分' : '撤销'}
-                                    </span>
-                                </td>
-                                <td class="${log.score_change > 0 ? 'positive' : 'negative'}">
-                                    ${log.score_change > 0 ? '+' : ''}${log.score_change}
-                                </td>
-                                <td>${log.operator}</td>
-                                <td>${log.note || '-'}</td>
-                                <td>${log.ip_address || '-'}</td>
-                            </tr>
-                        `).join('')}
-                    </tbody>
-                </table>
+        <div class="admin-section danger-zone">
+            <div class="section-title">
+                <span>⚠️</span>
+                危险操作区
+            </div>
+            
+            <p style="color: var(--text-light); margin-bottom: 1.5rem;">
+                以下操作不可逆，请谨慎操作！
+            </p>
+            
+            <div style="display: flex; gap: 1rem; flex-wrap: wrap;">
+                <button class="btn btn-danger" onclick="resetScores()">
+                    <span>🔄</span>
+                    重置所有分数
+                </button>
+                
+                <button class="btn btn-danger" onclick="clearAllData()">
+                    <span>🗑️</span>
+                    清除所有数据
+                </button>
             </div>
         </div>
     </div>
 
-    <!-- 重置确认模态框 -->
+    <!-- 重置确认弹窗 -->
     <div class="modal-overlay" id="resetModal">
-        <div class="modal-content danger-modal">
+        <div class="modal-content">
             <button class="modal-close" onclick="closeResetModal()">×</button>
-            <h2 class="danger-title">⚠️ 重置分数确认</h2>
-            <p style="text-align: center; margin-bottom: 1.5rem; color: var(--text);">
-                确定要重置所有学生的分数吗？此操作不可撤销！
-            </p>
-            <div class="form-group">
-                <label>请输入确认密码：</label>
-                <input type="password" id="resetPassword" class="confirm-input" placeholder="请输入管理员密码确认">
+            <div class="modal-title">⚠️ 重置所有分数</div>
+            
+            <div style="margin-bottom: 1.5rem; color: var(--text-light);">
+                <p>此操作将清空所有学生的评分记录，不可恢复！</p>
+                <p>请确认您要执行此操作。</p>
             </div>
-            <div style="display: flex; gap: 1rem;">
-                <button class="btn cancel-btn" style="flex: 1;" onclick="closeResetModal()">取消</button>
-                <button class="btn btn-danger" style="flex: 1;" onclick="resetScores()">确认重置</button>
+            
+            <div class="form-group">
+                <label>管理员账号：</label>
+                <input type="text" id="resetAdminUsername" placeholder="请输入管理员账号">
+            </div>
+            
+            <div class="form-group">
+                <label>管理员密码：</label>
+                <input type="password" id="resetAdminPassword" placeholder="请输入管理员密码">
+            </div>
+            
+            <div class="form-group">
+                <label>确认文本：</label>
+                <input type="text" id="resetConfirmText" placeholder="请输入'确认清除所有数据'">
+            </div>
+            
+            <div class="modal-actions">
+                <button class="modal-btn cancel-btn" onclick="closeResetModal()">
+                    <span>❌</span>
+                    取消
+                </button>
+                <button class="modal-btn danger-btn" onclick="confirmReset()">
+                    <span>✅</span>
+                    确认重置
+                </button>
             </div>
         </div>
     </div>
 
-    <!-- 清空数据确认模态框 -->
-    <div class="modal-overlay" id="clearModal">
-        <div class="modal-content danger-modal">
-            <button class="modal-close" onclick="closeClearModal()">×</button>
-            <h2 class="danger-title">🚨 清空数据确认</h2>
-            <p style="text-align: center; margin-bottom: 1.5rem; color: var(--text);">
-                警告：这将清空所有数据（包括历史记录）！确定要继续吗？
-            </p>
-            <div class="form-group">
-                <label>请输入"确认清空"：</label>
-                <input type="text" id="clearConfirm" class="confirm-input" placeholder="请输入'确认清空'">
-            </div>
-            <div style="display: flex; gap: 1rem;">
-                <button class="btn cancel-btn" style="flex: 1;" onclick="closeClearModal()">取消</button>
-                <button class="btn btn-danger" style="flex: 1;" onclick="clearAllData()">确认清空</button>
-            </div>
-        </div>
+    <div class="footer">
+        <p>By 2314 刘沁熙 | 基于Cloudflare Worker搭建 | Cloudflare CDN提供加速服务</p>
+        <p id="systemInfo">加载中...</p>
     </div>
 
     <script>
-        // 保存设置
-        document.getElementById('settingsForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const formData = new FormData(e.target);
-            const settings = Object.fromEntries(formData);
+        let wallpaperUrl = '';
+        let ipInfo = null;
+        let pageLoadTime = Date.now();
+        
+        // 页面加载完成
+        document.addEventListener('DOMContentLoaded', async function() {
+            // 加载壁纸
+            await loadWallpaper();
             
-            try {
-                const response = await fetch('/api/settings', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(settings)
-                });
+            // 加载IP信息
+            await loadIPInfo();
+            
+            // 更新系统信息
+            updateSystemInfo();
+            
+            // 表单提交
+            document.getElementById('settingsForm').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const formData = new FormData(e.target);
+                const settings = Object.fromEntries(formData);
                 
+                try {
+                    const response = await fetch('/api/settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(settings)
+                    });
+                    
+                    const result = await response.json();
+                    
+                    if (result.success) {
+                        showNotification('设置保存成功！', 'success');
+                        setTimeout(() => location.reload(), 1000);
+                    } else {
+                        showNotification('保存失败，请重试', 'error');
+                    }
+                } catch (error) {
+                    showNotification('网络错误，请重试', 'error');
+                }
+            });
+        });
+        
+        // 加载壁纸
+        async function loadWallpaper() {
+            try {
+                const response = await fetch('/api/wallpaper');
+                const result = await response.json();
+                
+                if (result.success && result.data && result.data.length > 0) {
+                    const wallpaper = result.data[0];
+                    wallpaperUrl = 'https://www.bing.com' + wallpaper.url;
+                    document.body.style.backgroundImage = \`url('\${wallpaperUrl}')\`;
+                }
+            } catch (error) {
+                console.error('加载壁纸失败:', error);
+            }
+        }
+        
+        // 加载IP信息
+        async function loadIPInfo() {
+            try {
+                const startTime = Date.now();
+                const response = await fetch('/api/ip-info');
                 const result = await response.json();
                 
                 if (result.success) {
-                    alert('设置保存成功！');
-                    location.reload();
-                } else {
-                    alert('保存失败，请重试');
+                    ipInfo = result.data;
+                    
+                    // 显示IP通知
+                    const latency = Date.now() - startTime;
+                    showNotification(\`\${ipInfo.flag} \${ipInfo.city} | 延迟: \${latency}ms\`, 'info', 5000);
                 }
             } catch (error) {
-                alert('网络错误，请重试');
+                console.error('加载IP信息失败:', error);
             }
-        });
-
+        }
+        
+        // 更新系统信息
+        function updateSystemInfo() {
+            const now = new Date();
+            const loadTime = Date.now() - pageLoadTime;
+            const timeStr = now.toLocaleString('zh-CN');
+            
+            let info = \`页面加载时间: \${loadTime}ms | 当前时间: \${timeStr}\`;
+            
+            if (ipInfo) {
+                info += \` | IP: \${ipInfo.ip} | 位置: \${ipInfo.city}, \${ipInfo.countryRegion}\`;
+            }
+            
+            document.getElementById('systemInfo').textContent = info;
+        }
+        
+        // 显示通知
+        function showNotification(message, type = 'info', duration = 3000) {
+            const container = document.getElementById('notificationContainer');
+            const notification = document.createElement('div');
+            notification.className = \`notification \${type}\`;
+            notification.innerHTML = \`
+                <span>\${type === 'success' ? '✅' : type === 'error' ? '❌' : type === 'warning' ? '⚠️' : 'ℹ️'}</span>
+                <span>\${message}</span>
+            \`;
+            
+            container.appendChild(notification);
+            
+            setTimeout(() => {
+                notification.style.animation = 'slideOutRight 0.3s ease';
+                setTimeout(() => {
+                    if (notification.parentNode) {
+                        notification.parentNode.removeChild(notification);
+                    }
+                }, 300);
+            }, duration);
+        }
+        
         // 创建快照
         async function createSnapshot() {
-            const title = prompt('请输入快照标题:');
+            const title = prompt('请输入快照标题（如：期中考核）:');
             if (!title) return;
             
             try {
@@ -4221,115 +4518,123 @@ async function renderAdminPage(db, request, ipSession) {
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ title })
                 });
-                
+
                 const result = await response.json();
-                
+
                 if (result.success) {
-                    alert('快照保存成功！');
-                    location.reload();
+                    showNotification('快照保存成功！', 'success');
                 } else {
-                    alert('保存失败');
+                    showNotification(result.error || '保存失败', 'error');
                 }
             } catch (error) {
-                alert('网络错误，请重试');
+                showNotification('网络错误，请重试', 'error');
             }
         }
-
-        // 查看快照
-        function viewSnapshot(title) {
-            window.open(\`/snapshot-view?title=\${encodeURIComponent(title)}\`, '_blank');
-        }
-
-        // 显示所有快照
-        function showSnapshots() {
-            window.open('/snapshots', '_blank');
-        }
-
-        // 显示重置确认模态框
-        function showResetConfirm() {
+        
+        // 重置分数
+        function resetScores() {
             document.getElementById('resetModal').style.display = 'flex';
         }
-
-        // 关闭重置确认模态框
+        
+        // 关闭重置弹窗
         function closeResetModal() {
             document.getElementById('resetModal').style.display = 'none';
         }
-
-        // 显示清空确认模态框
-        function showClearConfirm() {
-            document.getElementById('clearModal').style.display = 'flex';
-        }
-
-        // 关闭清空确认模态框
-        function closeClearModal() {
-            document.getElementById('clearModal').style.display = 'none';
-        }
-
-        // 重置分数
-        async function resetScores() {
-            const password = document.getElementById('resetPassword').value;
+        
+        // 确认重置
+        async function confirmReset() {
+            const username = document.getElementById('resetAdminUsername').value;
+            const password = document.getElementById('resetAdminPassword').value;
+            const confirmText = document.getElementById('resetConfirmText').value;
             
-            // 验证密码
-            const adminPassword = '${settingMap.admin_password || ''}';
-            if (password !== adminPassword) {
-                alert('密码错误！');
+            if (!username || !password || !confirmText) {
+                showNotification('请填写所有字段', 'error');
                 return;
             }
-
-            if (!confirm('最后一次确认：确定要重置所有学生的分数吗？此操作不可撤销！')) return;
+            
+            if (confirmText !== '确认清除所有数据') {
+                showNotification('确认文本不正确', 'error');
+                return;
+            }
             
             try {
                 const response = await fetch('/api/reset', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ confirm: true })
+                    body: JSON.stringify({
+                        adminUsername: username,
+                        adminPassword: password,
+                        confirm: confirmText
+                    })
                 });
                 
                 const result = await response.json();
                 
                 if (result.success) {
-                    alert('分数重置成功！');
+                    showNotification('重置成功！', 'success');
                     closeResetModal();
-                    location.reload();
+                    setTimeout(() => location.reload(), 1500);
                 } else {
-                    alert('重置失败');
+                    showNotification(result.error || '重置失败', 'error');
                 }
             } catch (error) {
-                alert('网络错误，请重试');
+                showNotification('网络错误，请重试', 'error');
             }
         }
-
-        // 清空所有数据
+        
+        // 清除所有数据
         async function clearAllData() {
-            const confirmText = document.getElementById('clearConfirm').value;
+            if (!confirm('⚠️ 警告：这将清空所有数据（包括历史记录）！确定要继续吗？')) return;
+            if (!confirm('🚨 最后一次确认：此操作将永久删除所有数据！')) return;
             
-            if (confirmText !== '确认清空') {
-                alert('请输入正确的确认文本！');
+            // 需要二次验证
+            const username = prompt('请输入管理员账号:');
+            const password = prompt('请输入管理员密码:');
+            
+            if (!username || !password) {
+                showNotification('验证失败', 'error');
                 return;
             }
-
-            if (!confirm('🚨 这是最后一次警告：此操作将永久删除所有数据！确定要继续吗？')) return;
             
             try {
-                // 先重置分数
-                await fetch('/api/reset', {
+                // 验证管理员
+                const verifyResponse = await fetch('/api/verify-admin', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ confirm: true })
+                    body: JSON.stringify({ username, password })
                 });
                 
-                // 清空快照
-                // 清空IP会话
-                // 这里需要扩展API，暂时先重置分数
+                const verifyResult = await verifyResponse.json();
                 
-                alert('所有数据已清空');
-                closeClearModal();
-                location.reload();
+                if (!verifyResult.success) {
+                    showNotification('管理员验证失败', 'error');
+                    return;
+                }
+                
+                // 执行重置
+                const resetResponse = await fetch('/api/reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        adminUsername: username,
+                        adminPassword: password,
+                        confirm: '确认清除所有数据'
+                    })
+                });
+                
+                const resetResult = await resetResponse.json();
+                
+                if (resetResult.success) {
+                    showNotification('所有数据已清除', 'success');
+                    setTimeout(() => location.reload(), 1500);
+                } else {
+                    showNotification('操作失败', 'error');
+                }
             } catch (error) {
-                alert('操作失败');
+                showNotification('网络错误，请重试', 'error');
             }
         }
-
+        
         // 退出登录
         async function logout() {
             try {
@@ -4339,15 +4644,18 @@ async function renderAdminPage(db, request, ipSession) {
                 window.location.href = '/login';
             }
         }
-
-        // 点击模态框外部关闭
-        document.getElementById('resetModal').addEventListener('click', function(e) {
-            if (e.target === this) closeResetModal();
+        
+        // 点击弹窗外部关闭
+        document.querySelectorAll('.modal-overlay').forEach(modal => {
+            modal.addEventListener('click', function(e) {
+                if (e.target === this) {
+                    this.style.display = 'none';
+                }
+            });
         });
         
-        document.getElementById('clearModal').addEventListener('click', function(e) {
-            if (e.target === this) closeClearModal();
-        });
+        // 定期更新系统信息
+        setInterval(updateSystemInfo, 60000);
     </script>
 </body>
 </html>
@@ -4364,7 +4672,7 @@ async function renderAdminPage(db, request, ipSession) {
 // 渲染访客页面
 async function renderVisitorPage(db) {
   try {
-    const rankingData = await handleGetRanking(db).then(r => r.json());
+    const studentsData = await handleGetStudents(db).then(r => r.json());
     const settings = await db.prepare(
       'SELECT key, value FROM settings WHERE key IN (?, ?)'
     ).bind('site_title', 'class_name').all();
@@ -4373,20 +4681,6 @@ async function renderVisitorPage(db) {
     (settings.results || []).forEach(row => {
       settingMap[row.key] = row.value;
     });
-
-    // 获取必应壁纸
-    let bingWallpaper = null;
-    try {
-      const bingResponse = await fetch('https://tc.ilqx.dpdns.org/api/bing/wallpaper');
-      if (bingResponse.ok) {
-        const bingData = await bingResponse.json();
-        if (bingData.status && bingData.data && bingData.data.length > 0) {
-          bingWallpaper = bingData.data[0];
-        }
-      }
-    } catch (error) {
-      console.error('Failed to fetch Bing wallpaper:', error);
-    }
 
     // 完整的访客页面HTML
     const html = `
@@ -4397,102 +4691,111 @@ async function renderVisitorPage(db) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${settingMap.site_title || '班级评分系统'} - 访客视图</title>
     <style>
-        * { 
-            margin: 0; padding: 0; box-sizing: border-box; 
-            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
-        }
-        
-        :root {
-            --primary: #6366f1;
-            --primary-dark: #4f46e5;
-            --secondary: #10b981;
-            --danger: #ef4444;
-            --background: #f8fafc;
-            --surface: #ffffff;
-            --text: #1e293b;
-            --text-light: #64748b;
-            --border: #e2e8f0;
-            --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+        html, body { 
+            height: 100%; 
+            margin: 0; 
+            overflow: auto; 
+            background-color: #e0f7fa;
+            font-family: 'Roboto', Arial, sans-serif;
         }
         
         body { 
-            background: var(--background); 
-            color: var(--text);
-            min-height: 100vh;
+            display: flex; 
+            flex-direction: column; 
+            align-items: center; 
+            justify-content: center; 
+            min-height: 100vh; 
+            color: #333333;
+            background-image: url('https://www.loliapi.com/acg/');
+            background-size: cover; 
+            background-position: center; 
+            background-repeat: no-repeat;
+            position: relative;
         }
         
-        .header { 
-            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); 
-            color: white; 
-            padding: 2rem 1rem; 
-            text-align: center;
-            box-shadow: var(--shadow);
+        .content {
+            text-align: center; 
+            max-width: 90%;
+            padding: 30px; 
+            background-color: rgba(255, 255, 255, 0.3);
+            border-radius: 15px; 
+            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
+            backdrop-filter: blur(5px);
+            border: 1px solid rgba(79, 195, 247, 0.3);
+            transform: scale(0.5);
+            opacity: 0.5;
+            filter: blur(10px);
+            transition: transform 1s ease-out, opacity 1s ease-out, filter 1s ease-out;
         }
         
-        .header h1 { 
-            font-weight: 700; 
-            margin-bottom: 0.5rem;
-            font-size: 2rem;
+        .content.loaded {
+            transform: scale(1);
+            opacity: 1;
+            filter: blur(0);
         }
         
-        .header .subtitle {
-            opacity: 0.9;
-            margin-bottom: 1rem;
+        .content:hover {
+            transform: scale(1.03);
+            box-shadow: 0 12px 40px rgba(79, 195, 247, 0.5), 0 0 20px rgba(176, 196, 222, 0.3);
+        }
+        
+        h1 { 
+            font-size: 2.5rem; 
+            margin-bottom: 20px; 
+            color: #0277bd;
+            text-shadow: 0 0 5px rgba(79, 195, 247, 0.3);
         }
         
         .login-prompt { 
             text-align: center; 
-            padding: 2rem 1rem; 
-            background: var(--surface);
-            margin: 1rem;
-            border-radius: 16px;
-            box-shadow: var(--shadow);
-            animation: slideInUp 0.5s ease;
+            padding: 20px; 
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+            margin: 20px 0;
         }
         
         .login-btn { 
-            background: linear-gradient(135deg, var(--primary), var(--primary-dark)); 
-            color: white; 
-            padding: 1rem 2rem; 
+            background: linear-gradient(45deg, #4fc3f7, #81d4fa); 
+            color: #333333; 
+            padding: 12px 24px; 
             border: none; 
-            border-radius: 12px; 
+            border-radius: 25px; 
             text-decoration: none; 
             display: inline-block; 
-            margin-top: 1rem;
-            font-weight: 600;
+            margin-top: 10px;
+            font-weight: bold; 
             transition: all 0.3s ease;
-            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
-            cursor: pointer;
+            box-shadow: 0 4px 12px rgba(79, 195, 247, 0.3);
+            text-transform: uppercase;
+            letter-spacing: 1px;
         }
         
         .login-btn:hover {
             transform: translateY(-2px);
-            box-shadow: 0 8px 20px rgba(99, 102, 241, 0.4);
+            box-shadow: 0 8px 20px rgba(79, 195, 247, 0.4);
+            background: linear-gradient(45deg, #29b6f6, #4fc3f7);
         }
         
         .ranking-table { 
             width: 100%; 
             border-collapse: separate; 
             border-spacing: 0;
-            background: var(--surface);
-            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
             overflow: hidden;
-            box-shadow: var(--shadow);
-            margin: 1rem 0;
-            animation: fadeIn 0.6s ease;
+            margin: 20px 0;
         }
         
         .ranking-table th, .ranking-table td { 
-            padding: 1.25rem 1rem; 
+            padding: 15px; 
             text-align: center; 
-            border-bottom: 1px solid var(--border);
-            transition: all 0.2s ease;
+            border-bottom: 1px solid rgba(79, 195, 247, 0.3);
         }
         
         .ranking-table th { 
-            background: var(--background); 
-            font-weight: 600; 
-            color: var(--text-light);
+            background: rgba(79, 195, 247, 0.3); 
+            font-weight: bold; 
+            color: #333333;
         }
         
         .ranking-table tr:last-child td { 
@@ -4500,66 +4803,59 @@ async function renderVisitorPage(db) {
         }
         
         .ranking-table tr:hover td {
-            background: var(--background);
-            transform: scale(1.02);
-        }
-        
-        .container { 
-            padding: 1rem; 
-            max-width: 600px; 
-            margin: 0 auto; 
-        }
-        
-        .section-title {
-            font-size: 1.5rem;
-            font-weight: 700;
-            margin: 2rem 0 1rem;
-            text-align: center;
-            color: var(--text);
+            background: rgba(79, 195, 247, 0.1);
         }
         
         .rank-badge {
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            width: 2rem;
-            height: 2rem;
+            width: 30px;
+            height: 30px;
             border-radius: 50%;
-            background: var(--primary);
+            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
             color: white;
-            font-weight: 700;
+            font-weight: bold;
             font-size: 0.875rem;
-            transition: all 0.3s ease;
+            box-shadow: 0 2px 8px rgba(79, 195, 247, 0.3);
         }
         
         .rank-1 { 
-            background: linear-gradient(135deg, #f59e0b, #d97706);
-            box-shadow: 0 4px 12px rgba(245, 158, 11, 0.3);
+            background: linear-gradient(45deg, #f59e0b, #d97706);
         }
         .rank-2 { 
-            background: linear-gradient(135deg, #6b7280, #4b5563);
-            box-shadow: 0 4px 12px rgba(107, 114, 128, 0.3);
+            background: linear-gradient(45deg, #6b7280, #4b5563);
         }
         .rank-3 { 
-            background: linear-gradient(135deg, #92400e, #78350f);
-            box-shadow: 0 4px 12px rgba(146, 64, 14, 0.3);
+            background: linear-gradient(45deg, #92400e, #78350f);
         }
         
-        .total { color: var(--primary); font-weight: 700; }
+        .positive { color: #10b981; font-weight: bold; }
+        .negative { color: #ef4444; font-weight: bold; }
+        .total { color: #0277bd; font-weight: bold; }
+        
+        .footer {
+            margin-top: 30px;
+            padding: 15px;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+            font-size: 0.875rem;
+            color: #333333;
+        }
         
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(20px); }
             to { opacity: 1; transform: translateY(0); }
         }
         
-        @keyframes slideInUp {
-            from { transform: translateY(30px); opacity: 0; }
-            to { transform: translateY(0); opacity: 1; }
-        }
-        
-        @media (max-width: 480px) {
-            .header h1 {
-                font-size: 1.5rem;
+        @media (max-width: 768px) {
+            .content {
+                max-width: 95%;
+                padding: 20px;
+            }
+            
+            h1 {
+                font-size: 1.8rem;
             }
             
             .ranking-table {
@@ -4567,76 +4863,24 @@ async function renderVisitorPage(db) {
             }
             
             .ranking-table th, .ranking-table td {
-                padding: 1rem 0.5rem;
+                padding: 10px 5px;
             }
-        }
-        
-        /* 背景图片样式 */
-        .background-container {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            z-index: -1;
-            overflow: hidden;
-        }
-        
-        .background-image {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-            filter: brightness(0.7);
-        }
-        
-        .background-overlay {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.3);
-        }
-        
-        .background-caption {
-            position: absolute;
-            bottom: 10px;
-            right: 10px;
-            color: white;
-            font-size: 0.75rem;
-            background: rgba(0, 0, 0, 0.5);
-            padding: 0.25rem 0.5rem;
-            border-radius: 4px;
-            max-width: 80%;
-            text-align: right;
         }
     </style>
 </head>
 <body>
-    <!-- 背景图片 -->
-    <div class="background-container">
-        ${bingWallpaper ? `
-            <img src="https://www.bing.com${bingWallpaper.url}" alt="${bingWallpaper.title || '必应每日壁纸'}" class="background-image">
-            <div class="background-overlay"></div>
-            <div class="background-caption">${bingWallpaper.copyright || ''}</div>
-        ` : ''}
-    </div>
-    
-    <div class="header">
+    <div class="content" id="contentContainer">
         <h1>${settingMap.site_title || '2314班综合评分系统'}</h1>
-        <div class="subtitle">${settingMap.class_name || '2314班'} - 访客视图</div>
-    </div>
-    
-    <div class="container">
-        <div class="login-prompt">
-            <p style="font-size: 1.1rem; margin-bottom: 1rem; color: var(--text);">查看完整功能请登录系统</p>
-            <button class="login-btn" onclick="window.location.href='/login'">🔐 立即登录</button>
-            <p style="margin-top: 1.5rem; font-size: 0.875rem; color: var(--text-light);">
-                By 2314 刘沁熙 基于cloudflare worker搭建 cloudflare cdn提供加速服务
-            </p>
+        <div style="color: #0277bd; margin-bottom: 20px; font-weight: bold;">
+            ${settingMap.class_name || '2314班'} - 访客视图
         </div>
         
-        <div class="section-title">🏆 学生评分总榜</div>
+        <div class="login-prompt">
+            <p style="font-size: 1.1rem; margin-bottom: 10px; color: #333333; font-weight: bold;">查看完整功能请登录系统</p>
+            <a href="/login" class="login-btn">🔐 立即登录</a>
+        </div>
+        
+        <div style="font-size: 1.2rem; margin: 20px 0; color: #0277bd; font-weight: bold;">🏆 学生评分总榜</div>
         
         <table class="ranking-table">
             <thead>
@@ -4647,22 +4891,73 @@ async function renderVisitorPage(db) {
                 </tr>
             </thead>
             <tbody>
-                ${rankingData.success ? (rankingData.ranking || []).slice(0, 20).map((student, index) => `
+                ${studentsData.success ? (studentsData.students || []).map((student, index) => `
                     <tr>
                         <td>
-                            <div class="rank-badge ${index < 3 ? \`rank-\${index + 1}\` : ''}">
+                            <div class="rank-badge ${index < 3 ? `rank-${index + 1}` : ''}">
                                 ${index + 1}
                             </div>
                         </td>
-                        <td>${student.name}</td>
+                        <td style="font-weight: bold;">${student.name}</td>
                         <td class="total">
                             ${student.total_score > 0 ? '+' : ''}${student.total_score}
                         </td>
                     </tr>
-                `).join('') : '<tr><td colspan="3" style="text-align: center; padding: 2rem;">加载中...</td></tr>'}
+                `).join('') : '<tr><td colspan="3" style="text-align: center; padding: 20px;">加载中...</td></tr>'}
             </tbody>
         </table>
+        
+        <div class="footer">
+            <p>By 2314 刘沁熙 | 基于Cloudflare Worker搭建 | Cloudflare CDN提供加速服务</p>
+            <p id="visitorInfo">加载中...</p>
+        </div>
     </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', async function() {
+            var container = document.getElementById('contentContainer');
+            setTimeout(function() {
+                container.classList.add('loaded');
+            }, 100);
+            
+            // 加载IP信息
+            await loadIPInfo();
+            
+            // 更新访客信息
+            updateVisitorInfo();
+        });
+        
+        // 加载IP信息
+        async function loadIPInfo() {
+            try {
+                const startTime = Date.now();
+                const response = await fetch('/api/ip-info');
+                const result = await response.json();
+                
+                if (result.success) {
+                    window.ipInfo = result.data;
+                    window.pageLoadTime = startTime;
+                }
+            } catch (error) {
+                console.error('加载IP信息失败:', error);
+            }
+        }
+        
+        // 更新访客信息
+        function updateVisitorInfo() {
+            const now = new Date();
+            const loadTime = Date.now() - window.pageLoadTime;
+            const timeStr = now.toLocaleString('zh-CN');
+            
+            let info = \`页面加载时间: \${loadTime}ms | 当前时间: \${timeStr}\`;
+            
+            if (window.ipInfo) {
+                info += \` | 位置: \${window.ipInfo.city}, \${window.ipInfo.countryRegion}\`;
+            }
+            
+            document.getElementById('visitorInfo').textContent = info;
+        }
+    </script>
 </body>
 </html>
     `;
@@ -4675,18 +4970,15 @@ async function renderVisitorPage(db) {
   }
 }
 
-// 渲染快照列表页面
-async function renderSnapshotsPage(db, request, ipSession) {
+// 渲染快照页面
+async function renderSnapshotsPage(db, request) {
   try {
-    // 检查IP会话
-    if (!ipSession.authenticated) {
+    const session = await validateSession(request, db);
+    if (!session) {
       return Response.redirect(new URL('/login', request.url));
     }
 
-    const snapshots = await db.prepare(
-      'SELECT DISTINCT title, snapshot_date FROM monthly_snapshots ORDER BY snapshot_date DESC'
-    ).all();
-
+    const snapshots = await handleGetSnapshots(db).then(r => r.json());
     const settings = await db.prepare(
       'SELECT key, value FROM settings WHERE key IN (?, ?)'
     ).bind('site_title', 'class_name').all();
@@ -4702,77 +4994,65 @@ async function renderSnapshotsPage(db, request, ipSession) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>历史快照 - ${settingMap.site_title || '班级评分系统'}</title>
+    <title>历史数据 - ${settingMap.site_title || '班级评分系统'}</title>
     <style>
-        * { 
-            margin: 0; padding: 0; box-sizing: border-box; 
-            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
-        }
-        
-        :root {
-            --primary: #6366f1;
-            --primary-dark: #4f46e5;
-            --secondary: #10b981;
-            --danger: #ef4444;
-            --background: #f8fafc;
-            --surface: #ffffff;
-            --text: #1e293b;
-            --text-light: #64748b;
-            --border: #e2e8f0;
-            --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+        html, body { 
+            height: 100%; 
+            margin: 0; 
+            overflow: auto; 
+            background-color: #e0f7fa;
+            font-family: 'Roboto', Arial, sans-serif;
         }
         
         body { 
-            background: var(--background); 
-            color: var(--text);
-            min-height: 100vh;
+            min-height: 100vh; 
+            color: #333333;
+            background-image: url('https://www.loliapi.com/acg/');
+            background-size: cover; 
+            background-position: center; 
+            background-repeat: no-repeat;
+            position: relative;
         }
         
-        .header { 
-            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); 
-            color: white; 
-            padding: 1.5rem 2rem; 
-            box-shadow: var(--shadow);
-        }
-        
-        .header-content { 
-            display: flex; 
-            justify-content: space-between; 
+        .header {
+            background: rgba(255, 255, 255, 0.9);
+            padding: 1rem 2rem;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            display: flex;
+            justify-content: space-between;
             align-items: center;
-            max-width: 1200px;
-            margin: 0 auto;
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid rgba(79, 195, 247, 0.3);
         }
         
-        .class-info h1 { 
-            font-weight: 700; 
-            margin-bottom: 0.5rem; 
+        .header h1 {
+            color: #0277bd;
+            font-size: 1.5rem;
+            margin: 0;
         }
         
         .btn {
-            padding: 0.75rem 1.5rem;
-            border: none;
-            border-radius: 12px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
+            padding: 0.5rem 1rem;
+            border-radius: 25px;
             text-decoration: none;
+            font-weight: bold;
+            transition: all 0.3s ease;
             display: inline-flex;
             align-items: center;
             gap: 0.5rem;
         }
         
         .btn-primary {
-            background: rgba(255,255,255,0.2);
-            color: white;
-            border: 1px solid rgba(255,255,255,0.3);
+            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
+            color: #333333;
         }
         
         .btn-primary:hover {
-            background: rgba(255,255,255,0.3);
             transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(79, 195, 247, 0.4);
         }
         
-        .container {
+        .main-content {
             max-width: 1200px;
             margin: 0 auto;
             padding: 2rem;
@@ -4786,111 +5066,140 @@ async function renderSnapshotsPage(db, request, ipSession) {
         }
         
         .snapshot-card {
-            background: var(--surface);
-            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.3);
+            border-radius: 15px;
             padding: 1.5rem;
-            box-shadow: var(--shadow);
             transition: all 0.3s ease;
-            cursor: pointer;
-            border: 2px solid transparent;
+            border: 1px solid rgba(79, 195, 247, 0.3);
+            backdrop-filter: blur(5px);
         }
         
         .snapshot-card:hover {
             transform: translateY(-8px);
-            box-shadow: 0 20px 40px -12px rgba(0, 0, 0, 0.25);
-            border-color: var(--primary);
+            box-shadow: 0 8px 32px rgba(79, 195, 247, 0.3), 0 0 10px rgba(176, 196, 222, 0.2);
+            background: rgba(255, 255, 255, 0.4);
         }
         
         .snapshot-title {
             font-size: 1.25rem;
-            font-weight: 700;
-            color: var(--text);
+            font-weight: bold;
+            color: #0277bd;
             margin-bottom: 0.5rem;
         }
         
-        .snapshot-date {
-            color: var(--text-light);
+        .snapshot-meta {
             font-size: 0.875rem;
+            color: #666666;
             margin-bottom: 1rem;
         }
         
-        .snapshot-info {
+        .snapshot-actions {
             display: flex;
-            justify-content: space-between;
-            font-size: 0.875rem;
-            color: var(--text-light);
+            gap: 0.5rem;
+            margin-top: 1rem;
+        }
+        
+        .action-btn {
+            flex: 1;
+            padding: 0.5rem;
+            border-radius: 8px;
+            border: none;
+            background: rgba(79, 195, 247, 0.2);
+            color: #0277bd;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.25rem;
+        }
+        
+        .action-btn:hover {
+            background: rgba(79, 195, 247, 0.3);
+            transform: translateY(-2px);
         }
         
         .empty-state {
             text-align: center;
             padding: 4rem 2rem;
-            color: var(--text-light);
+            color: #666666;
+        }
+        
+        .footer {
+            text-align: center;
+            padding: 2rem;
+            color: #666666;
+            font-size: 0.875rem;
+            margin-top: 2rem;
         }
         
         @media (max-width: 768px) {
-            .container {
+            .main-content {
                 padding: 1rem;
-            }
-            
-            .snapshots-grid {
-                grid-template-columns: 1fr;
             }
             
             .header {
                 padding: 1rem;
-            }
-            
-            .header-content {
                 flex-direction: column;
                 gap: 1rem;
-                text-align: center;
+            }
+            
+            .snapshots-grid {
+                grid-template-columns: 1fr;
             }
         }
     </style>
 </head>
 <body>
     <div class="header">
-        <div class="header-content">
-            <div class="class-info">
-                <h1>📊 历史快照</h1>
-                <div>${settingMap.site_title || '班级评分系统'}</div>
-            </div>
-            <div>
-                <a href="/class" class="btn btn-primary">← 返回评分系统</a>
-            </div>
+        <h1>📊 历史数据 - ${settingMap.site_title || '班级评分系统'}</h1>
+        <div>
+            <a href="/class" class="btn btn-primary">
+                <span>⬅️</span>
+                返回班级视图
+            </a>
         </div>
     </div>
-
-    <div class="container">
-        <h2 style="color: var(--text);">历史数据快照</h2>
-        <p style="color: var(--text-light); margin-bottom: 2rem;">点击快照查看详细数据</p>
+    
+    <div class="main-content">
+        <p style="color: #666666; text-align: center;">
+            这里是历史保存的快照数据，点击查看详情可以查看当时的评分情况。
+        </p>
         
-        ${(snapshots.results || []).length > 0 ? `
+        ${snapshots.success && snapshots.snapshots && snapshots.snapshots.length > 0 ? `
             <div class="snapshots-grid">
-                ${(snapshots.results || []).map(snapshot => `
-                    <div class="snapshot-card" onclick="viewSnapshot('${snapshot.title}')">
+                ${snapshots.snapshots.map(snapshot => `
+                    <div class="snapshot-card">
                         <div class="snapshot-title">${snapshot.title}</div>
-                        <div class="snapshot-date">${new Date(snapshot.snapshot_date).toLocaleString('zh-CN')}</div>
-                        <div class="snapshot-info">
-                            <span>点击查看详情</span>
-                            <span>📊</span>
+                        <div class="snapshot-meta">
+                            <div>月份: ${snapshot.month}</div>
+                            <div>保存时间: ${new Date(snapshot.created_at).toLocaleString('zh-CN')}</div>
+                        </div>
+                        <div class="snapshot-actions">
+                            <button class="action-btn" onclick="viewSnapshot(${snapshot.id})">
+                                <span>👁️</span>
+                                查看详情
+                            </button>
                         </div>
                     </div>
                 `).join('')}
             </div>
         ` : `
             <div class="empty-state">
-                <div style="font-size: 3rem; margin-bottom: 1rem;">📭</div>
-                <h3>暂无历史快照</h3>
-                <p>还没有保存过任何快照数据</p>
-                <a href="/class" class="btn" style="background: var(--primary); color: white; margin-top: 1rem;">返回系统保存快照</a>
+                <h3>暂无历史数据</h3>
+                <p>还没有保存过任何快照数据。</p>
             </div>
         `}
     </div>
+    
+    <div class="footer">
+        <p>By 2314 刘沁熙 | 基于Cloudflare Worker搭建 | Cloudflare CDN提供加速服务</p>
+    </div>
 
     <script>
-        function viewSnapshot(title) {
-            window.open(\`/snapshot-view?title=\${encodeURIComponent(title)}\`, '_blank');
+        function viewSnapshot(snapshotId) {
+            window.open(\`/snapshot-detail?id=\${snapshotId}\`, '_blank');
         }
     </script>
 </body>
@@ -4905,32 +5214,22 @@ async function renderSnapshotsPage(db, request, ipSession) {
   }
 }
 
-// 渲染快照查看页面
-async function renderSnapshotViewPage(db, request) {
+// 渲染快照详情页面
+async function renderSnapshotDetailPage(db, url) {
   try {
-    const url = new URL(request.url);
-    const title = url.searchParams.get('title');
+    const snapshotId = url.searchParams.get('id');
     
-    if (!title) {
-      return Response.redirect(new URL('/snapshots', request.url));
+    if (!snapshotId) {
+      return renderErrorPage('缺少快照ID');
     }
 
-    const [snapshotData, settings] = await Promise.all([
-      handleGetMonthlyData(request, db).then(r => r.json()),
-      db.prepare('SELECT key, value FROM settings WHERE key IN (?, ?)').bind('site_title', 'class_name').all()
-    ]);
-
-    const settingMap = {};
-    (settings.results || []).forEach(row => {
-      settingMap[row.key] = row.value;
-    });
-
-    if (!snapshotData.success || !snapshotData.data || snapshotData.data.length === 0) {
-      return renderErrorPage('快照数据不存在');
+    const snapshot = await handleGetSnapshotDetail(db, snapshotId).then(r => r.json());
+    
+    if (!snapshot.success) {
+      return renderErrorPage(snapshot.error || '快照不存在');
     }
 
-    // 按总分排序
-    const sortedData = [...(snapshotData.data || [])].sort((a, b) => b.total_score - a.total_score);
+    const snapshotData = JSON.parse(snapshot.snapshot.snapshot_data);
 
     const html = `
 <!DOCTYPE html>
@@ -4938,237 +5237,202 @@ async function renderSnapshotViewPage(db, request) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${title} - ${settingMap.site_title || '班级评分系统'}</title>
+    <title>${snapshotData.title} - 历史数据详情</title>
     <style>
-        * { 
-            margin: 0; padding: 0; box-sizing: border-box; 
-            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; 
-        }
-        
-        :root {
-            --primary: #6366f1;
-            --primary-dark: #4f46e5;
-            --secondary: #10b981;
-            --danger: #ef4444;
-            --background: #f8fafc;
-            --surface: #ffffff;
-            --text: #1e293b;
-            --text-light: #64748b;
-            --border: #e2e8f0;
-            --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+        html, body { 
+            height: 100%; 
+            margin: 0; 
+            overflow: auto; 
+            background-color: #e0f7fa;
+            font-family: 'Roboto', Arial, sans-serif;
         }
         
         body { 
-            background: var(--background); 
-            color: var(--text);
-            min-height: 100vh;
+            min-height: 100vh; 
+            color: #333333;
+            background-image: url('https://www.loliapi.com/acg/');
+            background-size: cover; 
+            background-position: center; 
+            background-repeat: no-repeat;
+            position: relative;
         }
         
-        .header { 
-            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); 
-            color: white; 
-            padding: 1.5rem 2rem; 
-            box-shadow: var(--shadow);
-        }
-        
-        .header-content { 
-            display: flex; 
-            justify-content: space-between; 
+        .header {
+            background: rgba(255, 255, 255, 0.9);
+            padding: 1rem 2rem;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            display: flex;
+            justify-content: space-between;
             align-items: center;
-            max-width: 1200px;
-            margin: 0 auto;
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid rgba(79, 195, 247, 0.3);
         }
         
-        .class-info h1 { 
-            font-weight: 700; 
-            margin-bottom: 0.5rem; 
+        .header h1 {
+            color: #0277bd;
+            font-size: 1.5rem;
+            margin: 0;
         }
         
         .btn {
-            padding: 0.75rem 1.5rem;
-            border: none;
-            border-radius: 12px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
+            padding: 0.5rem 1rem;
+            border-radius: 25px;
             text-decoration: none;
+            font-weight: bold;
+            transition: all 0.3s ease;
             display: inline-flex;
             align-items: center;
             gap: 0.5rem;
         }
         
         .btn-primary {
-            background: rgba(255,255,255,0.2);
-            color: white;
-            border: 1px solid rgba(255,255,255,0.3);
+            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
+            color: #333333;
         }
         
         .btn-primary:hover {
-            background: rgba(255,255,255,0.3);
             transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(79, 195, 247, 0.4);
         }
         
-        .container {
+        .main-content {
             max-width: 1200px;
             margin: 0 auto;
             padding: 2rem;
         }
         
-        .snapshot-header {
-            background: var(--surface);
-            border-radius: 16px;
-            padding: 2rem;
-            box-shadow: var(--shadow);
+        .snapshot-info {
+            background: rgba(255, 255, 255, 0.3);
+            border-radius: 15px;
+            padding: 1.5rem;
             margin-bottom: 2rem;
-            text-align: center;
+            border: 1px solid rgba(79, 195, 247, 0.3);
+            backdrop-filter: blur(5px);
         }
         
         .snapshot-title {
-            font-size: 2rem;
-            font-weight: 700;
-            color: var(--text);
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #0277bd;
             margin-bottom: 0.5rem;
         }
         
-        .snapshot-date {
-            color: var(--text-light);
-            font-size: 1rem;
+        .snapshot-meta {
+            font-size: 0.875rem;
+            color: #666666;
         }
         
-        .data-table {
-            width: 100%;
-            background: var(--surface);
-            border-radius: 16px;
+        .ranking-table { 
+            width: 100%; 
+            border-collapse: separate; 
+            border-spacing: 0;
+            background: rgba(255, 255, 255, 0.3);
+            border-radius: 10px;
             overflow: hidden;
-            box-shadow: var(--shadow);
-            margin-top: 2rem;
+            backdrop-filter: blur(5px);
+            border: 1px solid rgba(79, 195, 247, 0.3);
         }
         
-        .data-table th, .data-table td {
-            padding: 1.25rem 1rem;
-            text-align: center;
-            border-bottom: 1px solid var(--border);
+        .ranking-table th, .ranking-table td { 
+            padding: 15px; 
+            text-align: center; 
+            border-bottom: 1px solid rgba(79, 195, 247, 0.3);
         }
         
-        .data-table th {
-            background: var(--background);
-            font-weight: 600;
-            color: var(--text-light);
-            position: sticky;
-            top: 0;
+        .ranking-table th { 
+            background: rgba(79, 195, 247, 0.3); 
+            font-weight: bold; 
+            color: #333333;
         }
         
-        .data-table tr:hover td {
-            background: var(--background);
+        .ranking-table tr:last-child td { 
+            border-bottom: none; 
+        }
+        
+        .ranking-table tr:hover td {
+            background: rgba(79, 195, 247, 0.1);
         }
         
         .rank-badge {
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            width: 2rem;
-            height: 2rem;
+            width: 30px;
+            height: 30px;
             border-radius: 50%;
-            background: var(--primary);
+            background: linear-gradient(45deg, #4fc3f7, #81d4fa);
             color: white;
-            font-weight: 700;
+            font-weight: bold;
             font-size: 0.875rem;
+            box-shadow: 0 2px 8px rgba(79, 195, 247, 0.3);
         }
         
         .rank-1 { 
-            background: linear-gradient(135deg, #f59e0b, #d97706);
+            background: linear-gradient(45deg, #f59e0b, #d97706);
         }
         .rank-2 { 
-            background: linear-gradient(135deg, #6b7280, #4b5563);
+            background: linear-gradient(45deg, #6b7280, #4b5563);
         }
         .rank-3 { 
-            background: linear-gradient(135deg, #92400e, #78350f);
+            background: linear-gradient(45deg, #92400e, #78350f);
         }
         
-        .add-score { color: var(--secondary); font-weight: 600; }
-        .minus-score { color: var(--danger); font-weight: 600; }
-        .total-score { color: var(--primary); font-weight: 700; }
+        .positive { color: #10b981; font-weight: bold; }
+        .negative { color: #ef4444; font-weight: bold; }
+        .total { color: #0277bd; font-weight: bold; }
+        
+        .footer {
+            text-align: center;
+            padding: 2rem;
+            color: #666666;
+            font-size: 0.875rem;
+            margin-top: 2rem;
+        }
         
         @media (max-width: 768px) {
-            .container {
+            .main-content {
                 padding: 1rem;
             }
             
             .header {
                 padding: 1rem;
-            }
-            
-            .header-content {
                 flex-direction: column;
                 gap: 1rem;
-                text-align: center;
             }
             
-            .data-table {
+            .ranking-table {
                 font-size: 0.9rem;
             }
             
-            .data-table th, .data-table td {
-                padding: 1rem 0.5rem;
-            }
-        }
-        
-        .print-btn {
-            background: var(--secondary);
-            color: white;
-            margin-left: 1rem;
-        }
-        
-        .print-btn:hover {
-            background: #0da271;
-        }
-        
-        @media print {
-            .header, .btn {
-                display: none;
-            }
-            
-            .container {
-                padding: 0;
-            }
-            
-            .snapshot-header {
-                box-shadow: none;
-                border: 1px solid var(--border);
-            }
-            
-            .data-table {
-                box-shadow: none;
-                border: 1px solid var(--border);
+            .ranking-table th, .ranking-table td {
+                padding: 10px 5px;
             }
         }
     </style>
 </head>
 <body>
     <div class="header">
-        <div class="header-content">
-            <div class="class-info">
-                <h1>📊 快照详情</h1>
-                <div>${settingMap.site_title || '班级评分系统'}</div>
-            </div>
-            <div>
-                <a href="/snapshots" class="btn btn-primary">← 返回快照列表</a>
-                <button class="btn print-btn" onclick="window.print()">
-                    🖨️ 打印
-                </button>
-            </div>
+        <h1>📊 历史数据详情</h1>
+        <div>
+            <a href="/snapshots" class="btn btn-primary">
+                <span>⬅️</span>
+                返回历史数据
+            </a>
         </div>
     </div>
-
-    <div class="container">
-        <div class="snapshot-header">
-            <div class="snapshot-title">${title}</div>
-            <div class="snapshot-date">
-                快照时间: ${snapshotData.data && snapshotData.data[0] ? new Date(snapshotData.data[0].snapshot_date).toLocaleString('zh-CN') : '未知时间'}
+    
+    <div class="main-content">
+        <div class="snapshot-info">
+            <div class="snapshot-title">${snapshotData.title}</div>
+            <div class="snapshot-meta">
+                <div>保存时间: ${new Date(snapshotData.timestamp).toLocaleString('zh-CN')}</div>
+                <div>快照ID: ${snapshot.snapshot.id}</div>
             </div>
         </div>
         
-        <table class="data-table">
+        <div style="font-size: 1.2rem; margin: 20px 0; color: #0277bd; font-weight: bold;">🏆 学生评分排名</div>
+        
+        <table class="ranking-table">
             <thead>
                 <tr>
                     <th width="80">排名</th>
@@ -5179,32 +5443,27 @@ async function renderSnapshotViewPage(db, request) {
                 </tr>
             </thead>
             <tbody>
-                ${sortedData.map((item, index) => `
+                ${snapshotData.students.sort((a, b) => b.total_score - a.total_score).map((student, index) => `
                     <tr>
                         <td>
-                            <div class="rank-badge ${index < 3 ? \`rank-\${index + 1}\` : ''}">
+                            <div class="rank-badge ${index < 3 ? `rank-${index + 1}` : ''}">
                                 ${index + 1}
                             </div>
                         </td>
-                        <td>${item.student_name}</td>
-                        <td class="add-score">${item.add_score}</td>
-                        <td class="minus-score">${item.minus_score}</td>
-                        <td class="total-score">${item.total_score > 0 ? '+' : ''}${item.total_score}</td>
+                        <td style="font-weight: bold;">${student.name}</td>
+                        <td class="positive">${student.add_score}</td>
+                        <td class="negative">${student.minus_score}</td>
+                        <td class="total">${student.total_score > 0 ? '+' : ''}${student.total_score}</td>
                     </tr>
                 `).join('')}
             </tbody>
         </table>
     </div>
-
-    <script>
-        // 页面加载时自动滚动到表格
-        window.addEventListener('load', () => {
-            const table = document.querySelector('.data-table');
-            if (table) {
-                table.scrollIntoView({ behavior: 'smooth' });
-            }
-        });
-    </script>
+    
+    <div class="footer">
+        <p>By 2314 刘沁熙 | 基于Cloudflare Worker搭建 | Cloudflare CDN提供加速服务</p>
+        <p>快照时间: ${new Date(snapshotData.timestamp).toLocaleString('zh-CN')}</p>
+    </div>
 </body>
 </html>
     `;
@@ -5213,6 +5472,6 @@ async function renderSnapshotViewPage(db, request) {
       headers: { 'Content-Type': 'text/html; charset=utf-8' }
     });
   } catch (error) {
-    return renderErrorPage('快照查看页面加载失败: ' + error.message);
+    return renderErrorPage('快照详情页面加载失败: ' + error.message);
   }
 }
