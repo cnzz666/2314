@@ -3433,7 +3433,7 @@ async function renderClassPage(db, request, clientIP, userAgent) {
             </div>
         </div>
         <div class="cloudflare-badge">
-            由Cloudflare Page强力驱动
+            由Cloudflare Worker强力驱动
         </div>
     </div>
     
@@ -3459,7 +3459,7 @@ async function renderClassPage(db, request, clientIP, userAgent) {
         </div>
         <div class="info-card weather-container">
             <div class="info-card-title">天气</div>
-            <iframe allowtransparency="true" frameborder="0" width="100%" height="240" scrolling="no" src="https://tianqi.2345.com/plugin/widget/index.htm?s=2&z=3&t=0&v=1&d=3&bd=1&k=000000&f=&ltf=009944&htf=cc0000&q=1&e=1&a=1&c=70866&w=100%&h=240&align=left"></iframe>
+<iframe allowtransparency="true" frameborder="0" width="140" height="203" scrolling="no" src="//tianqi.2345.com/plugin/widget/index.htm?s=2&z=3&t=1&v=1&d=2&bd=0&k=&f=&ltf=009944&htf=cc0000&q=1&e=1&a=1&c=54511&w=140&h=203&align=center"></iframe>
         </div>
         <div class="info-card schedule-container">
             <div class="info-card-title">课表</div>
@@ -3875,7 +3875,7 @@ async function renderClassPage(db, request, clientIP, userAgent) {
                 '四': ['英语', '英语', '英语', '数学', '数学', '历史', '在宿舍', '午休', '数学', '政治', '化学', '语文', '晚饭', '语文', '英语', '英语', '政治', '语文'],
                 '五': ['语文', '语文', '语文', '英语', '语文', '物理', '在宿舍', '午休', '物理', '物理', '数学', '数学', '晚饭', '英政治', '历史', '历史', '化学', '英语'],
                 '六': ['英语', '英语', '语文', '语文化学', '语文', '历史', '在宿舍', '午休', '数学', '放假', '数学', '数学', '晚放', '班会', '化学', '英语', '物理', '数学'],
-                '日': ['轮流', '政治', '数学', '', '物理', '数学', '放假', '↑', '', '', '', '', '返校', '', '英语', '数学', '阅读', '数学.']
+                '日': ['轮流', '政治', '数学', '', '物理', '数学', '放假', '↑', '', '', '', '', '返校', '', '英语', '数学', '阅读', '数学']
             };
             
             const timeSlots = [
