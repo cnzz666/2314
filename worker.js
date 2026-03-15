@@ -487,7 +487,7 @@ function renderMainPage(request) {
     <div class="dashboard-grid">
         <!-- 天气卡片 (使用 iframe) -->
         <div class="card">
-            <div class="card-title">⛅ 北京天气</div>
+            <div class="card-title">天气</div>
             <div class="weather-frame">
                 <iframe allowtransparency="true" frameborder="0" width="100%" height="96" scrolling="no" src="//tianqi.2345.com/plugin/widget/index.htm?s=1&z=1&t=0&v=0&d=3&bd=0&k=&f=&ltf=009944&htf=cc0000&q=1&e=1&a=1&c=54511&w=385&h=96&align=center"></iframe>
             </div>
@@ -507,7 +507,7 @@ function renderMainPage(request) {
     </div>
 
     <!-- 底部署名 (固定) -->
-    <div class="footer-note">by 2314 liuqinxi · 中考倒计时</div>
+    <div class="footer-note">by 2314 liuqinxi</div>
 </div>
 
 <script>
