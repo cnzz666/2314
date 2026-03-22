@@ -282,7 +282,7 @@ function renderMainPage(ip) {
 
     <!-- 每日一言 正中下方 -->
     <div class="hitokoto-area" id="hitokoto-area">
-        <div class="hitokoto-text" id="hitokoto-text">✨ 一言加载中...</div>
+        <div class="hitokoto-text" id="hitokoto-text">一言加载中...</div>
         <div class="hitokoto-from" id="hitokoto-from"></div>
     </div>
 
@@ -297,11 +297,11 @@ function renderMainPage(ip) {
         async function fetchAPI(apiUrl) {
             try {
                 const resp = await fetch(API_PROXY + encodeURIComponent(apiUrl));
-                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                if (!resp.ok) throw new Error("HTTP " + resp.status);
                 const json = await resp.json();
                 return json;
             } catch (err) {
-                console.error(`[API Error] ${apiUrl}`, err);
+                console.error("[API Error] " + apiUrl, err);
                 return { error: true, message: err.message };
             }
         }
@@ -354,26 +354,20 @@ function renderMainPage(ip) {
             const container = document.getElementById('weather-widget');
             container.innerHTML = '<div style="text-align:center;">获取位置中...</div>';
             try {
-                // 获取客户端IP（通过服务端传递的IP无法在前端直接获取，这里使用ipify确保前端也能定位）
                 const ipResp = await fetch('https://api.ipify.org?format=json');
                 const ipData = await ipResp.json();
                 const clientIP = ipData.ip;
-                // 通过IP查询城市代码（使用高德或百度，这里使用ip-api.com快速定位）
                 const geoResp = await fetch(`http://ip-api.com/json/${clientIP}?fields=status,city,countryCode`);
                 const geo = await geoResp.json();
-                let cityCode = '54511'; // 默认北京
+                let cityCode = '54511';
                 if (geo.status === 'success' && geo.countryCode === 'CN') {
-                    // 城市映射表（简单映射常用城市，若不匹配则使用默认）
                     const cityMap = {
                         '北京': '54511', '上海': '58367', '广州': '59287', '深圳': '59493',
                         '杭州': '58457', '南京': '58238', '武汉': '57494', '成都': '56294',
-                        '重庆': '57516', '西安': '57036', '会泽': '56778' // 会泽近似代码
+                        '重庆': '57516', '西安': '57036', '会泽': '56778'
                     };
                     cityCode = cityMap[geo.city] || '54511';
-                } else {
-                    cityCode = '54511';
                 }
-                // 嵌入2345天气iframe (无emoji)
                 const iframeSrc = `//tianqi.2345.com/plugin/widget/index.htm?s=1&z=1&t=0&v=0&d=3&bd=0&k=&f=&ltf=009944&htf=cc0000&q=1&e=1&a=1&c=${cityCode}&w=385&h=96&align=center`;
                 container.innerHTML = `
                     <div class="weather-iframe-wrap">
@@ -469,7 +463,6 @@ function renderMainPage(ip) {
                         historyDiv.innerHTML = '<div class="error-msg">历史详情获取失败，请刷新</div>';
                     }
                 } else {
-                    // 备用：直接获取一个有图片的历史条目
                     const fallbackRes = await fetchAPI('https://api.wetab.link/api/history/detail?id=3898');
                     if (fallbackRes && fallbackRes.code === 0 && fallbackRes.data && fallbackRes.data[0]) {
                         const detail = fallbackRes.data[0];
