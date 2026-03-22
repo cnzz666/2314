@@ -69,7 +69,7 @@ function renderCaptchaPage(ip) {
         <p><strong>互联网知识之 Cloudflare 是什么：</strong><br>
         Cloudflare 是一套全球分布式网络体系，它能够通过分发式边缘计算拦截 DDoS 攻击、过滤恶意机器人请求并加速网页加载。作为网站的防御屏障，它确保了数据传输的完整性与访问的稳定性。验证通过后，您将获得受保护的访问权限。</p>
         <div class="cf-turnstile" data-sitekey="${CF_SITE_KEY}" data-callback="onVerify"></div>
-        <div id="success-hint">验证成功，正在进入系统...</div>
+        <div id="success-hint">✓ 验证成功！</div>
     </div>
     <div class="footer">你的ip: ${ip}</div>
     <script>
