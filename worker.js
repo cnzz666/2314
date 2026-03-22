@@ -1,788 +1,313 @@
-// worker.js - 重构版班级主页系统 (无登录/评分, 纸质风格, 带Turnstile验证)
+﻿/**
+ * 2314 lqx 现代化起始页 - Google Gemini Pro 3.1 优化版
+ * 功能：CF验证、动态天气、热搜、历史上的今天、中考倒计时、搜索建议
+ */
+
+const CF_SITE_KEY = '0x4AAAAAACH2EhsLlcPLE8QH';
+const CF_SECRET_KEY = '0x4AAAAAACH2Ev3JYFva9CblnEt-iqKNGAk';
+const WALLPAPER_URL = 'https://tc.ilqx.dpdns.org/file/AgACAgUAAyEGAASHMyZ1AAMSabZ5Y7HEwrA0vgKDxUX6lg3i_uQAAicPaxtXMblValDi_jjojFEBAAMCAAN3AAM6BA.jpg';
+
 export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const path = url.pathname;
+    async fetch(request, env) {
+        const url = new URL(request.url);
+        const path = url.pathname;
+        const clientIP = request.headers.get('CF-Connecting-IP') || '未知IP';
 
-    // 处理 Turnstile 验证回调
-    if (path === '/verify-turnstile' && request.method === 'POST') {
-      return handleVerifyTurnstile(request);
+        // 1. 处理 API 动态代理 (严禁模拟数据)
+        if (path.startsWith('/api/')) {
+            return await handleProxyAPI(path, url.searchParams);
+        }
+
+        // 2. 处理 Turnstile 验证提交
+        if (request.method === 'POST' && path === '/verify-security') {
+            const body = await request.formData();
+            const token = body.get('cf-turnstile-response');
+            
+            const result = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+                method: 'POST',
+                body: `secret=${CF_SECRET_KEY}&response=${token}`,
+                headers: { 'content-type': 'application/x-www-form-urlencoded' }
+            });
+            const outcome = await result.json();
+            
+            if (outcome.success) {
+                return new Response(JSON.stringify({ success: true }), {
+                    headers: { 'Set-Cookie': 'auth_v2=true; Max-Age=86400; Path=/; HttpOnly; SameSite=Lax' }
+                });
+            }
+            return new Response(JSON.stringify({ success: false }), { status: 403 });
+        }
+
+        // 3. 访问拦截逻辑
+        const cookies = request.headers.get('Cookie') || '';
+        if (!cookies.includes('auth_v2=true')) {
+            return new Response(renderCaptchaPage(clientIP), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+        }
+
+        // 4. 返回主页面
+        return new Response(renderMainPage(clientIP), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
     }
-
-    // 代理外部 API (避免跨域)
-    if (path.startsWith('/api/')) {
-      return handleApiProxy(request, url);
-    }
-
-    // 主页面 (所有其他路径返回 HTML)
-    return renderMainPage(request);
-  }
 };
 
-// 处理 Turnstile 服务端验证
-async function handleVerifyTurnstile(request) {
-  try {
-    const { token } = await request.json();
-    const secret = '0x4AAAAAACrLfPKMbc_zplxpLDU5OwaCdfI'; // 用户提供的密钥
-    const ip = request.headers.get('CF-Connecting-IP') || '';
+/**
+ * 动态代理处理 - 参考 HAR 抓包逻辑
+ */
+async function handleProxyAPI(path, params) {
+    const headers = { 
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://web.wetab.link/'
+    };
 
-    const formData = new FormData();
-    formData.append('secret', secret);
-    formData.append('response', token);
-    if (ip) formData.append('remoteip', ip);
-
-    const result = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-      method: 'POST',
-      body: formData,
-    });
-
-    const outcome = await result.json();
-    return new Response(JSON.stringify(outcome), {
-      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-    });
-  } catch (e) {
-    return new Response(JSON.stringify({ success: false, error: e.message }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-    });
-  }
-}
-
-// 代理后端API (直接转发，保留原格式)
-async function handleApiProxy(request, url) {
-  const targetUrl = url.searchParams.get('url') || 'https://api.wetab.link' + url.pathname + url.search;
-  // 简单白名单：只允许 wetab.link 和 hitokoto 等安全域名
-  const allowedHosts = ['api.wetab.link', 'v1.hitokoto.cn', 'weatheroffer.com', 'tc.ilqx.dpdns.org'];
-  try {
-    const target = new URL(targetUrl);
-    if (!allowedHosts.includes(target.hostname)) {
-      return new Response('Forbidden', { status: 403 });
+    try {
+        if (path === '/api/weather') {
+            // 代理会泽天气 (依据HAR中的 wetab 接口逻辑)
+            const res = await fetch(`https://api.wetab.link/api/weather/detail?cityCode=530326`, { headers });
+            return res;
+        }
+        if (path === '/api/hot') {
+            // 百度热搜代理
+            const res = await fetch('https://api.wetab.link/api/hotsearch/baidu', { headers });
+            return res;
+        }
+        if (path === '/api/history') {
+            // 历史上的今天
+            const res = await fetch('https://api.wetab.link/api/history/today', { headers });
+            return res;
+        }
+        if (path === '/api/quote') {
+            // 每日一言
+            const res = await fetch('https://v1.hitokoto.cn/');
+            return res;
+        }
+        if (path === '/api/suggest') {
+            // Bing 搜索建议
+            const q = params.get('q');
+            const res = await fetch(`https://api.bing.com/qsonhs.aspx?q=${encodeURIComponent(q)}`);
+            return res;
+        }
+    } catch (e) {
+        return new Response(JSON.stringify({ error: 'Proxy Error' }), { status: 500 });
     }
-
-    const response = await fetch(targetUrl, {
-      headers: {
-        'User-Agent': request.headers.get('User-Agent') || 'Mozilla/5.0',
-        'Accept': 'application/json',
-      }
-    });
-    const data = await response.text();
-    return new Response(data, {
-      status: response.status,
-      headers: {
-        'Content-Type': response.headers.get('Content-Type') || 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'public, max-age=300'
-      }
-    });
-  } catch (e) {
-    return new Response(JSON.stringify({ error: e.message }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-    });
-  }
+    return new Response('Not Found', { status: 404 });
 }
 
-// 渲染主页面 (HTML完全内联，无外部CSS)
-function renderMainPage(request) {
-  const clientIP = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || '未知IP';
-  const userAgent = request.headers.get('User-Agent') || '未知设备';
+/**
+ * Cloudflare 风格人机验证页面
+ */
+function renderCaptchaPage(ip) {
+    return `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>安全验证 - Cloudflare</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+    <style>
+        body { font-family: -apple-system, system-ui, sans-serif; background: #f9f9f9; color: #313131; margin: 0; padding: 10vh 10vw; }
+        .content { max-width: 600px; text-align: left; }
+        h1 { font-size: 32px; font-weight: 500; margin-bottom: 20px; }
+        p { line-height: 1.6; color: #555; font-size: 15px; }
+        .verify-box { margin-top: 30px; min-height: 65px; }
+        #success-ui { display: none; color: #1d8102; font-size: 20px; font-weight: 600; align-items: center; }
+        .footer { position: fixed; bottom: 20px; left: 0; width: 100%; text-align: center; color: #999; font-size: 13px; }
+        .ip-badge { background: #eee; padding: 2px 8px; border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <div class="content" id="main-ui">
+        <h1>正在验证您的安全访问请求</h1>
+        <p>进行人机验证前，系统已自动清空用户 Cookie 和本网站对其留下的缓存。本网站为防止恶意流量，需要进行人机验证。</p>
+        <p><strong>科普：什么是 Cloudflare？</strong><br>如果把互联网比作一棵大树，那么 Cloudflare 就是它的根基。作为全球边缘计算的领航者，全球近一半的网站都在使用其提供的安全加速服务。它通过分布式网络节点（Edge）拦截异常请求，确保真实用户能够获得最丝滑的访问体验。</p>
+        <div class="verify-box">
+            <div class="cf-turnstile" data-sitekey="${CF_SITE_KEY}" data-callback="onSuccess"></div>
+        </div>
+    </div>
+    <div id="success-ui" style="position: absolute; top: 10vh; left: 10vw;">
+        <span style="font-size: 30px; margin-right: 10px;">✓</span> 验证成功！
+    </div>
+    <div class="footer">
+        您的 IP: <span class="ip-badge">${ip}</span>
+    </div>
+    <script>
+        // 验证前清理
+        localStorage.clear();
+        sessionStorage.clear();
+        document.cookie.split(";").forEach(c => {
+            document.cookie = c.replace(/^ +/, "").replace(/=.*/, "=;expires=" + new Date().toUTCString() + ";path=/");
+        });
 
-  const html = `<!DOCTYPE html>
+        function onSuccess(token) {
+            document.getElementById('main-ui').style.opacity = '0.3';
+            document.getElementById('main-ui').style.pointerEvents = 'none';
+            
+            fetch('/verify-security', {
+                method: 'POST',
+                body: new URLSearchParams({'cf-turnstile-response': token})
+            }).then(res => res.json()).then(data => {
+                if(data.success) {
+                    document.getElementById('main-ui').style.display = 'none';
+                    document.getElementById('success-ui').style.display = 'flex';
+                    setTimeout(() => { location.reload(); }, 2000);
+                }
+            });
+        }
+    </script>
+</body>
+</html>`;
+}
+
+/**
+ * 现代化起始页 (仿图片样式)
+ */
+function renderMainPage(ip) {
+    return `
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>2314班 · 中考加油</title>
+    <title>班级主页</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif; }
+        :root { --glass: rgba(255, 255, 255, 0.15); --blur: blur(12px); }
         body {
-            min-height: 100vh;
-            background: #f4f2eb;  /* 纸质底色 */
-            background-image: url('https://tc.ilqx.dpdns.org/file/AgACAgUAAyEGAASHMyZ1AAMSabZ5Y7HEwrA0vgKDxUX6lg3i_uQAAicPaxtXMblValDi_jjojFEBAAMCAAN3AAM6BA.jpg');
-            background-size: cover;
-            background-attachment: fixed;
-            background-position: center;
-            color: #2c3e4f;
-            display: flex;
-            flex-direction: column;
-            position: relative;
+            margin: 0; height: 100vh;
+            background: url('${WALLPAPER_URL}') no-repeat center/cover;
+            color: white; font-family: 'PingFang SC', sans-serif;
+            display: flex; flex-direction: column; align-items: center; overflow: hidden;
         }
-        /* 半透明遮罩让文字更清晰 */
-        body::before {
-            content: '';
-            position: fixed;
-            top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(244, 242, 235, 0.7);
-            backdrop-filter: blur(2px);
-            z-index: -1;
-        }
-        /* 验证遮罩层 */
-        #verification-overlay {
-            position: fixed;
-            top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(44, 62, 79, 0.98);
-            backdrop-filter: blur(6px);
-            z-index: 10000;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: opacity 0.5s;
-            color: #e9e3d5;
-        }
-        .verification-card {
-            max-width: 500px;
-            background: #2c3e4f;
-            border-radius: 28px;
-            padding: 32px;
-            box-shadow: 0 20px 40px -12px rgba(0,0,0,0.6);
-            border: 1px solid #5f7a8c;
-            text-align: center;
-        }
-        .verification-card h2 {
-            font-weight: 500;
-            margin-bottom: 16px;
-            color: #f5e7d9;
-            font-size: 28px;
-        }
-        .verification-card p {
-            line-height: 1.7;
-            color: #bfcfda;
-            margin-bottom: 24px;
-            font-size: 15px;
-        }
-        .cf-quote {
-            background: #1e2b36;
-            padding: 16px;
-            border-radius: 16px;
-            margin: 20px 0;
-            border-left: 4px solid #f6ae2d;
-            text-align: left;
-        }
-        .ip-info {
-            font-family: monospace;
-            background: #1e2b36;
-            padding: 12px;
-            border-radius: 30px;
-            margin: 16px 0 24px;
-            font-size: 14px;
-            color: #b8d0d9;
-        }
-        #cf-turnstile-container {
-            display: inline-block;
-            margin: 10px 0;
-        }
-        .verification-footer {
-            margin-top: 24px;
-            font-size: 13px;
-            color: #8faaaf;
-        }
+        .container { width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; background: rgba(0,0,0,0.2); animation: fadeIn 1s ease; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
-        /* 主内容 (初始隐藏) */
-        #main-content {
-            display: none;
-            opacity: 0;
-            transition: opacity 1s;
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 20px 24px;
-            width: 100%;
-        }
+        /* 时间与倒计时 */
+        .top-info { margin-top: 8vh; text-align: center; }
+        #clock { font-size: 80px; font-weight: 200; text-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+        .countdown-wrap { display: flex; gap: 10px; margin-top: 10px; justify-content: center; }
+        .cd-box { background: var(--glass); backdrop-filter: var(--blur); padding: 10px 15px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.2); text-align: center; }
+        .cd-num { font-size: 20px; font-weight: bold; display: block; }
+        .cd-label { font-size: 12px; opacity: 0.8; }
 
-        /* 顶部横幅 */
-        .top-banner {
-            background: rgba(255, 250, 240, 0.8);
-            backdrop-filter: blur(4px);
-            border-radius: 60px;
-            padding: 14px 30px;
-            margin-bottom: 25px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
-            border: 1px solid #ddceb5;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-weight: 450;
-            color: #1f3a4b;
+        /* 搜索框 */
+        .search-section { margin-top: 5vh; width: 100%; max-width: 600px; position: relative; }
+        .search-bar {
+            width: 100%; background: var(--glass); backdrop-filter: var(--blur);
+            border-radius: 30px; border: 1px solid rgba(255,255,255,0.3);
+            padding: 15px 25px; font-size: 18px; color: white; outline: none;
+            transition: all 0.3s; box-shadow: 0 8px 32px rgba(0,0,0,0.2);
         }
-        .banner-left {
-            display: flex;
-            gap: 16px;
-            align-items: baseline;
-            flex-wrap: wrap;
-        }
-        #current-datetime {
-            font-size: 1.1rem;
-            letter-spacing: 0.3px;
-        }
-        #countdown {
-            background: #e7d9c5;
-            padding: 4px 14px;
-            border-radius: 40px;
-            font-size: 1rem;
-            font-weight: 500;
-            color: #1e3c4f;
-        }
-        .banner-right {
-            font-size: 1.5rem;
-            font-weight: 500;
-            color: #b43b3b;
-            text-shadow: 0 2px 4px rgba(180, 59, 59, 0.2);
-            min-width: 200px;
-            text-align: right;
-        }
-        /* 粒子画布 */
-        #particle-canvas {
-            position: absolute;
-            top: 0; left: 0;
-            width: 100%; height: 100%;
-            pointer-events: none;
-            z-index: 5;
-            opacity: 0;
-            transition: opacity 0.5s;
-        }
-        .banner-right.particle-active ~ #particle-canvas {
-            opacity: 0.6;
-        }
+        .search-bar:focus { background: rgba(255, 255, 255, 0.25); border-color: #fff; }
 
-        /* 搜索区域 + 窗口 */
-        .search-section {
-            display: flex;
-            justify-content: flex-end;
-            margin-bottom: 20px;
-            position: relative;
-            z-index: 500;
+        /* 组件网格 */
+        .widgets-grid { 
+            display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px;
+            margin-top: 40px; width: 90%; max-width: 1000px;
         }
-        #search-input {
-            background: #fefcf7;
-            border: 1px solid #c9b693;
-            border-radius: 40px 0 0 40px;
-            padding: 12px 20px;
-            width: 280px;
-            font-size: 15px;
-            outline: none;
-            color: #2c3e4f;
-        }
-        #search-btn {
-            background: #d5c3a5;
-            border: 1px solid #c9b693;
-            border-left: none;
-            border-radius: 0 40px 40px 0;
-            padding: 12px 24px;
-            cursor: pointer;
-            font-weight: 500;
-            color: #1f3a4b;
-            transition: 0.2s;
-        }
-        #search-btn:hover { background: #c7b28f; }
-
-        /* 仿Windows浏览器窗口 */
-        .browser-window {
-            position: fixed;
-            top: 100px; left: 100px;
-            width: 800px;
-            height: 500px;
-            background: #f1ebe2;
-            border-radius: 12px 12px 8px 8px;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.4);
-            display: none;
-            flex-direction: column;
-            z-index: 2000;
-            border: 1px solid #b7a27b;
-            resize: both;
-            overflow: hidden;
-        }
-        .window-bar {
-            background: #d9cdbc;
-            padding: 8px 12px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            cursor: move;
-            user-select: none;
-            border-bottom: 1px solid #b7a27b;
-        }
-        .window-controls {
-            display: flex;
-            gap: 8px;
-        }
-        .win-btn {
-            width: 16px; height: 16px;
-            border-radius: 50%;
-            background: #f0a5a5;
-            border: none;
-            cursor: pointer;
-        }
-        .win-btn.min { background: #f5d36c; }
-        .win-btn.max { background: #9bc69b; }
-        .win-close { background: #e67373; }
-        .address-bar {
-            flex: 1;
-            background: white;
-            border: 1px solid #b7a27b;
-            border-radius: 20px;
-            padding: 6px 16px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .address-bar input {
-            flex: 1;
-            border: none;
-            outline: none;
-            background: transparent;
-            font-size: 14px;
-        }
-        .nav-btns {
-            display: flex;
-            gap: 6px;
-        }
-        .nav-btns button {
-            background: none;
-            border: none;
-            font-size: 18px;
-            cursor: pointer;
-            color: #4d5f6b;
-        }
-        .browser-iframe {
-            width: 100%;
-            flex: 1;
-            background: white;
-            border: none;
-        }
-
-        /* 卡片网格 */
-        .dashboard-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
-            gap: 22px;
-            margin-top: 20px;
-        }
-        .card {
-            background: rgba(255, 250, 240, 0.7);
-            backdrop-filter: blur(3px);
-            border-radius: 32px;
-            padding: 22px;
-            border: 1px solid #e0d2bd;
-            box-shadow: 0 6px 14px rgba(0,0,0,0.03);
-            transition: 0.2s;
-        }
-        .card:hover { background: rgba(255, 250, 240, 0.9); }
-        .card-title {
-            font-size: 20px;
-            font-weight: 500;
-            margin-bottom: 18px;
-            border-left: 5px solid #ba9f7b;
-            padding-left: 16px;
-            color: #1e3c4f;
-        }
-        .weather-frame {
-            width: 100%;
-            border-radius: 24px;
-            overflow: hidden;
-            background: #e3d7c4;
-            iframe { display: block; }
-        }
-        .list-item {
-            padding: 10px 0;
-            border-bottom: 1px dashed #cfbba3;
-            font-size: 14px;
-        }
-        .list-item a {
-            color: #2c4a5c;
-            text-decoration: none;
-        }
-        .list-item a:hover { text-decoration: underline; }
-        .hotsearch-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .hot-label {
-            background: #f1d9bf;
-            border-radius: 20px;
-            padding: 2px 8px;
-            font-size: 12px;
-        }
-        .footer-note {
-            position: fixed;
-            bottom: 12px;
-            right: 20px;
-            background: rgba(230, 215, 190, 0.6);
-            backdrop-filter: blur(4px);
-            padding: 6px 14px;
-            border-radius: 40px;
-            font-size: 13px;
-            color: #1d3a45;
-            border: 1px solid #bba88b;
-            z-index: 500;
-        }
-
-        /* 加载提示 */
-        .loading-tip {
-            color: #8b7a62;
-            font-size: 13px;
-            padding: 20px;
-            text-align: center;
-        }
+        .card { background: var(--glass); backdrop-filter: var(--blur); border-radius: 18px; padding: 15px; border: 1px solid rgba(255,255,255,0.1); height: 200px; overflow-y: auto; }
+        .card-title { font-size: 14px; font-weight: bold; margin-bottom: 10px; display: flex; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 5px; }
+        
+        .hot-item { font-size: 13px; margin: 8px 0; display: flex; justify-content: space-between; }
+        .weather-info { text-align: center; margin-top: 20px; }
+        .weather-temp { font-size: 40px; }
+        
+        .footer-text { position: fixed; bottom: 15px; font-size: 12px; opacity: 0.6; }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.3); border-radius: 10px; }
     </style>
-    <!-- Turnstile 脚本 (官方) -->
-    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 </head>
 <body>
-
-<!-- 验证遮罩层 -->
-<div id="verification-overlay">
-    <div class="verification-card">
-        <h2>🛡️ 人机验证</h2>
-        <p>本网站为防止恶意流量访问，需要进行人机验证。</p>
-        <div class="cf-quote">
-            🌐 如果把互联网比作一棵大树，<strong>Cloudflare</strong> 就是它的根基。<br>
-            全球超过70%的网站使用 Cloudflare 来抵御攻击、加速访问。<br>
-            本页面也受到 Cloudflare 保护，请完成下方验证。
-        </div>
-        <div class="ip-info" id="pre-ip-info">
-            🔍 连接信息：IP ${clientIP} · 正在获取位置...
-        </div>
-        <div id="cf-turnstile-container"></div>
-        <div class="verification-footer">验证成功后自动进入 · by 2314 liuqinxi</div>
-    </div>
-</div>
-
-<!-- 主内容 (初始隐藏) -->
-<div id="main-content">
-    <!-- 顶部动态横幅 -->
-    <div class="top-banner">
-        <div class="banner-left">
-            <span id="current-datetime"></span>
-            <span id="countdown"></span>
-        </div>
-        <div class="banner-right" id="banner-slogan">2314班中考加油！</div>
-    </div>
-    <canvas id="particle-canvas"></canvas>
-
-    <!-- 右上搜索 -->
-    <div class="search-section">
-        <input type="text" id="search-input" placeholder="必应搜索...">
-        <button id="search-btn">搜索</button>
-    </div>
-
-    <!-- 仿Windows浏览器窗口 (可拖动) -->
-    <div class="browser-window" id="browserWindow">
-        <div class="window-bar" id="windowBar">
-            <div class="window-controls">
-                <div class="win-btn min" id="minBtn"></div>
-                <div class="win-btn max" id="maxBtn"></div>
-                <div class="win-btn win-close" id="closeBtn"></div>
-            </div>
-            <div class="address-bar">
-                <button id="backBtn">←</button>
-                <button id="forwardBtn">→</button>
-                <input type="text" id="urlInput" value="https://cn.bing.com/">
-                <button id="goBtn">↵</button>
-            </div>
-        </div>
-        <iframe class="browser-iframe" id="browserIframe" src="about:blank" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-top-navigation"></iframe>
-    </div>
-
-    <!-- 卡片区域 -->
-    <div class="dashboard-grid">
-        <!-- 天气卡片 (使用 iframe) -->
-        <div class="card">
-            <div class="card-title">天气</div>
-            <div class="weather-frame">
-                <iframe allowtransparency="true" frameborder="0" width="100%" height="96" scrolling="no" src="//tianqi.2345.com/plugin/widget/index.htm?s=1&z=1&t=0&v=0&d=3&bd=0&k=&f=&ltf=009944&htf=cc0000&q=1&e=1&a=1&c=54511&w=385&h=96&align=center"></iframe>
+    <div class="container">
+        <div class="top-info">
+            <div id="clock">00:00</div>
+            <div class="countdown-wrap">
+                <div class="cd-box"><span class="cd-num" id="cd-d">0</span><span class="cd-label">距离中考(天)</span></div>
+                <div class="cd-box"><span class="cd-num" id="cd-h">0</span><span class="cd-label">小时</span></div>
             </div>
         </div>
 
-        <!-- 每日一言 (从hitokoto获取) -->
-        <div class="card">
-            <div class="card-title">📜 一言</div>
-            <div id="hitokoto-text" class="loading-tip">载入一言...</div>
+        <div class="search-section">
+            <input type="text" class="search-bar" placeholder="搜索内容..." id="search-input">
         </div>
 
-        <!-- 热搜榜 (微博) -->
-        <div class="card">
-            <div class="card-title">🔥 微博热搜</div>
-            <div id="hotsearch-list" class="loading-tip">加载热搜中...</div>
+        <div class="widgets-grid">
+            <div class="card">
+                <div class="card-title">会泽天气</div>
+                <div id="weather-content" class="weather-info">加载中...</div>
+            </div>
+            <div class="card">
+                <div class="card-title">百度热搜</div>
+                <div id="hot-content"></div>
+            </div>
+            <div class="card">
+                <div class="card-title">历史上的今天</div>
+                <div id="history-content" style="font-size: 13px; line-height: 1.5;"></div>
+            </div>
+        </div>
+
+        <div style="margin-top: 30px; font-style: italic; opacity: 0.9;" id="hitokoto"></div>
+
+        <div class="footer-text">
+            By 2314 lqx | 网页由 Google Gemini Pro 3.1 优化 | 您的 IP: ${ip}
         </div>
     </div>
 
-    <!-- 底部署名 (固定) -->
-    <div class="footer-note">by 2314 liuqinxi</div>
-</div>
+    <script>
+        // 1. 实时时钟
+        setInterval(() => {
+            const n = new Date();
+            document.getElementById('clock').innerText = n.getHours().toString().padStart(2, '0') + ':' + n.getMinutes().toString().padStart(2, '0');
+        }, 1000);
 
-<script>
-    (function() {
-        // ---------- 全局变量 ----------
-        const clientIP = '${clientIP}';
-        let turnstileWidgetId = null;
-        let particleInterval, bannerInterval;
-        let particleCanvas, ctx, particles = [];
-        let bannerPhase = 0; // 0: datetime, 1: particle, 2: slogan
-        const bannerEl = document.getElementById('banner-slogan');
-        const datetimeEl = document.getElementById('current-datetime');
-        const countdownEl = document.getElementById('countdown');
-
-        // ---------- 中考日期计算 (2026-06-16) ----------
-        const examDate = new Date(2026, 5, 16); // 月份从0开始, 5=6月
-
-        function updateTime() {
+        // 2. 中考倒计时 (6月18日 8:00)
+        function updateCD() {
+            const target = new Date(new Date().getFullYear(), 5, 18, 8, 0, 0);
             const now = new Date();
-            // 日期时间
-            const year = now.getFullYear();
-            const month = String(now.getMonth() + 1).padStart(2,'0');
-            const day = String(now.getDate()).padStart(2,'0');
-            const weekdays = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'];
-            const wd = weekdays[now.getDay()];
-            const hour = String(now.getHours()).padStart(2,'0');
-            const minute = String(now.getMinutes()).padStart(2,'0');
-            const second = String(now.getSeconds()).padStart(2,'0');
-            datetimeEl.innerText = \`\${year}年\${month}月\${day}日 \${wd} \${hour}:\${minute}:\${second}\`;
-
-            // 中考倒计时 (天+小时)
-            const diff = examDate - now;
+            const diff = target - now;
             if (diff > 0) {
-                const days = Math.floor(diff / (1000 * 60 * 60 * 24));
-                const hours = Math.floor((diff % (86400000)) / (1000 * 60 * 60));
-                countdownEl.innerText = \`中考仅剩 \${days}天\${hours}小时\`;
-            } else {
-                countdownEl.innerText = '中考已至，金榜题名！';
+                document.getElementById('cd-d').innerText = Math.floor(diff / 86400000);
+                document.getElementById('cd-h').innerText = Math.floor((diff % 86400000) / 3600000);
             }
         }
-        updateTime();
-        setInterval(updateTime, 1000);
+        updateCD();
 
-        // ---------- 粒子效果 ----------
-        function initParticles() {
-            particleCanvas = document.getElementById('particle-canvas');
-            if (!particleCanvas) return;
-            ctx = particleCanvas.getContext('2d');
-            resizeCanvas();
-            window.addEventListener('resize', resizeCanvas);
-            particles = [];
-            for (let i = 0; i < 60; i++) {
-                particles.push({
-                    x: Math.random() * particleCanvas.width,
-                    y: Math.random() * particleCanvas.height,
-                    vx: (Math.random() - 0.5) * 0.6,
-                    vy: (Math.random() - 0.5) * 0.6,
-                    size: Math.random() * 3 + 1,
-                    color: \`rgba(180, 120, 70, \${Math.random() * 0.4 + 0.2})\`
-                });
-            }
-        }
-        function resizeCanvas() {
-            if (!particleCanvas) return;
-            particleCanvas.width = window.innerWidth;
-            particleCanvas.height = window.innerHeight;
-        }
-        function drawParticles() {
-            if (!ctx || !particleCanvas) return;
-            ctx.clearRect(0, 0, particleCanvas.width, particleCanvas.height);
-            for (let p of particles) {
-                ctx.beginPath();
-                ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-                ctx.fillStyle = p.color;
-                ctx.fill();
-                p.x += p.vx;
-                p.y += p.vy;
-                if (p.x < 0 || p.x > particleCanvas.width) p.vx *= -1;
-                if (p.y < 0 || p.y > particleCanvas.height) p.vy *= -1;
-            }
-            requestAnimationFrame(drawParticles);
-        }
-
-        // ---------- 横幅循环 ----------
-        function startBannerLoop() {
-            bannerPhase = 0;
-            bannerEl.style.opacity = '1';
-            particleCanvas.style.opacity = '0';
-            bannerInterval = setInterval(() => {
-                bannerPhase = (bannerPhase + 1) % 3;
-                if (bannerPhase === 0) {
-                    bannerEl.innerText = '2314班中考加油！';
-                    particleCanvas.style.opacity = '0';
-                } else if (bannerPhase === 1) {
-                    bannerEl.innerText = '';
-                    particleCanvas.style.opacity = '0.6';
-                } else if (bannerPhase === 2) {
-                    bannerEl.innerText = '2314班中考加油！';
-                    particleCanvas.style.opacity = '0';
-                }
-            }, 2000);
-        }
-
-        // ---------- 获取IP地理位置 (预验证时显示) ----------
-        async function fetchGeoInfo() {
-            try {
-                const res = await fetch('/api/geo?ip=' + clientIP);
-                const geo = await res.json();
-                document.getElementById('pre-ip-info').innerHTML = \`🔍 连接信息：IP \${clientIP} · \${geo.countryRegion || '未知'}\${geo.city || ''} · \${geo.asOrganization || '未知运营商'}\`;
-            } catch (e) {
-                document.getElementById('pre-ip-info').innerHTML = \`🔍 连接信息：IP \${clientIP} · 位置获取失败\`;
-            }
-        }
-        fetchGeoInfo();
-
-        // ---------- Turnstile 验证 ----------
-        window.onloadTurnstileCallback = function () {
-            turnstileWidgetId = turnstile.render('#cf-turnstile-container', {
-                sitekey: '0x4AAAAAACrLfLWUyYwrDR_e',
-                callback: async function(token) {
-                    // 验证token
-                    const resp = await fetch('/verify-turnstile', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ token })
-                    });
-                    const result = await resp.json();
-                    if (result.success) {
-                        // 验证通过，隐藏遮罩，显示主内容
-                        document.getElementById('verification-overlay').style.opacity = '0';
-                        setTimeout(() => {
-                            document.getElementById('verification-overlay').style.display = 'none';
-                            document.getElementById('main-content').style.display = 'block';
-                            setTimeout(() => document.getElementById('main-content').style.opacity = '1', 50);
-                            // 启动粒子背景
-                            initParticles();
-                            drawParticles();
-                            startBannerLoop();
-                            // 加载卡片数据
-                            loadHitokoto();
-                            loadHotSearch();
-                        }, 500);
-                    } else {
-                        alert('人机验证失败，请重试');
-                        turnstile.reset(turnstileWidgetId);
-                    }
-                }
-            });
+        // 3. 搜索功能 (Bing)
+        document.getElementById('search-input').onkeydown = (e) => {
+            if(e.key === 'Enter') window.location.href = 'https://cn.bing.com/search?q=' + e.target.value;
         };
 
-        // ---------- 卡片数据 ----------
-        async function loadHitokoto() {
-            try {
-                const resp = await fetch('https://v1.hitokoto.cn/?c=d&c=e&c=h&c=i&c=k');
-                const data = await resp.json();
-                document.getElementById('hitokoto-text').innerHTML = \`“\${data.hitokoto}” —— \${data.from}\`;
-            } catch (e) {
-                document.getElementById('hitokoto-text').innerHTML = '一言暂时缺席';
-            }
+        // 4. 动态数据加载 (全部动态反代)
+        async function loadData() {
+            // 天气
+            fetch('/api/weather').then(r => r.json()).then(d => {
+                const w = d.data.weather;
+                document.getElementById('weather-content').innerHTML = \`
+                    <div class="weather-temp">\${w.temperature}°</div>
+                    <div>\${w.weather} | \${w.windDirection}\${w.windPower}</div>
+                    <div style="font-size: 12px; margin-top: 5px;">会泽县</div>
+                \`;
+            });
+
+            // 热搜
+            fetch('/api/hot').then(r => r.json()).then(d => {
+                const list = d.data.slice(0, 6);
+                document.getElementById('hot-content').innerHTML = list.map((item, i) => \`
+                    <div class="hot-item">
+                        <span>\${i+1}. \${item.title.substring(0,15)}...</span>
+                        <span style="color: #ffca28">★</span>
+                    </div>
+                \`).join('');
+            });
+
+            // 历史上的今天
+            fetch('/api/history').then(r => r.json()).then(d => {
+                const item = d.data[0];
+                document.getElementById('history-content').innerText = item.title + ": " + item.content.substring(0, 80) + "...";
+            });
+
+            // 每日一言
+            fetch('/api/quote').then(r => r.json()).then(d => {
+                document.getElementById('hitokoto').innerText = "「 " + d.hitokoto + " 」";
+            });
         }
-
-        async function loadHotSearch() {
-            try {
-                const resp = await fetch('/api/hotsearch?type=weibo');
-                const data = await resp.json();
-                if (data.data && data.data.list) {
-                    const list = data.data.list.slice(0, 8);
-                    let html = '';
-                    list.forEach(item => {
-                        html += \`<div class="list-item hotsearch-item"><a href="\${item.url}" target="_blank">\${item.title}</a><span class="hot-label">\${item.hotLabel || '热'}</span></div>\`;
-                    });
-                    document.getElementById('hotsearch-list').innerHTML = html;
-                } else {
-                    document.getElementById('hotsearch-list').innerHTML = '暂无热搜';
-                }
-            } catch (e) {
-                document.getElementById('hotsearch-list').innerHTML = '热搜加载失败';
-            }
-        }
-
-        // ---------- 浏览器窗口实现 (可拖动, 地址栏) ----------
-        const win = document.getElementById('browserWindow');
-        const bar = document.getElementById('windowBar');
-        const iframe = document.getElementById('browserIframe');
-        const urlInput = document.getElementById('urlInput');
-        const goBtn = document.getElementById('goBtn');
-        const backBtn = document.getElementById('backBtn');
-        const forwardBtn = document.getElementById('forwardBtn');
-        const closeBtn = document.getElementById('closeBtn');
-        const minBtn = document.getElementById('minBtn');
-        const maxBtn = document.getElementById('maxBtn');
-
-        let offsetX, offsetY, mouseX, mouseY, isDragging = false;
-
-        bar.addEventListener('mousedown', (e) => {
-            if (e.target.closest('button, input')) return;
-            isDragging = true;
-            offsetX = e.clientX - win.offsetLeft;
-            offsetY = e.clientY - win.offsetTop;
-            bar.style.cursor = 'grabbing';
-        });
-
-        window.addEventListener('mousemove', (e) => {
-            if (!isDragging) return;
-            win.style.left = (e.clientX - offsetX) + 'px';
-            win.style.top = (e.clientY - offsetY) + 'px';
-        });
-
-        window.addEventListener('mouseup', () => {
-            isDragging = false;
-            bar.style.cursor = 'grab';
-        });
-
-        // 地址栏导航
-        function navigateTo(url) {
-            let fullUrl = url;
-            if (!url.startsWith('http://') && !url.startsWith('https://')) {
-                fullUrl = 'https://' + url;
-            }
-            iframe.src = fullUrl;
-            urlInput.value = fullUrl;
-        }
-
-        goBtn.addEventListener('click', () => navigateTo(urlInput.value));
-        urlInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') navigateTo(urlInput.value);
-        });
-
-        backBtn.addEventListener('click', () => iframe.contentWindow?.history.back());
-        forwardBtn.addEventListener('click', () => iframe.contentWindow?.history.forward());
-
-        closeBtn.addEventListener('click', () => win.style.display = 'none');
-        minBtn.addEventListener('click', () => win.style.display = 'none'); // 简单隐藏
-        maxBtn.addEventListener('click', () => {
-            if (win.style.width === '100%') {
-                win.style.width = '800px';
-                win.style.height = '500px';
-                win.style.top = '100px';
-                win.style.left = '100px';
-            } else {
-                win.style.width = '100%';
-                win.style.height = 'calc(100% - 60px)';
-                win.style.top = '30px';
-                win.style.left = '0';
-            }
-        });
-
-        // 搜索按钮
-        document.getElementById('search-btn').addEventListener('click', () => {
-            const query = document.getElementById('search-input').value.trim();
-            if (!query) return;
-            const searchUrl = 'https://cn.bing.com/search?q=' + encodeURIComponent(query);
-            win.style.display = 'flex';
-            navigateTo(searchUrl);
-        });
-
-        // 允许嵌入任意网页 (sandbox 已设置, 必要时可放宽)
-    })();
-</script>
-<!-- 后备: 如果Turnstile未加载 -->
-<script>
-    if (typeof turnstile === 'undefined') {
-        const checkTurnstile = setInterval(() => {
-            if (window.turnstile) {
-                clearInterval(checkTurnstile);
-                window.onloadTurnstileCallback();
-            }
-        }, 200);
-    } else {
-        window.onloadTurnstileCallback();
-    }
-</script>
+        loadData();
+    </script>
 </body>
 </html>`;
-  return new Response(html, {
-    headers: { 'Content-Type': 'text/html; charset=utf-8' }
-  });
 }
