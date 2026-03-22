@@ -20,7 +20,7 @@ export default {
     // 2. 搜索建议 (Bing)
     if (url.pathname === '/api/suggest') {
       const q = url.searchParams.get('q');
-      return fetch(`https://api.bing.com/qsonhs.aspx?q=${encodeURIComponent(q)}`);
+      return fetch('https://api.bing.com/qsonhs.aspx?q=' + encodeURIComponent(q));
     }
 
     // 3. 人机验证逻辑
@@ -29,7 +29,7 @@ export default {
       const verifyRes = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: `secret=${CF_SECRET_KEY}&response=${token}`
+        body: 'secret=' + CF_SECRET_KEY + '&response=' + token
       });
       const result = await verifyRes.json();
       if (result.success) {
@@ -106,15 +106,14 @@ function renderCaptchaPage(ip) {
     <div id="success-ui">✓ 验证成功！</div>
     <div class="ip-info">你的ip: ${ip}</div>
     <script>
-        // 自动清理逻辑
         localStorage.clear(); sessionStorage.clear();
-        document.cookie.split(";").forEach(c => document.cookie = c.replace(/^ +/, "").replace(/=.*/, "=;expires=" + new Date().toUTCString() + ";path=/"));
+        document.cookie.split(";").forEach(c => document.cookie = c.replace(/^ +/, "").replace(/=.*/, "=;expires=" + new Date().toUTCString() + "path=/"));
 
         async function onVerify(token) {
             const r = await fetch('/verify-security', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ token })
+                body: JSON.stringify({ token: token })
             });
             const d = await r.json();
             if(d.success) {
@@ -293,46 +292,48 @@ function renderMainPage(ip) {
 
     <script>
         // ---------- 辅助函数：通过代理获取WeTab API ----------
-        const API_PROXY = '/api/v2/proxy?url=';
+        var API_PROXY = '/api/v2/proxy?url=';
         async function fetchAPI(apiUrl) {
             try {
-                const resp = await fetch(API_PROXY + encodeURIComponent(apiUrl));
-                if (!resp.ok) throw new Error("HTTP " + resp.status);
-                const json = await resp.json();
+                var resp = await fetch(API_PROXY + encodeURIComponent(apiUrl));
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                var json = await resp.json();
                 return json;
             } catch (err) {
-                console.error("[API Error] " + apiUrl, err);
+                console.error('[API Error] ' + apiUrl, err);
                 return { error: true, message: err.message };
             }
         }
 
         // ---------- 时间与中考倒计时 ----------
         function refreshTime() {
-            const now = new Date();
-            document.getElementById('big-time').innerText = now.getHours().toString().padStart(2, '0') + ":" + now.getMinutes().toString().padStart(2, '0');
-            const target = new Date(now.getFullYear(), 5, 18, 8, 0, 0);
-            const diff = target - now;
-            const d = Math.max(0, Math.floor(diff / 86400000));
-            const h = Math.max(0, Math.floor((diff % 86400000) / 3600000));
-            const m = Math.max(0, Math.floor((diff % 3600000) / 60000));
+            var now = new Date();
+            document.getElementById('big-time').innerText = now.getHours().toString().padStart(2, '0') + ':' + now.getMinutes().toString().padStart(2, '0');
+            var target = new Date(now.getFullYear(), 5, 18, 8, 0, 0);
+            var diff = target - now;
+            var d = Math.max(0, Math.floor(diff / 86400000));
+            var h = Math.max(0, Math.floor((diff % 86400000) / 3600000));
+            var m = Math.max(0, Math.floor((diff % 3600000) / 60000));
             document.getElementById('d-val').innerText = d;
             document.getElementById('h-val').innerText = h;
             document.getElementById('m-val').innerText = m;
-            document.getElementById('p-title').innerText = "2314 中考必胜 距离中考只剩 " + d + " 天";
+            document.getElementById('p-title').innerText = '2314 中考必胜 距离中考只剩 ' + d + ' 天';
         }
         setInterval(refreshTime, 1000); refreshTime();
 
         // ---------- 搜索建议 & 搜索跳转 ----------
-        const si = document.getElementById('s-input');
-        const ss = document.getElementById('s-suggest');
-        si.oninput = async () => {
-            const val = si.value.trim();
+        var si = document.getElementById('s-input');
+        var ss = document.getElementById('s-suggest');
+        si.oninput = async function() {
+            var val = si.value.trim();
             if (!val) { ss.style.display = 'none'; return; }
             try {
-                const res = await fetch(`/api/suggest?q=${encodeURIComponent(val)}`);
-                const data = await res.json();
+                var res = await fetch('/api/suggest?q=' + encodeURIComponent(val));
+                var data = await res.json();
                 if (data && data.AS && data.AS.Results && data.AS.Results[0] && data.AS.Results[0].Suggests) {
-                    const suggests = data.AS.Results[0].Suggests.map(item => `<div class="suggest-item">${escapeHtml(item.Txt)}</div>`).join('');
+                    var suggests = data.AS.Results[0].Suggests.map(function(item) {
+                        return '<div class="suggest-item">' + escapeHtml(item.Txt) + '</div>';
+                    }).join('');
                     ss.innerHTML = suggests;
                     ss.style.display = 'block';
                 } else {
@@ -340,66 +341,59 @@ function renderMainPage(ip) {
                 }
             } catch(e) { ss.style.display = 'none'; }
         };
-        ss.onclick = (e) => {
+        ss.onclick = function(e) {
             if(e.target.classList && e.target.classList.contains('suggest-item')) {
                 goSearch(e.target.innerText);
             }
         };
-        si.onkeydown = (e) => { if(e.key === 'Enter') goSearch(si.value); };
-        function goSearch(q) { if(q.trim()) window.location.href = "https://cn.bing.com/search?q=" + encodeURIComponent(q); }
+        si.onkeydown = function(e) { if(e.key === 'Enter') goSearch(si.value); };
+        function goSearch(q) { if(q.trim()) window.location.href = 'https://cn.bing.com/search?q=' + encodeURIComponent(q); }
         function escapeHtml(str) { return str.replace(/[&<>]/g, function(m){if(m==='&') return '&amp;'; if(m==='<') return '&lt;'; if(m==='>') return '&gt;'; return m;}); }
 
         // ---------- 1. 天气：基于IP定位城市并嵌入iframe ----------
         async function loadWeatherByIP() {
-            const container = document.getElementById('weather-widget');
+            var container = document.getElementById('weather-widget');
             container.innerHTML = '<div style="text-align:center;">获取位置中...</div>';
             try {
-                const ipResp = await fetch('https://api.ipify.org?format=json');
-                const ipData = await ipResp.json();
-                const clientIP = ipData.ip;
-                const geoResp = await fetch(`http://ip-api.com/json/${clientIP}?fields=status,city,countryCode`);
-                const geo = await geoResp.json();
-                let cityCode = '54511';
+                var ipResp = await fetch('https://api.ipify.org?format=json');
+                var ipData = await ipResp.json();
+                var clientIP = ipData.ip;
+                var geoResp = await fetch('http://ip-api.com/json/' + clientIP + '?fields=status,city,countryCode');
+                var geo = await geoResp.json();
+                var cityCode = '54511';
                 if (geo.status === 'success' && geo.countryCode === 'CN') {
-                    const cityMap = {
+                    var cityMap = {
                         '北京': '54511', '上海': '58367', '广州': '59287', '深圳': '59493',
                         '杭州': '58457', '南京': '58238', '武汉': '57494', '成都': '56294',
                         '重庆': '57516', '西安': '57036', '会泽': '56778'
                     };
                     cityCode = cityMap[geo.city] || '54511';
                 }
-                const iframeSrc = `//tianqi.2345.com/plugin/widget/index.htm?s=1&z=1&t=0&v=0&d=3&bd=0&k=&f=&ltf=009944&htf=cc0000&q=1&e=1&a=1&c=${cityCode}&w=385&h=96&align=center`;
-                container.innerHTML = `
-                    <div class="weather-iframe-wrap">
-                        <iframe allowtransparency="true" frameborder="0" width="385" height="96" scrolling="no" src="${iframeSrc}"></iframe>
-                    </div>
-                    <div style="font-size:12px; text-align:center; margin-top:8px;">定位城市: ${geo.city || '中国'}</div>
-                `;
+                var iframeSrc = '//tianqi.2345.com/plugin/widget/index.htm?s=1&z=1&t=0&v=0&d=3&bd=0&k=&f=&ltf=009944&htf=cc0000&q=1&e=1&a=1&c=' + cityCode + '&w=385&h=96&align=center';
+                container.innerHTML = '<div class="weather-iframe-wrap"><iframe allowtransparency="true" frameborder="0" width="385" height="96" scrolling="no" src="' + iframeSrc + '"></iframe></div><div style="font-size:12px; text-align:center; margin-top:8px;">定位城市: ' + (geo.city || '中国') + '</div>';
             } catch (err) {
                 console.warn('天气定位失败，使用默认iframe', err);
-                container.innerHTML = `
-                    <div class="weather-iframe-wrap">
-                        <iframe allowtransparency="true" frameborder="0" width="385" height="96" scrolling="no" src="//tianqi.2345.com/plugin/widget/index.htm?s=1&z=1&t=0&v=0&d=3&bd=0&k=&f=&ltf=009944&htf=cc0000&q=1&e=1&a=1&c=54511&w=385&h=96&align=center"></iframe>
-                    </div>
-                    <div style="font-size:12px; text-align:center; margin-top:8px;">默认城市: 北京</div>
-                `;
+                container.innerHTML = '<div class="weather-iframe-wrap"><iframe allowtransparency="true" frameborder="0" width="385" height="96" scrolling="no" src="//tianqi.2345.com/plugin/widget/index.htm?s=1&z=1&t=0&v=0&d=3&bd=0&k=&f=&ltf=009944&htf=cc0000&q=1&e=1&a=1&c=54511&w=385&h=96&align=center"></iframe></div><div style="font-size:12px; text-align:center; margin-top:8px;">默认城市: 北京</div>';
             }
         }
         
         // ---------- 2. 百度热搜榜 ----------
         async function loadHotSearch() {
-            const hotContainer = document.getElementById('hot-list');
+            var hotContainer = document.getElementById('hot-list');
             hotContainer.innerHTML = '<div class="list-item">加载热搜中...</div>';
-            const data = await fetchAPI('https://api.wetab.link/api/hotsearch/baidu');
+            var data = await fetchAPI('https://api.wetab.link/api/hotsearch/baidu');
             if (data && data.code === 0 && data.data && data.data.list) {
-                const list = data.data.list.slice(0, 10);
+                var list = data.data.list.slice(0, 10);
                 if (list.length) {
-                    hotContainer.innerHTML = list.map((item, idx) => `
-                        <a href="${escapeHtml(item.url)}" class="list-item" target="_blank" rel="noopener">
-                            <span class="item-idx">${idx+1}</span>
-                            <span>${escapeHtml(item.title)}</span>
-                        </a>
-                    `).join('');
+                    var html = '';
+                    for (var i = 0; i < list.length; i++) {
+                        var item = list[i];
+                        html += '<a href="' + escapeHtml(item.url) + '" class="list-item" target="_blank" rel="noopener">' +
+                                '<span class="item-idx">' + (i+1) + '</span>' +
+                                '<span>' + escapeHtml(item.title) + '</span>' +
+                                '</a>';
+                    }
+                    hotContainer.innerHTML = html;
                 } else {
                     hotContainer.innerHTML = '<div class="error-msg">暂无热搜数据</div>';
                 }
@@ -410,17 +404,20 @@ function renderMainPage(ip) {
         
         // ---------- 3. 热点新闻 (top新闻) ----------
         async function loadNews() {
-            const newsDiv = document.getElementById('news-list');
+            var newsDiv = document.getElementById('news-list');
             newsDiv.innerHTML = '<div class="list-item">新闻加载中...</div>';
-            const data = await fetchAPI('https://api.wetab.link/api/news/list?type=top&pageNum=1&pageSize=10');
+            var data = await fetchAPI('https://api.wetab.link/api/news/list?type=top&pageNum=1&pageSize=10');
             if (data && data.code === 0 && data.data && data.data.list) {
-                const articles = data.data.list.slice(0, 8);
+                var articles = data.data.list.slice(0, 8);
                 if (articles.length) {
-                    newsDiv.innerHTML = articles.map(item => `
-                        <a href="${escapeHtml(item.url)}" class="list-item" target="_blank" rel="noopener">
-                            <span style="margin-right:6px;">·</span> ${escapeHtml(item.title)}
-                        </a>
-                    `).join('');
+                    var html = '';
+                    for (var i = 0; i < articles.length; i++) {
+                        var item = articles[i];
+                        html += '<a href="' + escapeHtml(item.url) + '" class="list-item" target="_blank" rel="noopener">' +
+                                '<span style="margin-right:6px;">·</span> ' + escapeHtml(item.title) +
+                                '</a>';
+                    }
+                    newsDiv.innerHTML = html;
                 } else {
                     newsDiv.innerHTML = '<div class="error-msg">暂无新闻数据</div>';
                 }
@@ -431,55 +428,51 @@ function renderMainPage(ip) {
         
         // ---------- 4. 历史上的今天 (含图片) ----------
         async function loadHistoryToday() {
-            const historyDiv = document.getElementById('history-today');
+            var historyDiv = document.getElementById('history-today');
             historyDiv.innerHTML = '<div class="history-text">翻阅史册中...</div>';
             try {
-                const now = new Date();
-                const month = now.getMonth() + 1;
-                const day = now.getDate();
-                const dateStr = `${month}/${day}`;
-                const listRes = await fetchAPI(`https://api.wetab.link/api/history/list?date=${encodeURIComponent(dateStr)}`);
+                var now = new Date();
+                var month = now.getMonth() + 1;
+                var day = now.getDate();
+                var dateStr = month + '/' + day;
+                var listRes = await fetchAPI('https://api.wetab.link/api/history/list?date=' + encodeURIComponent(dateStr));
                 if (listRes && listRes.code === 0 && listRes.data && listRes.data.length) {
-                    const firstEvent = listRes.data[0];
-                    const eventId = firstEvent.e_id;
-                    const detailRes = await fetchAPI(`https://api.wetab.link/api/history/detail?id=${eventId}`);
+                    var firstEvent = listRes.data[0];
+                    var eventId = firstEvent.e_id;
+                    var detailRes = await fetchAPI('https://api.wetab.link/api/history/detail?id=' + eventId);
                     if (detailRes && detailRes.code === 0 && detailRes.data && detailRes.data[0]) {
-                        const detail = detailRes.data[0];
-                        const title = detail.title || '历史事件';
-                        let content = detail.content ? detail.content.replace(/\\n/g, ' ').substring(0, 220) : '无详细描述';
-                        let imageHtml = '';
+                        var detail = detailRes.data[0];
+                        var title = detail.title || '历史事件';
+                        var content = detail.content ? detail.content.replace(/\\n/g, ' ').substring(0, 220) : '无详细描述';
+                        var imageHtml = '';
                         if (detail.picUrl && detail.picUrl.length > 0 && detail.picUrl[0].url) {
-                            imageHtml = `<img class="history-img" src="${detail.picUrl[0].url}" alt="历史配图" onerror="this.style.display='none'">`;
+                            imageHtml = '<img class="history-img" src="' + detail.picUrl[0].url + '" alt="历史配图" onerror="this.style.display=\'none\'">';
                         }
-                        historyDiv.innerHTML = `
-                            <div class="history-text">
-                                <strong style="font-size:16px; display:block; margin-bottom:8px;">${escapeHtml(title)}</strong>
-                                ${imageHtml}
-                                <div style="font-size:13px; line-height:1.5; margin-top:6px;">${escapeHtml(content)}${content.length>=200 ? '...' : ''}</div>
-                                <div style="margin-top:12px; font-size:11px; color:#ffeb3b; text-align:right;">${firstEvent.date || ''}</div>
-                            </div>
-                        `;
+                        historyDiv.innerHTML = '<div class="history-text">' +
+                            '<strong style="font-size:16px; display:block; margin-bottom:8px;">' + escapeHtml(title) + '</strong>' +
+                            imageHtml +
+                            '<div style="font-size:13px; line-height:1.5; margin-top:6px;">' + escapeHtml(content) + (content.length>=200 ? '...' : '') + '</div>' +
+                            '<div style="margin-top:12px; font-size:11px; color:#ffeb3b; text-align:right;">' + (firstEvent.date || '') + '</div>' +
+                            '</div>';
                     } else {
                         historyDiv.innerHTML = '<div class="error-msg">历史详情获取失败，请刷新</div>';
                     }
                 } else {
-                    const fallbackRes = await fetchAPI('https://api.wetab.link/api/history/detail?id=3898');
+                    var fallbackRes = await fetchAPI('https://api.wetab.link/api/history/detail?id=3898');
                     if (fallbackRes && fallbackRes.code === 0 && fallbackRes.data && fallbackRes.data[0]) {
-                        const detail = fallbackRes.data[0];
-                        const title = detail.title;
-                        let content = detail.content ? detail.content.replace(/\\n/g, ' ').substring(0, 220) : '';
-                        let imgHtml = '';
+                        var detail = fallbackRes.data[0];
+                        var title = detail.title;
+                        var content = detail.content ? detail.content.replace(/\\n/g, ' ').substring(0, 220) : '';
+                        var imgHtml = '';
                         if (detail.picUrl && detail.picUrl[0] && detail.picUrl[0].url) {
-                            imgHtml = `<img class="history-img" src="${detail.picUrl[0].url}" alt="历史配图" onerror="this.style.display='none'">`;
+                            imgHtml = '<img class="history-img" src="' + detail.picUrl[0].url + '" alt="历史配图" onerror="this.style.display=\'none\'">';
                         }
-                        historyDiv.innerHTML = `
-                            <div class="history-text">
-                                <strong style="font-size:16px;">${escapeHtml(title)}</strong>
-                                ${imgHtml}
-                                <div style="margin-top:8px;">${escapeHtml(content)}</div>
-                                <div style="margin-top:8px; font-size:11px; opacity:0.7;">康熙年间 · 史料</div>
-                            </div>
-                        `;
+                        historyDiv.innerHTML = '<div class="history-text">' +
+                            '<strong style="font-size:16px;">' + escapeHtml(title) + '</strong>' +
+                            imgHtml +
+                            '<div style="margin-top:8px;">' + escapeHtml(content) + '</div>' +
+                            '<div style="margin-top:8px; font-size:11px; opacity:0.7;">康熙年间 · 史料</div>' +
+                            '</div>';
                     } else {
                         historyDiv.innerHTML = '<div class="error-msg">历史上的今天暂无数据，稍后重试</div>';
                     }
@@ -492,16 +485,16 @@ function renderMainPage(ip) {
         
         // ---------- 5. 每日一言 ----------
         async function loadHitokoto() {
-            const textEl = document.getElementById('hitokoto-text');
-            const fromEl = document.getElementById('hitokoto-from');
+            var textEl = document.getElementById('hitokoto-text');
+            var fromEl = document.getElementById('hitokoto-from');
             try {
-                const resp = await fetch('https://v1.hitokoto.cn/?c=d&c=e&c=h&c=i&c=k');
-                const data = await resp.json();
+                var resp = await fetch('https://v1.hitokoto.cn/?c=d&c=e&c=h&c=i&c=k');
+                var data = await resp.json();
                 if (data && data.hitokoto) {
-                    textEl.innerHTML = `「 ${data.hitokoto} 」`;
-                    let author = data.from_who ? data.from_who : '佚名';
-                    let source = data.from ? data.from : '未知出处';
-                    fromEl.innerHTML = `—— ${author} · 《${source}》`;
+                    textEl.innerHTML = '「 ' + data.hitokoto + ' 」';
+                    var author = data.from_who ? data.from_who : '佚名';
+                    var source = data.from ? data.from : '未知出处';
+                    fromEl.innerHTML = '—— ' + author + ' · 《' + source + '》';
                 } else {
                     throw new Error('一言格式错误');
                 }
@@ -512,11 +505,11 @@ function renderMainPage(ip) {
         }
         
         // 执行所有模块
-        loadWeatherByIP().catch(e => console.warn(e));
-        loadHotSearch().catch(() => {});
-        loadNews().catch(() => {});
-        loadHistoryToday().catch(() => {});
-        loadHitokoto().catch(() => {});
+        loadWeatherByIP().catch(function(e) { console.warn(e); });
+        loadHotSearch().catch(function() {});
+        loadNews().catch(function() {});
+        loadHistoryToday().catch(function() {});
+        loadHitokoto().catch(function() {});
     </script>
 </body>
 </html>`;
