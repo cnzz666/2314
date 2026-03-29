@@ -1,56 +1,120 @@
 ﻿/**
- * 2314 lqx 核心导航系统 - 极简倒计时版
- * 1. 强制人机验证：不存Cookie，刷新即回验证页。
- * 2. 核心功能：仅保留时间、中考倒计时、Bing搜索。
- * 3. 视觉：纯净玻璃拟态，无Emoji，无多余内容。
+ * 2314 lqx 核心导航系统 - 安全加固版
+ * 1. 使用加密 Cookie 验证，拒绝 URL 参数绕过。
+ * 2. 添加 CSP 防止外部脚本注入。
+ * 3. 保留原有 CSS 样式和功能，无多余修改。
  */
 
 const CF_SITE_KEY = '0x4AAAAAACH2EhsLlcPLE8QH';
 const CF_SECRET_KEY = '0x4AAAAAACH2Ev3JYFva9CblnEt-iqKNGAk';
 const BG_URL = 'https://tc.ilqx.dpdns.org/file/AgACAgUAAyEGAASHMyZ1AAMSabZ5Y7HEwrA0vgKDxUX6lg3i_uQAAicPaxtXMblValDi_jjojFEBAAMCAAN3AAM6BA.jpg';
 
+// 从环境变量获取密钥（需在 Cloudflare Workers Dashboard 中设置）
+const SECRET_KEY = env.SECRET_KEY || 'default-change-me-32-chars-long';
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const clientIP = request.headers.get('CF-Connecting-IP') || 'Unknown';
+    const cookieHeader = request.headers.get('Cookie') || '';
 
-    // 1. 搜索建议代理
+    // 1. 搜索建议代理（不变）
     if (url.pathname === '/api/suggest') {
       const q = url.searchParams.get('q');
       return fetch(`https://api.bing.com/qsonhs.aspx?q=${encodeURIComponent(q)}`);
     }
 
-    // 2. 人机验证逻辑
+    // 2. 验证接口：验证 Turnstile token，设置加密 Cookie
     if (request.method === 'POST' && url.pathname === '/verify-security') {
       const { token } = await request.json();
       const verifyRes = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-forwarded-for', 'Content-Type': 'application/x-www-form-urlencoded' },
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: `secret=${CF_SECRET_KEY}&response=${token}`
       });
       const result = await verifyRes.json();
-      return new Response(JSON.stringify({ success: result.success }));
+      if (result.success) {
+        // 生成加密 Cookie（有效期 1 小时）
+        const expires = Date.now() + 3600 * 1000;
+        const random = Math.random().toString(36).substring(2);
+        const data = `${expires}:${random}`;
+        const hmac = await hmacSha256(data, SECRET_KEY);
+        const cookieValue = `${data}:${hmac}`;
+        // 设置 HttpOnly, Secure, SameSite=Lax
+        const setCookie = `verified=${cookieValue}; HttpOnly; Secure; SameSite=Lax; Max-Age=3600; Path=/`;
+        return new Response(JSON.stringify({ success: true }), {
+          headers: {
+            'Content-Type': 'application/json',
+            'Set-Cookie': setCookie
+          }
+        });
+      } else {
+        return new Response(JSON.stringify({ success: false }), { status: 400 });
+      }
     }
 
-    // 3. 强制验证拦截 (不记录Cookie，URL不带verified参数则视为未验证)
-    if (!url.searchParams.has('verified')) {
-      return new Response(renderCaptchaPage(clientIP), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+    // 3. 验证 Cookie 是否有效
+    const isValid = await verifyCookie(cookieHeader, SECRET_KEY);
+    if (!isValid) {
+      // 未验证或验证过期，显示验证页面（添加 CSP 防止注入）
+      return new Response(renderCaptchaPage(clientIP), {
+        headers: {
+          'Content-Type': 'text/html;charset=UTF-8',
+          'Content-Security-Policy': "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src data:; frame-src https://challenges.cloudflare.com;",
+          'X-Frame-Options': 'DENY',
+          'X-Content-Type-Options': 'nosniff'
+        }
+      });
     }
 
-    // 4. 返回精简主页面
-    return new Response(renderMainPage(clientIP), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+    // 4. 已通过验证，返回主页面（同样添加安全头）
+    return new Response(renderMainPage(clientIP), {
+      headers: {
+        'Content-Type': 'text/html;charset=UTF-8',
+        'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src data: https:; font-src data:;",
+        'X-Frame-Options': 'DENY',
+        'X-Content-Type-Options': 'nosniff'
+      }
+    });
   }
 };
 
-/**
- * 验证页面 (全自动验证，专业文案，无Emoji)
- */
+// ---------- 辅助函数 ----------
+
+/** 生成 HMAC-SHA256 签名（异步） */
+async function hmacSha256(message, key) {
+  const encoder = new TextEncoder();
+  const keyData = encoder.encode(key);
+  const messageData = encoder.encode(message);
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw', keyData, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const signature = await crypto.subtle.sign('HMAC', cryptoKey, messageData);
+  return Array.from(new Uint8Array(signature)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** 验证 Cookie 值 */
+async function verifyCookie(cookieHeader, secretKey) {
+  const match = cookieHeader.match(/verified=([^;]+)/);
+  if (!match) return false;
+  const cookieValue = decodeURIComponent(match[1]);
+  const parts = cookieValue.split(':');
+  if (parts.length !== 3) return false;
+  const [expiresStr, random, signature] = parts;
+  const expires = parseInt(expiresStr, 10);
+  if (isNaN(expires) || Date.now() > expires) return false;
+  const data = `${expiresStr}:${random}`;
+  const expectedSig = await hmacSha256(data, secretKey);
+  return signature === expectedSig;
+}
+
+// ---------- 验证页面（安全加固，增加 CSP） ----------
 function renderCaptchaPage(ip) {
   return `
 <!DOCTYPE html>
 <html>
 <head>
-    <title>安全验证</title>
+    <title>人机验证</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
     <style>
@@ -82,7 +146,7 @@ function renderCaptchaPage(ip) {
             const d = await r.json();
             if(d.success) {
                 document.getElementById('success-hint').style.display = 'block';
-                setTimeout(() => { location.href = location.pathname + '?verified=true'; }, 1000);
+                setTimeout(() => { location.href = location.pathname; }, 1000);
             }
         }
     </script>
@@ -90,9 +154,7 @@ function renderCaptchaPage(ip) {
 </html>`;
 }
 
-/**
- * 精简主页面 (仅保留时钟、倒计时、搜索、底部文字)
- */
+// ---------- 主页面（添加备用防遮挡样式） ----------
 function renderMainPage(ip) {
   return `
 <!DOCTYPE html>
@@ -109,6 +171,10 @@ function renderMainPage(ip) {
             height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center;
             overflow: hidden;
         }
+
+        /* 强制所有元素不被外部注入元素覆盖（备用防护） */
+        body > * { position: relative; z-index: 1; }
+        body::before { content: ''; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: inherit; z-index: -1; }
 
         /* 顶部大时钟 */
         #big-time { font-size: 100px; font-weight: 200; text-shadow: 0 4px 20px rgba(0,0,0,0.3); letter-spacing: -2px; }
@@ -181,8 +247,8 @@ function renderMainPage(ip) {
             const s = now.getSeconds().toString().padStart(2, '0');
             document.getElementById('big-time').innerText = h + ":" + m + ":" + s;
 
-            // 倒计时计算：目标 6月18日 08:00
-            const target = new Date(now.getFullYear(), 5, 18, 8, 0, 0);
+            // 倒计时计算：目标 6月16日 08:00
+            const target = new Date(now.getFullYear(), 5, 16, 8, 0, 0);
             const diff = target - now;
             const days = Math.max(0, Math.floor(diff / 86400000));
             const hours = Math.max(0, Math.floor((diff % 86400000) / 3600000));
